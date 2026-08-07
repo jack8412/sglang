@@ -322,6 +322,12 @@ def main():
     print("mini-K3 KT hybrid == monolithic: PASS")
 
     # Full-model construction check (4 KDA + 1 MLA): imports + shapes only.
+    # KimiK3LinearModel allocates CUDA alt-streams unconditionally in
+    # __init__, so this section needs a GPU — RUNBOOK step 2 runs it for
+    # real; on CPU-only hosts it is reported as skipped.
+    if not torch.cuda.is_available():
+        print("mini-K3 full-model construction: SKIPPED (needs CUDA)")
+        return
     ctx = publish_ctx(False)
     init_single_process_distributed()
     try:
