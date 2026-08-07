@@ -36,6 +36,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -133,6 +134,28 @@ if KTRANSFORMERS_AVAILABLE:
 logger = logging.getLogger(__name__)
 
 # Global cache for GPU experts masks (initialized once per session)
+
+
+@contextmanager
+def _scoped_layer_num_local_experts(layer: torch.nn.Module, num_experts: int):
+    """Temporarily present the GPU-resident expert count as the layer's
+    num_local_experts.
+
+    The KT wrapper allocates the GPU method's weights for only the resident
+    subset via the ``num_experts`` argument, but the pin's native
+    ``Mxfp4MoEMethod`` (Kimi-K3) sizes its parameters from
+    ``layer.num_local_experts`` instead — with the full count (896) that
+    over-allocates ~40% VRAM and OOMs at construction. The override must be
+    scoped: outside the wrapped-method delegations, ``num_local_experts``
+    keeps global semantics (the weight loader's early bounds check must see
+    the full count or non-contiguous masks would drop experts pre-remap)."""
+    original = layer.num_local_experts
+    layer.num_local_experts = num_experts
+    try:
+        yield
+    finally:
+        layer.num_local_experts = original
+
 
 
 @dataclass
@@ -4384,14 +4407,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 1. Create weights for GPU experts using the wrapped method
         # GPU weights are indexed by gpu_index (0 to num_gpu_experts-1), not logical expert ID
         # The mapping logical_to_gpu_index is used to remap IDs during weight loading and inference
-        self.gpu_method.create_weights(
-            layer=layer,
-            num_experts=self.num_gpu_experts,
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=intermediate_size_per_partition,
-            params_dtype=params_dtype,
-            **extra_weight_attrs,
-        )
+        with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
+            self.gpu_method.create_weights(
+                layer=layer,
+                num_experts=self.num_gpu_experts,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                params_dtype=params_dtype,
+                **extra_weight_attrs,
+            )
 
         # Move mask and mapping tables to GPU for inference
         target_device = next(layer.parameters()).device
@@ -4503,7 +4527,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         # 1. Process GPU weights
         if hasattr(self.gpu_method, "process_weights_after_loading"):
-            self.gpu_method.process_weights_after_loading(layer)
+            with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
+                self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
