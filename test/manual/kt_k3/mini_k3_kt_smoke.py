@@ -52,6 +52,7 @@ NUM_TOKENS = 9
 
 def build_config():
     return KimiLinearConfig(
+        architectures=["KimiK3LinearForCausalLM"],
         vocab_size=512,
         hidden_size=HIDDEN,
         intermediate_size=192,
