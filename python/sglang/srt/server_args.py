@@ -2961,6 +2961,36 @@ class ServerArgs:
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         NS("exec.moe"),
     ] = None
+    kt_numa_nodes: A[
+        Optional[List[int]],
+        "[ktransformers parameter] Explicit NUMA node ids for each KT threadpool. Length must equal --kt-threadpool-count.",
+        NS("exec.moe"),
+    ] = None
+    kt_gpu_experts_ratio: A[
+        Optional[float],
+        "[ktransformers parameter] Ratio of total experts (across all MoE layers) to place on GPU, in (0.0, 1.0]. If set, overrides --kt-num-gpu-experts.",
+        NS("exec.moe"),
+    ] = None
+    kt_gpu_prefill_token_threshold: A[
+        Optional[int],
+        "[ktransformers parameter] Token threshold for the full-GPU prefill fallback: when a batch's token count reaches it, the complete layer's experts are temporarily streamed to GPU instead of using CPU experts.",
+        NS("exec.moe"),
+    ] = None
+    kt_expert_placement_strategy: A[
+        Literal["frequency", "front-loading", "uniform", "random"],
+        "[ktransformers parameter] GPU expert placement strategy. frequency: top-k by activation frequency (needs --init-expert-location logical_count data). front-loading: fill from the first MoE layer onwards. uniform: equal experts per layer. random: random placement with a fixed seed.",
+        NS("exec.moe"),
+    ] = "uniform"
+    kt_enable_dynamic_expert_update: A[
+        bool,
+        "[ktransformers parameter] Enable dynamic GPU expert updates from runtime statistics: after a full-GPU prefill fallback, the resident GPU expert set is updated to the batch's most-activated experts. Not supported for MXFP4 expert layouts.",
+        NS("exec.moe"),
+    ] = False
+    record_kt_gpu_expert_distribution: A[
+        bool,
+        "[ktransformers parameter] Record the per-layer GPU-resident expert mask each forward pass; dumped with the expert distribution stats.",
+        NS("exec.moe"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Diffusion LLM
@@ -3579,6 +3609,7 @@ class ServerArgs:
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
         self._handle_a2a_moe()
+        self._handle_kt()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
@@ -6792,6 +6823,62 @@ class ServerArgs:
                     "must be >= the per-rank pplx dispatch tokens "
                     "(chunked_prefill_size, or the decode cuda-graph batch size)"
                 )
+
+    def _handle_kt(self):
+        """KTransformers (CPU-GPU hybrid MoE) safety rails."""
+        if self.kt_weight_path is None:
+            if self.kt_gpu_experts_ratio is not None or self.kt_num_gpu_experts:
+                logger.warning(
+                    "--kt-gpu-experts-ratio/--kt-num-gpu-experts have no effect "
+                    "without --kt-weight-path."
+                )
+            return
+
+        if not self.disable_shared_experts_fusion:
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "KTransformers EP is enabled. --disable-shared-experts-fusion is "
+                "automatically set to prevent shared experts from being offloaded "
+                "to CPU."
+            )
+
+        if self.kt_numa_nodes is not None and (
+            len(self.kt_numa_nodes) != self.kt_threadpool_count
+        ):
+            raise ValueError(
+                f"--kt-numa-nodes has {len(self.kt_numa_nodes)} entries but "
+                f"--kt-threadpool-count is {self.kt_threadpool_count}; they must "
+                f"match (one NUMA node per KT threadpool)."
+            )
+
+        if self.kt_gpu_experts_ratio is not None and not (
+            0.0 < self.kt_gpu_experts_ratio <= 1.0
+        ):
+            raise ValueError(
+                f"--kt-gpu-experts-ratio must be in (0.0, 1.0], got "
+                f"{self.kt_gpu_experts_ratio}."
+            )
+
+        if (
+            self.kt_expert_placement_strategy == "frequency"
+            and self.init_expert_location == "trivial"
+        ):
+            raise ValueError(
+                "--kt-expert-placement-strategy frequency requires "
+                "--init-expert-location pointing at logical_count activation "
+                "data (.pt/.json)."
+            )
+
+        if (
+            self.kt_enable_dynamic_expert_update
+            and (self.kt_method or "").upper() == "MXFP4"
+        ):
+            raise ValueError(
+                "--kt-enable-dynamic-expert-update is not supported for "
+                "--kt-method MXFP4: the expert-weight copy path handles "
+                "int4/fp8/bf16 layouts only (MXFP4 needs the E8M0-scale-aware "
+                "copy; planned follow-up)."
+            )
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""
