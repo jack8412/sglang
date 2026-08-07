@@ -364,12 +364,12 @@ class FusedMoE(torch.nn.Module):
             gate_up_interleaved=gate_up_interleaved,
         )
 
-        self.quant_method: Optional[FusedMoEMethodBase] = None
         server_args = get_server_args()
+        base_quant_method: Optional[FusedMoEMethodBase] = None
         if quant_config is not None:
-            self.quant_method = quant_config.get_quant_method(self, prefix)
-        if self.quant_method is None:
-            self.quant_method = UnquantizedFusedMoEMethod(
+            base_quant_method = quant_config.get_quant_method(self, prefix)
+        if base_quant_method is None:
+            base_quant_method = UnquantizedFusedMoEMethod(
                 self.use_triton_kernels,
                 self.use_flashinfer_trtllm_moe,
                 self.use_deep_gemm,
@@ -377,10 +377,13 @@ class FusedMoE(torch.nn.Module):
         # Chain-wrap via the quant-method registry (mxfp4_deepseek at priority
         # 10, kt_ep at 20). Predicates decide from server_args; models without
         # a matching wrapper get the base method back unchanged. `prefix` is
-        # stashed for factories that need it.
+        # stashed for factories that need it. Single assignment on purpose:
+        # base methods are nn.Modules (registered as a child module on first
+        # assignment), while the KT wrapper is not — rebinding a registered
+        # child module to a non-Module raises in nn.Module.__setattr__.
         self._registry_prefix = prefix
-        self.quant_method = maybe_wrap_moe_quant_method(
-            self, self.quant_method, server_args
+        self.quant_method: Optional[FusedMoEMethodBase] = (
+            maybe_wrap_moe_quant_method(self, base_quant_method, server_args)
         )
         _validate_hpc_ops_quant_method(self.quant_method)
         self.supports_deferred_finalize = (
