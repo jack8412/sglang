@@ -136,24 +136,38 @@ class _RefKTMoEWrapper:
         pass
 
 
-def publish_ctx(kt: bool, mask_path: str):
-    sa = ServerArgs(model_path="dummy")
-    sa.chunked_prefill_size = 64
-    sa.disable_shared_experts_fusion = True
-    if kt:
-        sa.kt_weight_path = "/dummy-kt-weights"
-        sa.kt_method = "MXFP4"
-        sa.kt_cpuinfer = 2
-        sa.kt_threadpool_count = 1
-        sa.kt_num_gpu_experts = 40
-        sa.kt_expert_placement_strategy = "uniform"
-    ctx = get_context().override_server_args(
-        **{f: getattr(sa, f) for f in (
-            "kt_weight_path", "kt_method", "kt_cpuinfer", "kt_threadpool_count",
-            "kt_num_gpu_experts", "kt_expert_placement_strategy",
-            "chunked_prefill_size", "disable_shared_experts_fusion",
-        )}
+_CONFIG_DIR = None
+
+
+def _config_dir():
+    """Persist the mini-K3 config to disk once: KT mask generation resolves
+    the HF config through ServerArgs.get_model_config(), which loads from
+    model_path."""
+    global _CONFIG_DIR
+    if _CONFIG_DIR is None:
+        import tempfile
+
+        _CONFIG_DIR = tempfile.mkdtemp(prefix="mini-k3-")
+        build_config().save_pretrained(_CONFIG_DIR)
+    return _CONFIG_DIR
+
+
+def publish_ctx(kt: bool):
+    fields = dict(
+        model_path=_config_dir(),
+        chunked_prefill_size=64,
+        disable_shared_experts_fusion=True,
     )
+    if kt:
+        fields.update(
+            kt_weight_path="/dummy-kt-weights",
+            kt_method="MXFP4",
+            kt_cpuinfer=2,
+            kt_threadpool_count=1,
+            kt_num_gpu_experts=40,
+            kt_expert_placement_strategy="uniform",
+        )
+    ctx = get_context().override_server_args(**fields)
     ctx.install()
     initialize_moe_config(get_server_args())
     return ctx
@@ -161,7 +175,7 @@ def publish_ctx(kt: bool, mask_path: str):
 
 def run(kt: bool, seed=0):
     torch.manual_seed(seed)
-    ctx = publish_ctx(kt, "")
+    ctx = publish_ctx(kt)
     try:
         with get_parallel().override(
             tp_rank=0,
@@ -238,7 +252,7 @@ def main():
     # Monolithic reference: same weights, KT off. Rebuild the model and load
     # the union weight set into the full expert table.
     mono_out, mono_moe = None, None
-    ctx = publish_ctx(False, "")
+    ctx = publish_ctx(False)
     try:
         with get_parallel().override(
             tp_rank=0,
@@ -271,7 +285,7 @@ def main():
     print("mini-K3 KT hybrid == monolithic: PASS")
 
     # Full-model construction check (4 KDA + 1 MLA): imports + shapes only.
-    ctx = publish_ctx(False, "")
+    ctx = publish_ctx(False)
     try:
         with get_parallel().override(
             tp_rank=0,
