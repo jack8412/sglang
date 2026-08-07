@@ -1633,6 +1633,24 @@ class KVCacheConfigurator:
                 / 1024,
             )
         rest_memory = available_gpu_memory - slack_gb
+
+        # MXFP4 layerwise-prefill slots (KT hybrid) are allocated lazily on the
+        # first threshold-qualified request, i.e. after this profiling pass —
+        # reserve their capacity so the KV pool cannot consume it. Returns 0.0
+        # unless that path is enabled. (Replaces ktfork #72/#73's model_runner
+        # field + memory_profiler plumbing; the gate lives with the collaborator.)
+        from sglang.srt.layers.moe.kt_ep_wrapper import (
+            mxfp4_layerwise_prefill_reservation_gib,
+        )
+
+        reservation_gib = mxfp4_layerwise_prefill_reservation_gib(self.server_args)
+        if reservation_gib > 0:
+            logger.info(
+                f"Reserving {reservation_gib:.2f} GB for lazy MXFP4 "
+                f"layerwise-prefill slots before KV-cache sizing."
+            )
+            rest_memory -= reservation_gib
+
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
