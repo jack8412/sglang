@@ -267,6 +267,11 @@ def main():
         KT_WHEEL_SUPPORTS_SITU=True,
     ), patch.object(ktw, "get_stream", lambda name: object()), patch(
         "torch.cuda.Event", lambda *a, **k: None
+    ), patch(
+        # The wrapper passes torch.cuda.current_stream(...).cuda_stream to the
+        # (mocked) kt wrapper; on CPU-only torch that call itself raises.
+        "torch.cuda.current_stream",
+        lambda *a, **k: type("S", (), {"cuda_stream": None})(),
     ):
         hybrid_out, hybrid_moe = run(kt=True)
 
