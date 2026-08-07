@@ -29,9 +29,13 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.kt_ep_wrapper import (
-    KTEPWrapperMethod,
-    create_kt_config_from_server_args,
+# Imported for its registry side-effect: kt_ep_wrapper self-registers the
+# "kt_ep" MoE quant wrapper at import time (its predicate fires only when
+# --kt-weight-path is set), so every FusedMoE model gets the KT attach.
+import sglang.srt.layers.moe.kt_ep_wrapper  # noqa: F401
+from sglang.srt.layers.moe.quant_method_registry import (
+    is_wrapped_method,
+    maybe_wrap_moe_quant_method,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
@@ -362,22 +366,22 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
         server_args = get_server_args()
-        kt_config = create_kt_config_from_server_args(server_args, layer_id)
-        if kt_config is not None:
-            if quant_config is not None:
-                gpu_method = quant_config.get_quant_method(self, prefix)
-            else:
-                gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
-            self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
-        else:
-            if quant_config is not None:
-                self.quant_method = quant_config.get_quant_method(self, prefix)
-            if self.quant_method is None:
-                self.quant_method = UnquantizedFusedMoEMethod(
-                    self.use_triton_kernels,
-                    self.use_flashinfer_trtllm_moe,
-                    self.use_deep_gemm,
-                )
+        if quant_config is not None:
+            self.quant_method = quant_config.get_quant_method(self, prefix)
+        if self.quant_method is None:
+            self.quant_method = UnquantizedFusedMoEMethod(
+                self.use_triton_kernels,
+                self.use_flashinfer_trtllm_moe,
+                self.use_deep_gemm,
+            )
+        # Chain-wrap via the quant-method registry (mxfp4_deepseek at priority
+        # 10, kt_ep at 20). Predicates decide from server_args; models without
+        # a matching wrapper get the base method back unchanged. `prefix` is
+        # stashed for factories that need it.
+        self._registry_prefix = prefix
+        self.quant_method = maybe_wrap_moe_quant_method(
+            self, self.quant_method, server_args
+        )
         _validate_hpc_ops_quant_method(self.quant_method)
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
@@ -985,13 +989,24 @@ class FusedMoE(torch.nn.Module):
             if expert_id < 0 or expert_id >= self.num_local_experts:
                 return
 
-        if isinstance(
-            self.quant_method,
-            KTEPWrapperMethod,
-        ):
-            if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
-                    return
+        kt_method = None
+        if is_wrapped_method(self.quant_method, "kt_ep"):
+            kt_method = self.quant_method
+        elif hasattr(self, "scheme") and is_wrapped_method(self.scheme, "kt_ep"):
+            # Some code paths store the KT wrapper on self.scheme.
+            kt_method = self.scheme
+
+        if kt_method is not None and kt_method.num_gpu_experts != -1:
+            # CPU-resident experts (mask False) never materialize on GPU.
+            if expert_id < 0 or expert_id >= len(kt_method.gpu_experts_mask):
+                return
+            if not kt_method.gpu_experts_mask[expert_id]:
+                return
+            # Remap the logical expert id to its dense GPU weight slot.
+            mapped_expert_id = int(kt_method.logical_to_gpu_index[expert_id].item())
+            if mapped_expert_id < 0:
+                return
+            expert_id = mapped_expert_id
 
         self._weight_loader_impl(
             param=param,
@@ -1070,7 +1085,7 @@ class FusedMoE(torch.nn.Module):
         method = self.quant_method
         if hasattr(self, "scheme"):
             method = self.scheme
-        if method.__class__.__name__ == "KTEPWrapperMethod":
+        if is_wrapped_method(method, "kt_ep"):
             method = method.gpu_method
 
         # For flashinfer TRT-LLM BF16 path, process_weights_after_loading reshapes
@@ -1306,7 +1321,7 @@ class FusedMoE(torch.nn.Module):
         # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
         # into block layout; hot weight updates must restore canonical shapes first.
         method = self.quant_method
-        if isinstance(method, KTEPWrapperMethod):
+        if is_wrapped_method(method, "kt_ep"):
             method = method.gpu_method
         if isinstance(method, UnquantizedFusedMoEMethod):
             method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(

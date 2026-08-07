@@ -1336,12 +1336,39 @@ class Envs:
 
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    # Max age (minutes) before launch_server sweeps orphaned ninja locks under
+    # ~/.cache/torch_extensions (left behind by SIGKILL/OOM mid-JIT-build,
+    # which otherwise hangs later runs). <= 0 disables the sweep.
+    SGLANG_STALE_LOCK_AGE_MINUTES = EnvInt(30)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+
+    # ===================================================================
+    # KTransformers CPU-GPU hybrid MoE (kt_ep_wrapper) debug knobs
+    # ===================================================================
+    # Per-call wall-time breakdown of the hybrid submit/mask/gpu/sync/merge
+    # stages, logged for layers (0, 5, 20, 35) on TP0.
+    SGLANG_DEBUG_KT_HYBRID_TIMING = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_KT_HYBRID_TIMING"
+    )
+    # Adds torch.cuda.synchronize() at each timing stage (slow; triage only).
+    SGLANG_DEBUG_KT_HYBRID_TIMING_DEEP = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_KT_HYBRID_TIMING_DEEP"
+    )
+    # Collapse the CPU-experts CUDA stream onto the main stream (regression
+    # isolation for the multi-stream submit path).
+    SGLANG_DISABLE_KT_CPU_STREAM = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_KT_HYBRID_NO_CPU_STREAM"
+    )
+    # Force GPU-experts apply() to a zero return; routed output comes purely
+    # from CPU experts ("Plan-C" fallback for GPU-vs-merge triage).
+    SGLANG_DEBUG_KT_BYPASS_GPU_MOE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_KT_BYPASS_GPU_MOE"
+    )
 
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)

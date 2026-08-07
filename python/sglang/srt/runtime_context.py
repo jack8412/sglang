@@ -376,6 +376,9 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    # KT (CPU-expert) wrapper attach kill-switch; the speculative context in
+    # ``layers.moe.utils`` sets it around draft-model construction/forwards.
+    kt_ep_disabled: bool = False
 
 
 @dataclasses.dataclass

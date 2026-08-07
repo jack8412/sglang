@@ -321,6 +321,7 @@ def initialize_moe_config(server_args: ServerArgs):
     moe.tbo_token_distribution_threshold = server_args.tbo_token_distribution_threshold
     moe.disable_fp4_allgather = server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     moe.quantization = server_args.quantization
+    moe.kt_ep_disabled = False
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -553,6 +554,27 @@ def speculative_moe_a2a_backend_context():
     finally:
         moe.a2a_backend = original_backend
         moe.disable_fp4_allgather = original_disable_fp4_allgather
+
+
+def is_kt_ep_wrapper_disabled() -> bool:
+    """Whether the KT (CPU-expert) wrapper attach is disabled — used so draft
+    models in speculative decoding build pure-GPU MoE layers."""
+    return get_flags().moe.kt_ep_disabled
+
+
+@contextmanager
+def speculative_kt_ep_disabled_context():
+    """Disable the KT EP wrapper while constructing/running draft models.
+
+    Draft models must use pure GPU MoE instead of the CPU-GPU hybrid path
+    provided by kt_ep_wrapper."""
+    moe = get_flags().moe
+    original_value = moe.kt_ep_disabled
+    try:
+        moe.kt_ep_disabled = True
+        yield
+    finally:
+        moe.kt_ep_disabled = original_value
 
 
 # The type of method in top-K routing, for use in torch custom op
