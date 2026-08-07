@@ -172,4 +172,12 @@ def moe_forward_native(
         .sum(dim=1)
         .type(new_x.dtype)
     )
+    # Parity with the GPU runners, which apply the routed scaling factor from
+    # MoeRunnerConfig inside the MoE op (the KT wrapper strips it from the
+    # wrapped GPU method's config and the model applies it once instead).
+    if (
+        moe_runner_config.routed_scaling_factor is not None
+        and moe_runner_config.routed_scaling_factor != 1.0
+    ):
+        final_out = final_out * moe_runner_config.routed_scaling_factor
     return final_out
