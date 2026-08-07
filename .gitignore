@@ -280,3 +280,7 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# k3-hybrid local working docs (kept out of the repo)
+/CLAUDE.md
+/RUNBOOK.md
