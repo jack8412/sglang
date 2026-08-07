@@ -91,11 +91,16 @@ def dequant_mxfp4_ref(
 
     n, half_k = packed.shape
     k = half_k * 2
-    values = MXFP4QuantizeUtil.dequantize(
-        packed, dtype=torch.float32, scale=None, block_sizes=None
+    out = MXFP4QuantizeUtil.dequantize(
+        packed, dtype=torch.float32, scale=scales_e8m0, block_sizes=[32]
     ).reshape(n, k)
-    scale = e8m0_to_bf16(scales_e8m0).to(torch.float32)
-    return values * scale.repeat_interleave(_MXFP4_GROUP_SIZE, dim=1)[:, :k]
+    # The util computes exp2(code - 127) for every code; kt's convention maps
+    # code 0 to +0.0 (not 2^-127) — mask those groups to match.
+    zero_groups = scales_e8m0 == 0
+    if bool(zero_groups.any()):
+        keep = (~zero_groups).to(torch.float32)
+        out = out * keep.repeat_interleave(_MXFP4_GROUP_SIZE, dim=1)[:, :k]
+    return out
 
 
 def expert_bytes_digest(bytes_: Mxfp4ExpertBytes) -> str:
