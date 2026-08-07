@@ -265,7 +265,7 @@ def main():
         KTRANSFORMERS_AVAILABLE=True,
         KTMoEWrapper=_RefKTMoEWrapper,
         KT_WHEEL_SUPPORTS_SITU=True,
-    ), patch.object(ktw, "get_stream", lambda name: None), patch(
+    ), patch.object(ktw, "get_stream", lambda name: object()), patch(
         "torch.cuda.Event", lambda *a, **k: None
     ):
         hybrid_out, hybrid_moe = run(kt=True)
