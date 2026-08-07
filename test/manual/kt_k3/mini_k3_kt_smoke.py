@@ -172,7 +172,6 @@ def run(kt: bool, seed=0):
             moe_tp_size=1,
             attn_tp_rank=0,
             attn_tp_size=1,
-            ep_join_rank_offset=0,
         ):
             from sglang.srt.models.kimi_k3 import KimiK3MoE
 
@@ -250,7 +249,6 @@ def main():
             moe_tp_size=1,
             attn_tp_rank=0,
             attn_tp_size=1,
-            ep_join_rank_offset=0,
         ):
             from sglang.srt.models.kimi_k3 import KimiK3MoE
 
@@ -284,7 +282,6 @@ def main():
             moe_tp_size=1,
             attn_tp_rank=0,
             attn_tp_size=1,
-            ep_join_rank_offset=0,
         ):
             from sglang.srt.models.kimi_k3 import KimiK3LinearForCausalLM
 
