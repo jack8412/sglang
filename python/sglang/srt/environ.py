@@ -1371,6 +1371,33 @@ class Envs:
     )
 
     # ===================================================================
+    # DeepSeek-V4-Flash MXFP4 GPU MoE
+    # (mxfp4_deepseek.py / v4_triton_kernels_moe.py)
+    # ===================================================================
+    # Tri-state diagnostic override for the V4 MXFP4 MoE kernel dispatch:
+    # unset -> capability-driven (trtllm on SM_100, triton_kernels
+    # elsewhere); "1" -> force the triton_kernels path (and the
+    # DeepSeekMxfp4MoEMethod wrap); "0" -> force trtllm even off-whitelist
+    # (fails loud; kept as a diagnostic exit).
+    SGLANG_V4_USE_TRITON_KERNELS = EnvStr(None)
+    # Use flashinfer's official permute-index shuffle (vs the legacy
+    # shuffle_matrix_a path) when preparing TRT-LLM MxFP4 expert weights.
+    SGLANG_MXFP4_USE_OFFICIAL_SHUFFLE = EnvBool(True)
+    # Skip the local->global topk-id re-offset in
+    # DeepSeekMxfp4MoEMethod.apply. Default True on this branch (the fork
+    # default was False): mainline's StandardDispatcher skips local-expert
+    # mapping unconditionally for the flashinfer_mxfp4 backend, so topk ids
+    # reach apply() already global. False restores the fork-era re-offset
+    # for a dispatcher that maps ids to the local range.
+    SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING = EnvBool(True)
+    # Keep persistent all-ones output-scale buffers on the layer instead of
+    # allocating fresh ones on every apply() call.
+    SGLANG_OPT_MXFP4_STATIC_SCALE_ONES = EnvBool(False)
+    # Skip routed_scaling_factor in apply(); the caller is expected to fuse
+    # it into the shared-expert add instead.
+    SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = EnvBool(False)
+
+    # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)

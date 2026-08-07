@@ -23,6 +23,37 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
+
+# Side-effect imports: register DSV4 plugins into quant_method_registry.
+# Order matters for quant_method_registry: priority kwarg in each
+# registration enforces mxfp4 (10) → kt_ep (20) wrap order regardless of
+# import order.
+#
+# We wrap each import in try/except: if a sibling plugin (e.g. mxfp4_deepseek
+# with flashinfer < 0.6.9) raises ImportError at module load, we still want
+# DeepseekV4ForCausalLM to register so the model can dispatch through the
+# legacy lazy-import path in Fp8Config.get_quant_method, which surfaces the
+# real error message to the user. The original PR #38 design relied on
+# Fp8Config's lazy import for this; preserving that safety net here.
+_dsv4_log = logging.getLogger(__name__)
+
+
+def _try_side_effect(import_path):
+    try:
+        __import__(import_path)
+    except Exception as exc:  # noqa: BLE001
+        _dsv4_log.warning(
+            "DSV4 side-effect import failed: %s -> %s. "
+            "DSV4 model will register but the affected plugin may not be "
+            "available; legacy lazy-import paths will surface the real error.",
+            import_path,
+            exc,
+        )
+
+
+_try_side_effect("sglang.srt.layers.quantization.mxfp4_deepseek")
+_try_side_effect("sglang.srt.layers.moe.kt_ep_wrapper")
+
 from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,

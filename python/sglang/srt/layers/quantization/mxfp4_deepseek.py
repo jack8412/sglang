@@ -1,0 +1,593 @@
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+import torch
+from torch.nn import Module
+from torch.nn.parameter import Parameter
+
+from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import (
+    is_flashinfer_available,
+    log_info_on_rank0,
+    set_weight_attrs,
+)
+from sglang.srt.utils.common import next_power_of_2
+
+if is_flashinfer_available():
+    # V4-Flash needs flashinfer >= 0.6.9 (mxfp8_quantize, trtllm_fp4_block_scale_routed_moe
+    # and friends were not exported in 0.6.3, the version pinned by sglang-kt's pyproject).
+    # Fail loud with the exact upgrade command rather than letting the imports below crash
+    # with a bare ImportError. Origin: sglang 本身.
+    import flashinfer as _flashinfer
+    from packaging.version import Version as _Version
+
+    _MIN_FI_VERSION = "0.6.9"
+    _fi_ver = getattr(_flashinfer, "__version__", "0.0.0")
+    if _Version(_fi_ver) < _Version(_MIN_FI_VERSION):
+        raise ImportError(
+            f"DeepSeek-V4-Flash MXFP4 MoE requires flashinfer >= {_MIN_FI_VERSION} "
+            f"(found {_fi_ver}). Upgrade with: "
+            f"pip install --upgrade flashinfer-python flashinfer-cubin"
+        )
+    from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
+    from flashinfer.fp4_quantization import block_scale_interleave
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+
+
+_USE_OFFICIAL_SHUFFLE = envs.SGLANG_MXFP4_USE_OFFICIAL_SHUFFLE.get()
+
+
+# Capabilities for which flashinfer's `trtllm_fp4_block_scale_routed_moe`
+# ships a working binary. flashinfer 0.6.9 only includes sm100f. Outside
+# this whitelist the dispatcher routes V4 MXFP4 MoE through the portable
+# `triton_kernels.matmul_ogs` path in `v4_triton_kernels_moe.py`. Keep
+# this in sync with the same constant in `v4_triton_kernels_moe.py`.
+_TRTLLM_FP4_CAPS = {(10, 0)}
+
+
+def _trtllm_fp4_supported() -> bool:
+    """True when the current GPU is in the trtllm fp4 binary whitelist.
+    Origin: sglang 本身."""
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability() in _TRTLLM_FP4_CAPS
+
+
+class DeepSeekMxfp4MoEMethod:
+    # Tag for quant_method_registry.is_wrapped_method() — set as a class
+    # attribute so any DeepSeekMxfp4MoEMethod instance is identifiable
+    # regardless of whether it was constructed via the registry or directly
+    # from Fp8Config.get_quant_method.
+    _quant_wrapper_id = "mxfp4_deepseek"
+
+    def __init__(self, fp8_method, prefix: str):
+        self._fp8 = fp8_method
+        self.prefix = prefix
+        self.flashinfer_mxfp4_moe_precision = (
+            get_exec().moe.flashinfer_mxfp4_moe_precision
+        )
+
+    def create_moe_runner(self, layer, moe_runner_config):
+        self.moe_runner_config = moe_runner_config
+
+        # Mainline DSV4 always threads a non-None swiglu_limit through
+        # MoeRunnerConfig (the fork's SGLANG_DSV4_2604_SUBMODE gate was
+        # retired upstream); other wrapped models may pass None, which
+        # skips the gemm1 clamp entirely.
+        swiglu_limit = moe_runner_config.swiglu_limit
+        self._gemm1_clamp_limit_tensor = (
+            torch.full(
+                (layer.num_local_experts,),
+                swiglu_limit,
+                dtype=torch.float32,
+                device=layer.w13_weight.device,
+            )
+            if swiglu_limit is not None
+            else None
+        )
+
+    def create_weights(
+        self,
+        layer,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        fp4_block_k = 32
+
+        w13_weight = Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // 2,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        w2_weight = Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 2,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_scale = Parameter(
+            torch.ones(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // fp4_block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        w2_weight_scale = Parameter(
+            torch.ones(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // fp4_block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        w13_weight_scale.format_ue8m0 = False
+        w2_weight_scale.format_ue8m0 = False
+        scale_attrs = dict(extra_weight_attrs)
+        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, scale_attrs)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, scale_attrs)
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
+
+        self._fp8.process_weights_after_loading(layer)
+
+        if getattr(layer, "_mega_moe_weights_built", False):
+            return
+
+        # V4 GPU MoE dispatch (capability-driven, env override available).
+        #
+        # Default: capability in `_TRTLLM_FP4_CAPS` -> trtllm path below;
+        # any other capability -> triton_kernels (this branch).
+        #
+        # Override via `SGLANG_V4_USE_TRITON_KERNELS`:
+        #   "1" -> force triton_kernels even on whitelist (debugging).
+        #   "0" -> force trtllm even off-whitelist (will fail loud — kept
+        #          as a diagnostic exit so devs can see the underlying
+        #          error rather than silently fall back).
+        #
+        # The triton_kernels branch must run BEFORE `reorder_w1w3_to_w3w1`
+        # (TRT-LLM-only weight rearrangement) so it gets natural
+        # [w1, w3] = [gate, up] order.
+        # Origin: sglang 本身.
+        try:
+            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+                use_v4_triton_kernels,
+                force_disable_v4_triton_kernels,
+                convert_v4_weights_to_triton_kernels,
+            )
+        except Exception:
+            use_v4_triton_kernels = lambda: False
+            force_disable_v4_triton_kernels = lambda: False
+            convert_v4_weights_to_triton_kernels = None
+
+        _force_tk = use_v4_triton_kernels()
+        _force_trtllm = force_disable_v4_triton_kernels()
+        _take_tk_path = (
+            convert_v4_weights_to_triton_kernels is not None
+            and (_force_tk or (not _force_trtllm and not _trtllm_fp4_supported()))
+        )
+        if _take_tk_path:
+            w13_raw = layer.w13_weight.data
+            w2_raw = layer.w2_weight.data
+            w13_scale_raw = layer.w13_weight_scale_inv.data
+            w2_scale_raw = layer.w2_weight_scale_inv.data
+
+            if w13_scale_raw.dtype == torch.float32:
+                w13_scale_raw = w13_scale_raw.to(torch.float8_e8m0fnu)
+                w2_scale_raw = w2_scale_raw.to(torch.float8_e8m0fnu)
+
+            hidden_size_tk = w13_raw.shape[2] * 2
+            intermediate_size_tk = w2_raw.shape[2] * 2
+            log_info_on_rank0(
+                logger,
+                f'[v4-triton-kernels] Swizzling V4 MXFP4 weights for matmul_ogs '
+                f'(layer: {self.prefix}, hidden_size={hidden_size_tk}, '
+                f'intermediate_size={intermediate_size_tk})...',
+            )
+            w13_swiz, w13_pcg, w2_swiz, w2_pcg = convert_v4_weights_to_triton_kernels(
+                w13_raw, w13_scale_raw, w2_raw, w2_scale_raw,
+            )
+            # Free raw tensors; the triton_kernels Tensor objects keep their
+            # own swizzled storage. The kt_ep_wrapper's full-GPU prefill
+            # fallback (kt_gpu_prefill_token_threshold > 0) needs the raw
+            # attributes around to materialize all 256 experts on GPU when
+            # the gate fires, so opt-in keep them in that mode. Origin: sglang
+            # 本身 (V4-Flash full-GPU prefill fallback compat).
+            _keep_raw_for_full_gpu_fallback = (
+                get_exec().moe.kt_gpu_prefill_token_threshold or 0
+            ) > 0
+            if not _keep_raw_for_full_gpu_fallback:
+                del layer.w13_weight
+                del layer.w2_weight
+                del layer.w13_weight_scale_inv
+                del layer.w2_weight_scale_inv
+            layer._v4_tk_w13 = w13_swiz
+            layer._v4_tk_w13_pcg = w13_pcg
+            layer._v4_tk_w2 = w2_swiz
+            layer._v4_tk_w2_pcg = w2_pcg
+            layer._v4_tk_intermediate_size = intermediate_size_tk
+            layer._v4_tk_num_experts = w13_raw.shape[0]
+            layer._v4_tk_path = True
+            return
+
+        w13_w, w13_s = reorder_w1w3_to_w3w1(
+            layer.w13_weight.data, layer.w13_weight_scale_inv.data
+        )
+        layer.w13_weight = Parameter(w13_w, requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
+
+        log_info_on_rank0(
+            logger,
+            f"Shuffling FP4 expert weights for TRT-LLM MxFP4 kernel "
+            f"(layer: {self.prefix})...",
+        )
+
+        w13 = layer.w13_weight.data
+        w2 = layer.w2_weight.data
+        w13_scale = layer.w13_weight_scale_inv.data
+        w2_scale = layer.w2_weight_scale_inv.data
+        num_experts = w13.shape[0]
+
+        if w13_scale.dtype == torch.float32:
+            w13_scale = w13_scale.to(torch.float8_e8m0fnu)
+            w2_scale = w2_scale.to(torch.float8_e8m0fnu)
+
+        epilogue_tile_m = 128
+        g1_w, g1_s, g2_w, g2_s = [], [], [], []
+        if _USE_OFFICIAL_SHUFFLE:
+            cache: dict = {}
+            for i in range(num_experts):
+                w13_u8 = w13[i].view(torch.uint8)
+                w13_s_u8 = w13_scale[i].view(torch.uint8)
+                w2_u8 = w2[i].view(torch.uint8)
+                w2_s_u8 = w2_scale[i].view(torch.uint8)
+
+                perm = _maybe_get_cached_w3_w1_permute_indices(
+                    cache,
+                    w13_u8,
+                    epilogue_tile_m,
+                )
+                g1_w.append(w13_u8[perm.to(w13_u8.device)].contiguous())
+                perm_sf = _maybe_get_cached_w3_w1_permute_indices(
+                    cache,
+                    w13_s_u8,
+                    epilogue_tile_m,
+                    num_elts_per_sf=16,
+                )
+                g1_s.append(
+                    block_scale_interleave(
+                        w13_s_u8[perm_sf.to(w13_s_u8.device)].contiguous()
+                    )
+                )
+
+                perm = get_w2_permute_indices_with_cache(
+                    cache,
+                    w2_u8,
+                    epilogue_tile_m,
+                )
+                g2_w.append(w2_u8[perm.to(w2_u8.device)].contiguous())
+                perm_sf = get_w2_permute_indices_with_cache(
+                    cache,
+                    w2_s_u8,
+                    epilogue_tile_m,
+                    num_elts_per_sf=16,
+                )
+                g2_s.append(
+                    block_scale_interleave(
+                        w2_s_u8[perm_sf.to(w2_s_u8.device)].contiguous()
+                    )
+                )
+        else:
+            for i in range(num_experts):
+                g1_w.append(shuffle_matrix_a(w13[i].view(torch.uint8), epilogue_tile_m))
+                g1_s.append(
+                    shuffle_matrix_sf_a(w13_scale[i].view(torch.uint8), epilogue_tile_m)
+                )
+                g2_w.append(shuffle_matrix_a(w2[i].view(torch.uint8), epilogue_tile_m))
+                g2_s.append(
+                    shuffle_matrix_sf_a(w2_scale[i].view(torch.uint8), epilogue_tile_m)
+                )
+
+        layer.w13_weight = Parameter(torch.stack(g1_w), requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(
+            torch.stack(g1_s)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, w13.shape[1], -1),
+            requires_grad=False,
+        )
+        layer.w2_weight = Parameter(torch.stack(g2_w), requires_grad=False)
+        layer.w2_weight_scale_inv = Parameter(
+            torch.stack(g2_s)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, w2.shape[1], -1),
+            requires_grad=False,
+        )
+
+        if envs.SGLANG_OPT_MXFP4_STATIC_SCALE_ONES.get():
+            self._register_static_scale_ones(layer)
+        torch.cuda.empty_cache()
+
+    def _register_static_scale_ones(self, layer: Module) -> None:
+        device = layer.w13_weight.device
+        for name in (
+            "output1_scale_scalar",
+            "output1_scale_gate_scalar",
+            "output2_scale_scalar",
+        ):
+            layer.register_buffer(
+                name,
+                torch.ones(layer.num_local_experts, device=device, dtype=torch.float32),
+                persistent=False,
+            )
+
+    def apply(
+        self,
+        layer: Module,
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        hidden_states = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        # NEW (2026-04-29): V4 triton_kernels MoE path. Origin: sglang 本身.
+        # Must dispatch before accessing layer.w13_weight (we deleted it
+        # during process_weights_after_loading on the triton_kernels path).
+        if getattr(layer, "_v4_tk_path", False):
+            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+                apply_v4_triton_kernels_moe,
+            )
+            # Extract topk_ids/weights from topk_output (mirror the trtllm
+            # extraction below, which happens after this dispatch). Mainline
+            # HashTopK emits StandardTopKOutput (the fork's separate hash
+            # format was folded into the standard format upstream), so the
+            # standard branch covers it.
+            if TopKOutputChecker.format_is_standard(topk_output):
+                topk_ids = topk_output.topk_ids
+                topk_weights = topk_output.topk_weights
+            else:
+                raise NotImplementedError(
+                    f'triton_kernels V4 path: unsupported topk format {topk_output.format}'
+                )
+            # On mainline the StandardDispatcher never maps topk ids to the
+            # local range for the flashinfer_mxfp4 backend, so the default
+            # (SKIP_DISPATCHER_MAPPING=True) leaves the already-global ids
+            # untouched; False restores the fork-era local->global re-offset.
+            if not envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get():
+                local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
+                topk_ids = torch.where(
+                    topk_ids >= 0,
+                    topk_ids + local_expert_offset,
+                    topk_ids,
+                )
+            rsf = layer.moe_runner_config.routed_scaling_factor
+            # 2604B SwiGLU clamp: thread swiglu_limit through so the triton-
+            # kernels GPU MoE path applies the same gate/up clamp as
+            # trtllm's gemm1_clamp_limit and deep_gemm's _apply_swiglu_limit.
+            # When swiglu_limit is None apply_v4_triton_kernels_moe skips the
+            # clamp. Origin: sglang 本身.
+            output = apply_v4_triton_kernels_moe(
+                hidden_states=hidden_states,
+                w13_swiz=layer._v4_tk_w13,
+                w13_pcg=layer._v4_tk_w13_pcg,
+                w2_swiz=layer._v4_tk_w2,
+                w2_pcg=layer._v4_tk_w2_pcg,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                intermediate_size=layer._v4_tk_intermediate_size,
+                num_experts=layer._v4_tk_num_experts,
+                routed_scaling_factor=1.0,
+                swiglu_limit=layer.moe_runner_config.swiglu_limit,
+            )
+            # rsf handled here (not inside kernel) to mirror the trtllm path
+            # (line ~638) and avoid double-apply with FUSE_RSF_SHARED_ADD.
+            if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
+                if rsf is not None and rsf != 1.0:
+                    output.mul_(rsf)
+            return StandardCombineInput(hidden_states=output)
+
+        w13 = layer.w13_weight
+        w2 = layer.w2_weight
+        w13_scale = layer.w13_weight_scale_inv
+        w2_scale = layer.w2_weight_scale_inv
+
+        intermediate_size = w2.shape[2] * 2 if w2.dtype == torch.uint8 else w2.shape[2]
+        hidden_size = w13.shape[2] * 2 if w13.dtype == torch.uint8 else w13.shape[2]
+
+        num_local_experts = layer.num_local_experts
+        if w13_scale.dim() == 2:
+            w13_scale = w13_scale.reshape(num_local_experts, 2 * intermediate_size, -1)
+        if w2_scale.dim() == 2:
+            w2_scale = w2_scale.reshape(num_local_experts, hidden_size, -1)
+
+        if TopKOutputChecker.format_is_standard(topk_output):
+            topk_ids = topk_output.topk_ids
+            topk_weights = topk_output.topk_weights
+        elif TopKOutputChecker.format_is_bypassed(topk_output):
+            raise NotImplementedError(
+                "the old code in this branch is WRONG. e.g. it does not consider HashTopK, and may miss args"
+            )
+        else:
+            raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+
+        # See the triton_kernels-path note above: mainline dispatchers keep
+        # ids global for this backend, so the re-offset is off by default.
+        if not envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get():
+            local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
+            topk_ids = torch.where(
+                topk_ids >= 0,
+                topk_ids + local_expert_offset,
+                topk_ids,
+            )
+
+        packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
+
+        precision = self.flashinfer_mxfp4_moe_precision
+        if precision == "bf16":
+            assert hidden_states.dtype == torch.bfloat16
+            x_quant = hidden_states
+            x_scale = None
+            origin_dim = x_quant.shape[-1]
+            if hidden_size != origin_dim:
+                x_quant = torch.nn.functional.pad(
+                    x_quant,
+                    (0, hidden_size - origin_dim),
+                    mode="constant",
+                    value=0.0,
+                )
+        elif precision == "default":
+            x_quant, x_scale = mxfp8_quantize(
+                hidden_states, False, alignment=hidden_size
+            )
+            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
+                *hidden_states.shape[:-1], -1
+            )
+        else:
+            raise NotImplementedError(f"Unsupported mxfp4 moe precision: {precision}")
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            num_tokens = x_quant.shape[0]
+            out_hidden_size = (
+                x_quant.shape[-1] * 2
+                if x_quant.dtype == torch.uint8
+                else x_quant.shape[-1]
+            )
+            symm_output = torch.empty(
+                num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
+            )
+
+        output = trtllm_fp4_block_scale_routed_moe(
+            topk_ids=packed_topk,
+            routing_bias=None,
+            hidden_states=x_quant,
+            hidden_states_scale=x_scale,
+            gemm1_weights=w13,
+            gemm1_weights_scale=w13_scale,
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
+            gemm2_weights=w2,
+            gemm2_weights_scale=w2_scale,
+            gemm2_bias=None,
+            output1_scale_scalar=(
+                layer.output1_scale_scalar
+                if envs.SGLANG_OPT_MXFP4_STATIC_SCALE_ONES.get()
+                else torch.ones(
+                    num_local_experts, device=x_quant.device, dtype=torch.float32
+                )
+            ),
+            output1_scale_gate_scalar=(
+                layer.output1_scale_gate_scalar
+                if envs.SGLANG_OPT_MXFP4_STATIC_SCALE_ONES.get()
+                else torch.ones(
+                    num_local_experts, device=x_quant.device, dtype=torch.float32
+                )
+            ),
+            output2_scale_scalar=(
+                layer.output2_scale_scalar
+                if envs.SGLANG_OPT_MXFP4_STATIC_SCALE_ONES.get()
+                else torch.ones(
+                    num_local_experts, device=x_quant.device, dtype=torch.float32
+                )
+            ),
+            num_experts=layer.num_experts,
+            top_k=packed_topk.shape[1],
+            n_group=1,
+            topk_group=1,
+            intermediate_size=intermediate_size,
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            local_num_experts=num_local_experts,
+            routed_scaling_factor=1.0,
+            routing_method_type=int(RoutingMethodType.TopK),
+            do_finalize=True,
+            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+            output=symm_output,
+        )[0]
+
+        if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
+            rsf = layer.moe_runner_config.routed_scaling_factor
+            if rsf is not None and rsf != 1.0:
+                output.mul_(rsf)
+
+        return StandardCombineInput(hidden_states=output)
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration: V4-Flash MXFP4 wrap. Predicate gate matches what
+# fused_moe_triton/layer.py used to do inline (env override + kt-method
+# check). Activated when DSV4 model module loads.
+# ---------------------------------------------------------------------------
+
+def _mxfp4_predicate(layer, server_args):
+    env = envs.SGLANG_V4_USE_TRITON_KERNELS.get()
+    if env == "1":
+        do_wrap = True
+    elif env == "0":
+        do_wrap = False
+    else:
+        do_wrap = (server_args.kt_method or "").upper() == "MXFP4"
+    if not do_wrap:
+        return None
+    return True  # ctx sentinel; factory reads layer attrs
+
+
+def _mxfp4_factory(layer, gpu_method, _ctx):
+    from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+    if not isinstance(gpu_method, Fp8MoEMethod):
+        return gpu_method
+    prefix = getattr(layer, "_registry_prefix", "")
+    return DeepSeekMxfp4MoEMethod(gpu_method, prefix=prefix)
+
+
+from sglang.srt.layers.moe.quant_method_registry import register_moe_quant_wrapper
+
+# priority=10 → wraps Fp8MoEMethod first (matches PR #38 Phase 2, runs before kt_ep Phase 3)
+register_moe_quant_wrapper(
+    "mxfp4_deepseek", _mxfp4_predicate, _mxfp4_factory, priority=10
+)
