@@ -5,7 +5,10 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.moe.utils import (
+    speculative_kt_ep_disabled_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
@@ -67,7 +70,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         )
 
         # Load draft model weights only.
-        with empty_context():
+        with empty_context(), speculative_kt_ep_disabled_context():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -120,6 +123,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
+            speculative_kt_ep_disabled_context(),
         ):
             super().init_attention_backends()
 
@@ -127,6 +131,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
+            speculative_kt_ep_disabled_context(),
         ):
             super().init_cuda_graphs()
 

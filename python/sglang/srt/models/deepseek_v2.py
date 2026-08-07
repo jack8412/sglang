@@ -104,7 +104,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.quant_method_registry import is_wrapped_method
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -1002,7 +1002,7 @@ class DeepseekV2MoE(nn.Module):
             not _is_cuda
             and not _is_musa
             and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            or is_wrapped_method(self.experts.quant_method, "kt_ep")
         ):
             final_hidden_states *= self.routed_scaling_factor
 
@@ -1150,7 +1150,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not _is_xpu
             and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            or is_wrapped_method(self.experts.quant_method, "kt_ep")
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor

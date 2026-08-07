@@ -5,6 +5,58 @@ import os
 import sys
 import warnings
 
+
+def _sweep_stale_torch_extension_locks():
+    """Remove stale ninja locks under ~/.cache/torch_extensions before any
+    torch.utils.cpp_extension build runs.
+
+    torch's cpp_extension JIT builds take a ``lock`` / ``.ninja_lock`` file in
+    the build dir and block while it is held. A run killed mid-build (SIGKILL,
+    OOM, scheduler crash) leaves the lock on disk, and subsequent runs hang
+    forever on the orphaned lock with zero CPU/GPU activity — indistinguishable
+    from a deadlock. Sweeping locks older than SGLANG_STALE_LOCK_AGE_MINUTES
+    (default 30m: never interrupts a live build, auto-recovers same-day reruns)
+    eliminates this hang class at startup.
+    """
+    try:
+        import time
+
+        from sglang.srt.environ import envs
+
+        cache_dir = os.path.expanduser(
+            os.environ.get("TORCH_EXTENSIONS_DIR", "~/.cache/torch_extensions")
+        )
+        if not os.path.isdir(cache_dir):
+            return
+        max_age_min = envs.SGLANG_STALE_LOCK_AGE_MINUTES.get()
+        if max_age_min <= 0:
+            return
+        cutoff = time.time() - max_age_min * 60
+        swept = 0
+        for root, _dirs, files in os.walk(cache_dir):
+            for name in files:
+                if name not in ("lock", ".ninja_lock"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.unlink(path)
+                        swept += 1
+                except OSError:
+                    pass
+        if swept:
+            print(
+                f"[sglang] swept {swept} stale ninja locks under {cache_dir} "
+                f"(older than {max_age_min}m)",
+                file=sys.stderr,
+            )
+    except Exception:
+        # Best-effort cleanup; failures must not block startup.
+        pass
+
+
+_sweep_stale_torch_extension_locks()
+
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import suppress_noisy_warnings

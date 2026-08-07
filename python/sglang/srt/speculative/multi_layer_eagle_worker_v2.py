@@ -26,7 +26,10 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
 )
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.moe.utils import (
+    speculative_kt_ep_disabled_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -150,7 +153,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Load draft model weights only.
-        with empty_context(), speculative_moe_backend_context():
+        with empty_context(), speculative_moe_backend_context(), speculative_kt_ep_disabled_context():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -207,6 +210,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         with (
             self.draft_tp_context(self.draft_runner_list[0].tp_group),
             speculative_moe_backend_context(),
+            speculative_kt_ep_disabled_context(),
         ):
             super().init_attention_backends()
 
@@ -214,6 +218,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         with (
             self.draft_tp_context(self.draft_runner_list[0].tp_group),
             speculative_moe_backend_context(),
+            speculative_kt_ep_disabled_context(),
         ):
             super().init_cuda_graphs()
 

@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
 from sglang.srt.layers.moe.utils import (
+    speculative_kt_ep_disabled_context,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -162,7 +163,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ctx = empty_context()
         with (
             ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -224,6 +225,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
+            speculative_kt_ep_disabled_context(),
         ):
             self.draft_worker.init_attention_backends()
             self.init_attention_backend()
@@ -233,6 +235,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
+            speculative_kt_ep_disabled_context(),
         ):
             self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
             if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
@@ -1075,6 +1078,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                speculative_kt_ep_disabled_context(),
             ):
                 self.adaptive_controller.register(
                     SpecRuntimeState(
@@ -1124,6 +1128,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                speculative_kt_ep_disabled_context(),
                 spec_stage_span("draft_extend"),
             ):
                 batch_output.next_draft_input = (
@@ -1166,6 +1171,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
+                    speculative_kt_ep_disabled_context(),
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
@@ -1187,6 +1193,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
+                    speculative_kt_ep_disabled_context(),
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)

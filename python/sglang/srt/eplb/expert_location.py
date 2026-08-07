@@ -776,6 +776,20 @@ class ModelConfigForExpertLocation:
             return None
 
 
+def _should_use_trivial_mapping_for_kt(server_args: ServerArgs) -> bool:
+    """KT (CPU experts) consumes --init-expert-location logical_count only to
+    generate GPU expert masks; CPU expert weight loading must keep
+    physical_id == logical_id, so EPLB remapping is skipped when KT is on."""
+    kt_enabled = server_args.kt_weight_path is not None
+    if kt_enabled:
+        logger.info(
+            "Detected KT mode: kt_weight_path=%s. Using trivial mapping for "
+            "CPU expert weight loading.",
+            server_args.kt_weight_path,
+        )
+    return kt_enabled
+
+
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -806,6 +820,15 @@ def compute_initial_expert_location_metadata(
             moe_ep_rank=moe_ep_rank,
         )
     elif "logical_count" in data_dict:
+        if _should_use_trivial_mapping_for_kt(server_args):
+            logger.info(
+                "init_expert_location: KT frequency strategy — logical_count is "
+                "read directly by KT mask generation; CPU weight loading keeps "
+                "the trivial mapping (physical_id == logical_id)."
+            )
+            return ExpertLocationMetadata.init_trivial(
+                server_args, model_config, moe_ep_rank
+            )
         logger.info(
             "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
         )

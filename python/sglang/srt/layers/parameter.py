@@ -73,8 +73,9 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
         raise ValueError(
             f"Downcasting not allowed: {target.dtype=}, {loaded_weight.dtype=}"
         )
-    if loaded_rank == torch.float8_e8m0fnu:
-        assert target_rank in {torch.float8_e8m0fnu, torch.float32}
+    if loaded_weight.dtype == torch.float8_e8m0fnu:
+        # ue8m0 group scales (MXFP4/MXFP8) may only widen into fp32 params.
+        assert target.dtype in (torch.float8_e8m0fnu, torch.float32)
 
     target.copy_(loaded_weight)
 
