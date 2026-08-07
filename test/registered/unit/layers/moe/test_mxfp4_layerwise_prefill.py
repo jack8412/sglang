@@ -395,8 +395,12 @@ class TestMxfp4ReservationBudget(CustomTestCase):
     _EXPECTED_BYTES = 2 * (4096 + 2048 + 1024 + 512 + 123)
 
     def _register_layer(self, signature):
+        # gpu_method carries the class name the layout classifier keys on
+        # (marlin-prepared DSV4 path).
         method = SimpleNamespace(
-            _full_init_args=(64, 32, torch.bfloat16), global_num_experts=2
+            _full_init_args=(64, 32, torch.bfloat16),
+            global_num_experts=2,
+            gpu_method=DeepSeekMxfp4MoEMethod(None),
         )
         layer = object()
         ktw._MXFP4_PREFILL_LAYER_REGISTRY[signature] = {0: (method, layer)}
@@ -513,6 +517,7 @@ class TestMxfp4HostTransport(CustomTestCase):
         log = []
         manager = object.__new__(ktw._Mxfp4LayerwisePrefillManager)
         manager.postprocess_stream = _RecordingStream("postprocess", log)
+        manager.prepared_layout = ktw._MXFP4_LAYOUT_MARLIN
         slot = SimpleNamespace(
             raw_ready_event=_RecordingEvent("raw_ready", log),
             ready_event=_RecordingEvent("ready", log),
@@ -521,7 +526,7 @@ class TestMxfp4HostTransport(CustomTestCase):
             w13_weight_scale_inv=object(),
             w2_weight=object(),
             w2_weight_scale_inv=object(),
-            marlin_prepared=object(),
+            prepared=object(),
         )
 
         def fail_prepare(*_args, **_kwargs):
@@ -536,7 +541,7 @@ class TestMxfp4HostTransport(CustomTestCase):
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "marlin prepare"):
-                manager._postprocess_slot(slot)
+                manager._postprocess_slot(slot, cpu_expert_ids=[])
 
         self.assertEqual(slot.reuse_guard, "ready")
         self.assertIn(("record", "ready", "postprocess"), log)
@@ -616,7 +621,7 @@ class TestMxfp4HostTransport(CustomTestCase):
         failing_destination.__getitem__.return_value = failing_row
         setattr(
             slot,
-            ktw._Mxfp4PrefillSlot.RAW_NAMES[0],
+            ktw._MXFP4_RAW_NAMES_BY_LAYOUT[ktw._MXFP4_LAYOUT_MARLIN][0],
             failing_destination,
         )
 
@@ -659,15 +664,16 @@ class TestMxfp4HostTransport(CustomTestCase):
         layer = SimpleNamespace(_v4_tk_path=True)
         manager = object.__new__(ktw._Mxfp4LayerwisePrefillManager)
         manager.context = SimpleNamespace(gpu_layer=layer)
+        manager.prepared_layout = ktw._MXFP4_LAYOUT_MARLIN
 
-        manager._bind_slot(SimpleNamespace(marlin_prepared=prepared))
+        manager._bind_slot(SimpleNamespace(prepared=prepared))
 
         self.assertIs(layer._v4_marlin_weights, prepared)
         self.assertTrue(layer._v4_marlin_path)
         self.assertFalse(layer._v4_tk_path)
 
     def _make_manager_and_slot(self, log):
-        names = ktw._Mxfp4PrefillSlot.RAW_NAMES
+        names = ktw._MXFP4_RAW_NAMES_BY_LAYOUT[ktw._MXFP4_LAYOUT_MARLIN]
         host_buffers = {
             names[0]: _HostBuffer(names[0], 8, 1),
             names[1]: _HostBuffer(names[1], 12, 2),
@@ -683,6 +689,8 @@ class TestMxfp4HostTransport(CustomTestCase):
         )
         manager = object.__new__(ktw._Mxfp4LayerwisePrefillManager)
         manager.context = context
+        manager.prepared_layout = ktw._MXFP4_LAYOUT_MARLIN
+        manager.raw_names = names
         manager.epoch = 7
         manager.transfer_stream = _RecordingStream("transfer", log)
         manager.postprocess_stream = _RecordingStream("postprocess", log)
@@ -706,7 +714,7 @@ class TestMxfp4HostTransport(CustomTestCase):
         )
         for name in names:
             setattr(slot, name, _Destination(name, log))
-        slot.marlin_prepared = object()
+        slot.prepared = object()
         return manager, slot
 
     def _run_transport(self, tp_rank, reuse_guard="consumed"):
@@ -812,7 +820,9 @@ class TestMxfp4HostTransport(CustomTestCase):
             name: buffer.numel() // 2 * buffer.element_size()
             for name, buffer in manager.context.cpu_buffers.items()
         }
-        for position, name in enumerate(ktw._Mxfp4PrefillSlot.RAW_NAMES, 2):
+        for position, name in enumerate(
+            ktw._MXFP4_RAW_NAMES_BY_LAYOUT[ktw._MXFP4_LAYOUT_MARLIN], 2
+        ):
             bases = manager.context.all_rank_buffer_ptrs[name]
             self.assertEqual(
                 second[position], [base + expected_offsets[name] for base in bases]
@@ -1130,7 +1140,7 @@ class TestMxfp4ApplyFallbacks(CustomTestCase):
         layer = self._layer()
         raw = {
             name: torch.empty((1, 1, 1))
-            for name in ktw._Mxfp4PrefillSlot.RAW_NAMES
+            for name in ktw._MXFP4_RAW_NAMES_BY_LAYOUT[ktw._MXFP4_LAYOUT_MARLIN]
         }
         gpu_layer = SimpleNamespace(
             **{name: SimpleNamespace(data=tensor) for name, tensor in raw.items()}
@@ -1138,6 +1148,7 @@ class TestMxfp4ApplyFallbacks(CustomTestCase):
         context = SimpleNamespace(
             gpu_layer=gpu_layer,
             _is_mxfp4_quant=True,
+            mxfp4_prepared_layout=ktw._MXFP4_LAYOUT_MARLIN,
             initialize_cpu_buffers=mock.Mock(),
         )
 

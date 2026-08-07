@@ -172,6 +172,32 @@ _MXFP4_PREFILL_LAYER_REGISTRY = {}
 _MXFP4_LAYERWISE_MANAGERS = {}
 _MXFP4_LAYERWISE_DISABLED_REASONS = {}
 
+# Prepared-slot target layouts for the MXFP4 layerwise-prefill pipeline.
+# DSV4's DeepSeekMxfp4MoEMethod consumes prepared Marlin weights; K3's native
+# Mxfp4MoEMethod consumes the trtllm-gen shuffled layout (the SiTU-capable
+# B200 kernel — Marlin's epilogue lacks SiTU, so it is never a K3 target).
+_MXFP4_LAYOUT_MARLIN = "marlin"
+_MXFP4_LAYOUT_TRTLLM = "trtllm"
+
+# Raw (pre-swizzle) slot tensor names per prepared layout.  They mirror the
+# attribute names each GPU method's create_weights registers:
+#   marlin: DeepSeekMxfp4MoEMethod.create_weights (mxfp4_deepseek.py L151-180)
+#   trtllm: Mxfp4MoEMethod.create_weights (mxfp4.py L475-533)
+_MXFP4_RAW_NAMES_BY_LAYOUT = {
+    _MXFP4_LAYOUT_MARLIN: (
+        "w13_weight",
+        "w13_weight_scale_inv",
+        "w2_weight",
+        "w2_weight_scale_inv",
+    ),
+    _MXFP4_LAYOUT_TRTLLM: (
+        "w13_weight",
+        "w13_weight_scale",
+        "w2_weight",
+        "w2_weight_scale",
+    ),
+}
+
 
 class SharedStagingBuffer:
     """Global shared staging buffer for CPU expert input across all MoE layers.
@@ -422,6 +448,10 @@ class SharedFullContext:
         """Detect quant type from weight attributes created on gpu_layer."""
         layer = self.gpu_layer
 
+        # Prepared-slot target layout for the MXFP4 layerwise-prefill
+        # pipeline; stays None for every non-MXFP4 layout.
+        self.mxfp4_prepared_layout = None
+
         # V4-Flash MXFP4 (must come before FP8 block — both register
         # `w13_weight_scale_inv`, but MXFP4 is FP4 nibble-packed weights with
         # ue8m0 scales rather than FP8 e4m3 weights with FP8 scales). Use the
@@ -434,6 +464,20 @@ class SharedFullContext:
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
+            self.mxfp4_prepared_layout = _MXFP4_LAYOUT_MARLIN
+            return
+
+        # K3 native MXFP4 (must come before FP8 per-channel — Mxfp4MoEMethod
+        # registers `w13_weight_scale`/`w2_weight_scale` too, but they are
+        # uint8 E8M0 group scales over FP4 nibble-packed weights). Class-name
+        # check for the same circular-import reason as above.
+        if self.gpu_method.__class__.__name__ == "Mxfp4MoEMethod":
+            self.is_mxfp4_quant = True
+            self.is_mxfp8_quant = False
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            self.mxfp4_prepared_layout = _MXFP4_LAYOUT_TRTLLM
             return
 
         # INT4 Marlin
@@ -606,6 +650,10 @@ class SharedFullContext:
     def weight_names(self) -> list:
         """Get weight names based on quantization type."""
         if getattr(self, "_is_mxfp4_quant", False):
+            if self.mxfp4_prepared_layout == _MXFP4_LAYOUT_TRTLLM:
+                # K3 native MXFP4: Mxfp4MoEMethod.create_weights registers
+                # w13_weight_scale / w2_weight_scale (no `_inv` suffix).
+                return self.WEIGHT_NAMES_MXFP4_TRTLLM
             # V4-Flash MXFP4 uses the same flat names as FP8 block (w13_weight,
             # w13_weight_scale_inv, w2_weight, w2_weight_scale_inv); the
             # underlying byte payload differs (FP4 nibble + ue8m0 scale) but
@@ -648,6 +696,15 @@ class SharedFullContext:
     # - Scale shape: (num_experts, output_dim, 1) vs (num_experts, blocks_n, blocks_k)
     # - Weight name: w13_weight_scale vs w13_weight_scale_inv
     WEIGHT_NAMES_FP8_CHANNEL = [
+        "w13_weight",
+        "w13_weight_scale",
+        "w2_weight",
+        "w2_weight_scale",
+    ]
+
+    # Weight names for K3 native MXFP4 (Mxfp4MoEMethod): FP4 nibble-packed
+    # weights + E8M0 group scales, registered without the `_inv` suffix.
+    WEIGHT_NAMES_MXFP4_TRTLLM = [
         "w13_weight",
         "w13_weight_scale",
         "w2_weight",
@@ -757,8 +814,17 @@ class SharedFullContext:
                 expert_shape = gpu_tensor.shape[1:]  # Shape per expert
                 if (
                     getattr(self, "_is_mxfp4_quant", False)
-                    and name in ("w13_weight_scale_inv", "w2_weight_scale_inv")
+                    and name in (
+                        "w13_weight_scale_inv",
+                        "w2_weight_scale_inv",
+                        "w13_weight_scale",
+                        "w2_weight_scale",
+                    )
                 ):
+                    # kt-kernel's write_weight_scale_to_buffer keeps its bf16
+                    # scale contract regardless of the resident scale layout;
+                    # the gpu_layer attr dtype (fp32 for DSV4, uint8 E8M0 for
+                    # K3 trtllm) does not describe the export payload.
                     buf_dtype = torch.bfloat16
                 else:
                     buf_dtype = gpu_tensor.dtype
@@ -1689,25 +1755,31 @@ class SharedFullContext:
 
 
 class _Mxfp4PrefillSlot:
-    """One complete MXFP4 layer image used by the layerwise prefill pipeline."""
+    """One complete MXFP4 layer image used by the layerwise prefill pipeline.
 
-    RAW_NAMES = (
-        "w13_weight",
-        "w13_weight_scale_inv",
-        "w2_weight",
-        "w2_weight_scale_inv",
-    )
+    ``raw_names`` tags the raw tensor layout and ``prepared`` holds the
+    layout's prepared image (``V4MarlinPreparedWeights`` for DSV4's marlin
+    target, ``TrtllmPreparedWeights`` for K3's trtllm-gen target); see
+    ``_MXFP4_RAW_NAMES_BY_LAYOUT``.
+    """
 
     def __init__(
         self,
         index: int,
         raw_tensors: Dict[str, torch.Tensor],
-        marlin_prepared,
+        prepared,
+        *,
+        raw_names: tuple,
     ):
         self.index = index
-        for name in self.RAW_NAMES:
+        self.raw_names = tuple(raw_names)
+        for name in self.raw_names:
             setattr(self, name, raw_tensors[name])
-        self.marlin_prepared = marlin_prepared
+        self.prepared = prepared
+        # Stable nn.Parameter views over `prepared` for layouts whose apply
+        # reads prepared tensors straight off layer attributes (trtllm);
+        # filled by the manager, None for the marlin layout.
+        self.prepared_params = None
 
         self.state = "EMPTY"
         self.layer_idx: Optional[int] = None
@@ -1742,20 +1814,40 @@ class _Mxfp4LayerwisePrefillManager:
         self,
         context: SharedFullContext,
         signature: tuple,
+        slot0_raw_tensors: Dict[str, torch.Tensor],
         slot1_raw_tensors: Dict[str, torch.Tensor],
-        slot_marlin_prepared: tuple,
+        slot_prepared: tuple,
     ):
         self.context = context
         self.signature = signature
+        self.prepared_layout = context.mxfp4_prepared_layout
+        self.raw_names = _MXFP4_RAW_NAMES_BY_LAYOUT[self.prepared_layout]
         self.device = context.gpu_layer.w13_weight.device
-        slot0_raw = {
-            name: getattr(context.gpu_layer, name).data
-            for name in _Mxfp4PrefillSlot.RAW_NAMES
-        }
         self.slots = (
-            _Mxfp4PrefillSlot(0, slot0_raw, slot_marlin_prepared[0]),
-            _Mxfp4PrefillSlot(1, slot1_raw_tensors, slot_marlin_prepared[1]),
+            _Mxfp4PrefillSlot(
+                0, slot0_raw_tensors, slot_prepared[0], raw_names=self.raw_names
+            ),
+            _Mxfp4PrefillSlot(
+                1, slot1_raw_tensors, slot_prepared[1], raw_names=self.raw_names
+            ),
         )
+        if self.prepared_layout == _MXFP4_LAYOUT_TRTLLM:
+            for slot in self.slots:
+                slot.prepared_params = {
+                    "w13_weight": torch.nn.Parameter(
+                        slot.prepared.w13, requires_grad=False
+                    ),
+                    "w13_weight_scale": torch.nn.Parameter(
+                        slot.prepared.w13_scale, requires_grad=False
+                    ),
+                    "w2_weight": torch.nn.Parameter(
+                        slot.prepared.w2, requires_grad=False
+                    ),
+                    "w2_weight_scale": torch.nn.Parameter(
+                        slot.prepared.w2_scale, requires_grad=False
+                    ),
+                }
+            self._initialize_trtllm_static_layer_attrs()
         self.transfer_stream = torch.cuda.Stream(device=self.device)
         self.postprocess_stream = torch.cuda.Stream(device=self.device)
         # Runtime transport control must not use the main stream: it is
@@ -1776,6 +1868,60 @@ class _Mxfp4LayerwisePrefillManager:
         self.last_layer_position: Optional[int] = None
         self.current_slot_index: Optional[int] = None
         self.round_active = False
+
+    def _initialize_trtllm_static_layer_attrs(self) -> None:
+        """Create the per-layer-invariant attributes Mxfp4MoEMethod.apply
+        reads that its process_weights_after_loading would have set.
+
+        Mirrors mxfp4.py L629-644 (gemm1_alpha / gemm1_beta /
+        gemm1_clamp_limit from the runner config) and L831-838 (float32
+        shuffled bias stacks).  The kt export carries no bias channel and the
+        shadow layer's biases are zero-initialized, so the shuffled biases
+        are exact zeros of the post-shuffle shape.
+        """
+        layer = self.context.gpu_layer
+        slot = self.slots[0]
+        num_experts = slot.num_experts
+        w13_rows = slot.w13_weight.shape[1]
+        hidden_size = slot.w2_weight.shape[1]
+        alpha = layer.moe_runner_config.gemm1_alpha or 1.702
+        limit = layer.moe_runner_config.gemm1_clamp_limit or 7.0
+        layer.gemm1_alpha = torch.nn.Parameter(
+            torch.full(
+                (num_experts,),
+                float(alpha),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            requires_grad=False,
+        )
+        layer.gemm1_beta = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32, device=self.device),
+            requires_grad=False,
+        )
+        layer.gemm1_clamp_limit = torch.nn.Parameter(
+            torch.full(
+                (num_experts,),
+                float(limit),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            requires_grad=False,
+        )
+        layer.w13_weight_bias = torch.nn.Parameter(
+            torch.zeros(
+                (num_experts, w13_rows), dtype=torch.float32, device=self.device
+            ),
+            requires_grad=False,
+        )
+        layer.w2_weight_bias = torch.nn.Parameter(
+            torch.zeros(
+                (num_experts, hidden_size),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            requires_grad=False,
+        )
 
     @property
     def registry(self):
@@ -1837,7 +1983,7 @@ class _Mxfp4LayerwisePrefillManager:
     ) -> None:
         """Tell the caching allocator which prepared tensors compute consumes."""
 
-        prepared = slot.marlin_prepared
+        prepared = slot.prepared
         for tensor in (
             prepared.w13,
             prepared.w13_scale,
@@ -1848,9 +1994,18 @@ class _Mxfp4LayerwisePrefillManager:
 
     def _bind_slot(self, slot: _Mxfp4PrefillSlot) -> None:
         layer = self.context.gpu_layer
-        layer._v4_marlin_weights = slot.marlin_prepared
-        layer._v4_marlin_path = True
-        layer._v4_tk_path = False
+        if self.prepared_layout == _MXFP4_LAYOUT_MARLIN:
+            layer._v4_marlin_weights = slot.prepared
+            layer._v4_marlin_path = True
+            layer._v4_tk_path = False
+            return
+        # trtllm: Mxfp4MoEMethod.apply reads the shuffled stacks straight off
+        # the layer attributes its process_weights_after_loading rebinds
+        # (mxfp4.py L827-830; consumed at L1575-1582 situ / L1655-1662
+        # trtllm).  Install the slot's stable Parameter views over exactly
+        # those names and delegate to the resident method's apply.
+        for name, param in slot.prepared_params.items():
+            setattr(layer, name, param)
 
     def _tp_phase_succeeded(self, local_success: bool) -> bool:
         if (
@@ -1926,41 +2081,96 @@ class _Mxfp4LayerwisePrefillManager:
             return tensor.numel() // 2 * tensor.element_size()
 
         offsets = {
-            name: host_slot * expert_nbytes(name)
-            for name in _Mxfp4PrefillSlot.RAW_NAMES
+            name: host_slot * expert_nbytes(name) for name in self.raw_names
         }
 
         def rank_pointers(name: str) -> List[int]:
             return [ptr + offsets[name] for ptr in pointers[name]]
 
+        # raw_names order is (w13, w13_scale, w2, w2_scale) in every layout —
+        # the positional contract of write_weight_scale_to_buffer.
+        w13_name, w13_scale_name, w2_name, w2_scale_name = self.raw_names
         method.wrapper.submit_write_weight_scale_to_buffer(
             get_parallel().tp_size,
             expert_id,
-            rank_pointers("w13_weight"),
-            rank_pointers("w13_weight_scale_inv"),
-            rank_pointers("w2_weight"),
-            rank_pointers("w2_weight_scale_inv"),
+            rank_pointers(w13_name),
+            rank_pointers(w13_scale_name),
+            rank_pointers(w2_name),
+            rank_pointers(w2_scale_name),
         )
         method.wrapper.sync_write_weight_scale_to_buffer()
 
-    def _postprocess_slot(self, slot: _Mxfp4PrefillSlot) -> None:
-        from sglang.srt.layers.quantization.v4_marlin_moe import (
-            prepare_v4_mxfp4_marlin,
-        )
+    def _copy_resident_trtllm_experts(
+        self,
+        *,
+        slot: _Mxfp4PrefillSlot,
+        method,
+        original_layer: torch.nn.Module,
+        gpu_expert_ids: List[int],
+    ) -> None:
+        """Copy GPU-resident experts straight into the prepared slot image.
 
+        After Mxfp4MoEMethod.process_weights_after_loading the resident layer
+        holds only trtllm-gen shuffled stacks (mxfp4.py L827-830; the raw
+        checkpoint layout is not preserved).  Both the weight shuffle and the
+        scale interleave permute within one expert, so the resident expert's
+        shuffled image is byte-identical to what the export+swizzle path
+        would produce — copy it into ``slot.prepared`` and skip its raw rows
+        entirely.  Caller runs on the transfer stream after the slot reuse
+        fences.
+        """
+        prepared = slot.prepared
+        resident_pairs = (
+            (original_layer.w13_weight, prepared.w13),
+            (original_layer.w13_weight_scale, prepared.w13_scale),
+            (original_layer.w2_weight, prepared.w2),
+            (original_layer.w2_weight_scale, prepared.w2_scale),
+        )
+        for expert_id in gpu_expert_ids:
+            gpu_index = method.logical_to_gpu_index[expert_id].item()
+            for source, destination in resident_pairs:
+                destination[expert_id].copy_(
+                    source[gpu_index], non_blocking=True
+                )
+
+    def _postprocess_slot(
+        self, slot: _Mxfp4PrefillSlot, *, cpu_expert_ids: List[int]
+    ) -> None:
         with torch.cuda.stream(self.postprocess_stream):
             self.postprocess_stream.wait_event(slot.raw_ready_event)
             try:
                 # Repack and scale-swizzle into stable caller-owned storage.  The
-                # kernel is current-stream ordered and publishes no events; the
+                # kernels are current-stream ordered and publish no events; the
                 # layerwise scheduler owns the raw/ready/consumed lifecycle.
-                prepare_v4_mxfp4_marlin(
-                    slot.w13_weight,
-                    slot.w13_weight_scale_inv,
-                    slot.w2_weight,
-                    slot.w2_weight_scale_inv,
-                    out=slot.marlin_prepared,
-                )
+                if self.prepared_layout == _MXFP4_LAYOUT_MARLIN:
+                    from sglang.srt.layers.quantization.v4_marlin_moe import (
+                        prepare_v4_mxfp4_marlin,
+                    )
+
+                    prepare_v4_mxfp4_marlin(
+                        slot.w13_weight,
+                        slot.w13_weight_scale_inv,
+                        slot.w2_weight,
+                        slot.w2_weight_scale_inv,
+                        out=slot.prepared,
+                    )
+                else:
+                    # trtllm: only CPU-resident experts hold export bytes in
+                    # the raw slot; GPU-resident experts were copied into the
+                    # prepared image directly (already shuffled) and their
+                    # prepared rows must not be overwritten.
+                    from sglang.srt.layers.moe.kt_mxfp4_export import (
+                        prepare_trtllm_mxfp4,
+                    )
+
+                    prepare_trtllm_mxfp4(
+                        slot.w13_weight,
+                        slot.w13_weight_scale,
+                        slot.w2_weight,
+                        slot.w2_weight_scale,
+                        out=slot.prepared,
+                        expert_ids=cpu_expert_ids,
+                    )
             finally:
                 # Even an exceptional conversion attempt must publish a fence
                 # before this slot can be overwritten on a retry.
@@ -2015,7 +2225,7 @@ class _Mxfp4LayerwisePrefillManager:
                         self.context.cpu_buffers[name],
                         getattr(slot, name),
                     )
-                    for name in _Mxfp4PrefillSlot.RAW_NAMES
+                    for name in self.raw_names
                 ]
                 gpu_expert_ids = []
                 cpu_expert_ids = []
@@ -2048,13 +2258,23 @@ class _Mxfp4LayerwisePrefillManager:
                         self.transfer_stream.wait_event(slot.ready_event)
                     elif reuse_guard == "raw":
                         self.transfer_stream.wait_event(slot.raw_ready_event)
-                    for expert_id in gpu_expert_ids:
-                        gpu_index = method.logical_to_gpu_index[expert_id].item()
-                        for name, _, destination in weight_infos:
-                            source = getattr(original_layer, name)
-                            destination[expert_id].copy_(
-                                source[gpu_index], non_blocking=True
-                            )
+                    if self.prepared_layout == _MXFP4_LAYOUT_MARLIN:
+                        for expert_id in gpu_expert_ids:
+                            gpu_index = method.logical_to_gpu_index[
+                                expert_id
+                            ].item()
+                            for name, _, destination in weight_infos:
+                                source = getattr(original_layer, name)
+                                destination[expert_id].copy_(
+                                    source[gpu_index], non_blocking=True
+                                )
+                    else:
+                        self._copy_resident_trtllm_experts(
+                            slot=slot,
+                            method=method,
+                            original_layer=original_layer,
+                            gpu_expert_ids=gpu_expert_ids,
+                        )
             except Exception as exc:
                 gpu_copy_error = exc
             self._commit_tp_runtime_phase(
@@ -2153,7 +2373,7 @@ class _Mxfp4LayerwisePrefillManager:
 
             postprocess_error = None
             try:
-                self._postprocess_slot(slot)
+                self._postprocess_slot(slot, cpu_expert_ids=cpu_expert_ids)
             except Exception as exc:
                 postprocess_error = exc
             self._commit_tp_runtime_phase(
@@ -2324,25 +2544,95 @@ def _mxfp4_pipeline_requested(method) -> bool:
     )
 
 
+def _mxfp4_pipeline_layout_or_reason(method) -> Tuple[Optional[str], Optional[str]]:
+    """Classify the resident GPU method into a prepared-slot layout.
+
+    Returns ``(layout, None)`` for a supported configuration,
+    ``(None, reason)`` for a *recognized-but-unsupported* MXFP4 mode (the
+    caller records the reason so threshold-qualified prefills stay on the
+    hybrid path instead of the incompatible serial fallback), and
+    ``(None, None)`` for unknown layouts — which keep today's plain
+    unsupported semantics.
+    """
+    gpu_method = method.gpu_method
+    if gpu_method.__class__.__name__ == "DeepSeekMxfp4MoEMethod":
+        return _MXFP4_LAYOUT_MARLIN, None
+
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    # Precise class check: the DSV4 wrap chain (DeepSeekMxfp4MoEMethod over
+    # Fp8MoEMethod) is handled above and subclasses are not vetted.
+    if type(gpu_method) is not Mxfp4MoEMethod:
+        return None, None
+    # Mode checks follow Mxfp4MoEMethod.apply's dispatch priority
+    # (mxfp4.py L1368 deep_gemm, L1426 marlin, L1430-1433 cutlass,
+    # L1434 flashinfer trtllm).
+    if gpu_method.use_deep_gemm:
+        return None, (
+            "resident Mxfp4MoEMethod is in deep_gemm mode; the layerwise "
+            "slot pipeline supports only the flashinfer trtllm-gen (SM100) "
+            "backend"
+        )
+    if gpu_method.use_marlin:
+        return None, (
+            "resident Mxfp4MoEMethod is in marlin mode, whose epilogue "
+            "lacks SiTU; the layerwise slot pipeline supports only the "
+            "flashinfer trtllm-gen (SM100) backend"
+        )
+    if gpu_method._fi_kernel != "trtllm_sm100":
+        return None, (
+            "resident Mxfp4MoEMethod is not in flashinfer trtllm-gen mode "
+            f"(fi_kernel={gpu_method._fi_kernel!r}, "
+            f"use_flashinfer={gpu_method.use_flashinfer}); the layerwise "
+            "slot pipeline supports only the SM100 trtllm-gen backend"
+        )
+    if method.moe_runner_config.activation != "situ":
+        return None, (
+            "resident Mxfp4MoEMethod trtllm-gen path needs "
+            "activation='situ' (the KT dispatch provides precomputed "
+            "standard routing, which the non-situ trtllm branch does not "
+            f"accept); got activation="
+            f"{method.moe_runner_config.activation!r}"
+        )
+    return _MXFP4_LAYOUT_TRTLLM, None
+
+
 def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
     if not _mxfp4_pipeline_requested(method) or not torch.cuda.is_available():
         return False
-    if method.gpu_method.__class__.__name__ != "DeepSeekMxfp4MoEMethod":
+    layout, unsupported_reason = _mxfp4_pipeline_layout_or_reason(method)
+    if layout is None:
+        if unsupported_reason is not None:
+            # Recognized MXFP4 mode the pipeline cannot serve: record a
+            # TP-consistent disabled reason (the classification is derived
+            # from process-global config, identical on every rank) so these
+            # layers use hybrid CPU/GPU MoE.  Unknown layouts fall through
+            # with no reason, keeping today's semantics.
+            signature = _mxfp4_pipeline_signature(method, layer)
+            if signature not in _MXFP4_LAYERWISE_DISABLED_REASONS:
+                _disable_mxfp4_layerwise_pipeline(
+                    signature, unsupported_reason
+                )
         return False
-    # Respect both diagnostic overrides.  The default capability-driven path
-    # uses the prepared Marlin backend on Ada and Blackwell consumer GPUs.
-    if envs.SGLANG_V4_USE_TRITON_KERNELS.get() in ("0", "1"):
-        return False
-    device = next(layer.parameters()).device
-    return torch.cuda.get_device_capability(device) in ((8, 9), (12, 0))
+    if layout == _MXFP4_LAYOUT_MARLIN:
+        # Respect both diagnostic overrides.  The default capability-driven
+        # path uses the prepared Marlin backend on Ada and Blackwell
+        # consumer GPUs.
+        if envs.SGLANG_V4_USE_TRITON_KERNELS.get() in ("0", "1"):
+            return False
+        device = next(layer.parameters()).device
+        return torch.cuda.get_device_capability(device) in ((8, 9), (12, 0))
+    # trtllm: _fi_kernel == "trtllm_sm100" already encodes the SM100
+    # capability check performed at Mxfp4MoEMethod construction.
+    return True
 
 
 def _mxfp4_pipeline_runtime_supported(method, layer: torch.nn.Module) -> bool:
-    return (
-        _mxfp4_pipeline_backend_supported(method, layer)
-        and all(
-            hasattr(layer, name) for name in _Mxfp4PrefillSlot.RAW_NAMES
-        )
+    if not _mxfp4_pipeline_backend_supported(method, layer):
+        return False
+    layout, _ = _mxfp4_pipeline_layout_or_reason(method)
+    return all(
+        hasattr(layer, name) for name in _MXFP4_RAW_NAMES_BY_LAYOUT[layout]
     )
 
 
@@ -2369,6 +2659,46 @@ def _mxfp4_raw_slot_storage_nbytes(
         * (intermediate_size // 32)
         * float32_size
     )
+
+
+def _mxfp4_trtllm_raw_slot_storage_nbytes(
+    *, num_experts: int, hidden_size: int, intermediate_size: int
+) -> int:
+    """One full-expert raw slot for the trtllm layout, without allocating.
+
+    Uint8 FP4 nibble weights shaped as ``Mxfp4MoEMethod.create_weights``
+    registers them, plus **bf16** export scales (the SHM/H2D payload dtype;
+    the created uint8 E8M0 scale params cannot serve as raw slot storage —
+    see ``_allocate_mxfp4_slot_storage``).
+    """
+    uint8_size = torch.tensor([], dtype=torch.uint8).element_size()
+    bf16_size = torch.tensor([], dtype=torch.bfloat16).element_size()
+    weight_bytes = (
+        num_experts * (2 * intermediate_size) * (hidden_size // 2) * uint8_size
+        + num_experts * hidden_size * (intermediate_size // 2) * uint8_size
+    )
+    scale_elems = num_experts * (2 * intermediate_size) * (
+        hidden_size // 32
+    ) + num_experts * hidden_size * (intermediate_size // 32)
+    return weight_bytes + scale_elems * bf16_size
+
+
+def _mxfp4_trtllm_shadow_static_nbytes(
+    *, num_experts: int, hidden_size: int, intermediate_size: int
+) -> int:
+    """Shadow-layer allocations the trtllm pipeline retains beyond the two
+    raw and two prepared slots: create_weights' uint8 E8M0 scale params and
+    bf16 biases (kept alive via ``SharedFullContext.original_params``) plus
+    the float32 static attrs ``_initialize_trtllm_static_layer_attrs`` adds.
+    """
+    scale_elems = num_experts * (2 * intermediate_size) * (
+        hidden_size // 32
+    ) + num_experts * hidden_size * (intermediate_size // 32)
+    bias_elems = num_experts * (2 * intermediate_size) + num_experts * hidden_size
+    scalar_elems = 3 * num_experts
+    # uint8 scales + bf16 raw biases + float32 shuffled biases + float32
+    # gemm1_alpha/beta/clamp_limit.
+    return scale_elems + bias_elems * (2 + 4) + scalar_elems * 4
 
 
 def mxfp4_layerwise_prefill_reservation_gib(server_args) -> float:
@@ -2412,21 +2742,51 @@ def get_mxfp4_layerwise_prefill_reservation_bytes() -> int:
             continue
         hidden_size, intermediate_size, _ = init_args
 
-        from sglang.srt.layers.quantization.v4_marlin_moe import (
-            get_v4_mxfp4_marlin_storage_nbytes,
-        )
+        layout, _ = _mxfp4_pipeline_layout_or_reason(method)
+        if layout == _MXFP4_LAYOUT_MARLIN:
+            from sglang.srt.layers.quantization.v4_marlin_moe import (
+                get_v4_mxfp4_marlin_storage_nbytes,
+            )
 
-        raw_slot_bytes = _mxfp4_raw_slot_storage_nbytes(
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-        )
-        prepared_slot_bytes = get_v4_mxfp4_marlin_storage_nbytes(
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-        )
-        total_bytes += 2 * (raw_slot_bytes + prepared_slot_bytes)
+            raw_slot_bytes = _mxfp4_raw_slot_storage_nbytes(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+            prepared_slot_bytes = get_v4_mxfp4_marlin_storage_nbytes(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+            total_bytes += 2 * (raw_slot_bytes + prepared_slot_bytes)
+        elif layout == _MXFP4_LAYOUT_TRTLLM:
+            if hidden_size % 128 or intermediate_size % 128:
+                # Mxfp4MoEMethod.create_weights would pad these dims, so the
+                # export-shaped slot layout cannot apply; initialization
+                # disables the pipeline with a reason and no slot capacity
+                # is ever allocated.
+                continue
+            from sglang.srt.layers.moe.kt_mxfp4_export import (
+                get_trtllm_mxfp4_storage_nbytes,
+            )
+
+            raw_slot_bytes = _mxfp4_trtllm_raw_slot_storage_nbytes(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+            prepared_slot_bytes = get_trtllm_mxfp4_storage_nbytes(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+            total_bytes += 2 * (
+                raw_slot_bytes + prepared_slot_bytes
+            ) + _mxfp4_trtllm_shadow_static_nbytes(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
 
     return total_bytes
 
@@ -2488,24 +2848,69 @@ def _try_mxfp4_initialization(factory):
 
 
 def _allocate_mxfp4_slot_storage(context: SharedFullContext):
-    from sglang.srt.layers.quantization.v4_marlin_moe import (
-        allocate_v4_mxfp4_marlin,
-    )
+    """Build (slot0_raw, slot1_raw, slot_prepared) for the context's layout.
 
+    Marlin (DSV4): slot 0 raw storage reuses all four created params; the
+    prepared Marlin images live in separate storage.
+
+    trtllm (K3): slot 0 reuses the created uint8 weight params, but the raw
+    scale storage must be fresh **bf16** tensors — the export payload is
+    bf16 while ``Mxfp4MoEMethod.create_weights`` registers uint8 E8M0 scale
+    params, and a bf16→uint8 ``copy_`` would numerically cast instead of
+    transporting bytes.
+    """
+    layer = context.gpu_layer
+    if context.mxfp4_prepared_layout == _MXFP4_LAYOUT_MARLIN:
+        from sglang.srt.layers.quantization.v4_marlin_moe import (
+            allocate_v4_mxfp4_marlin,
+        )
+
+        raw_names = _MXFP4_RAW_NAMES_BY_LAYOUT[_MXFP4_LAYOUT_MARLIN]
+        slot0_raw = {name: getattr(layer, name).data for name in raw_names}
+        slot1_raw = {
+            name: torch.empty_like(getattr(layer, name).data)
+            for name in raw_names
+        }
+        num_experts = slot0_raw["w13_weight"].shape[0]
+        hidden_size = slot0_raw["w13_weight"].shape[2] * 2
+        intermediate_size = slot0_raw["w2_weight"].shape[2] * 2
+        device = slot0_raw["w13_weight"].device
+        slot_prepared = tuple(
+            allocate_v4_mxfp4_marlin(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=device,
+            )
+            for _ in range(2)
+        )
+        return slot0_raw, slot1_raw, slot_prepared
+
+    from sglang.srt.layers.moe.kt_mxfp4_export import allocate_trtllm_mxfp4
+
+    device = layer.w13_weight.device
     slot0_raw = {
-        name: getattr(context.gpu_layer, name).data
-        for name in _Mxfp4PrefillSlot.RAW_NAMES
+        "w13_weight": layer.w13_weight.data,
+        "w13_weight_scale": torch.empty(
+            tuple(layer.w13_weight_scale.shape),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        "w2_weight": layer.w2_weight.data,
+        "w2_weight_scale": torch.empty(
+            tuple(layer.w2_weight_scale.shape),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
     }
     slot1_raw = {
-        name: torch.empty_like(getattr(context.gpu_layer, name).data)
-        for name in _Mxfp4PrefillSlot.RAW_NAMES
+        name: torch.empty_like(tensor) for name, tensor in slot0_raw.items()
     }
     num_experts = slot0_raw["w13_weight"].shape[0]
     hidden_size = slot0_raw["w13_weight"].shape[2] * 2
     intermediate_size = slot0_raw["w2_weight"].shape[2] * 2
-    device = slot0_raw["w13_weight"].device
-    slot_marlin_prepared = tuple(
-        allocate_v4_mxfp4_marlin(
+    slot_prepared = tuple(
+        allocate_trtllm_mxfp4(
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -2513,7 +2918,48 @@ def _allocate_mxfp4_slot_storage(context: SharedFullContext):
         )
         for _ in range(2)
     )
-    return slot1_raw, slot_marlin_prepared
+    return slot0_raw, slot1_raw, slot_prepared
+
+
+def _trtllm_export_shape_mismatch(
+    *, context: SharedFullContext, method
+) -> Optional[str]:
+    """Return a disable reason if the shadow layer cannot hold kt-export
+    bytes, else None.
+
+    ``Mxfp4MoEMethod.create_weights`` pads hidden/intermediate to multiples
+    of 128 on the SM100 flashinfer branch (mxfp4.py L414-417).  The kt
+    export writes unpadded ``[2I, H/2]`` / ``[H, I/2]`` shards, so any
+    padding breaks the raw byte layout (row-stride mismatch) and the
+    pipeline must fall back to hybrid CPU/GPU MoE.
+    """
+    hidden_size, intermediate_size, _ = method._full_init_args
+    layer = context.gpu_layer
+    expected_w13 = (
+        method.global_num_experts,
+        2 * intermediate_size,
+        hidden_size // 2,
+    )
+    expected_w2 = (
+        method.global_num_experts,
+        hidden_size,
+        intermediate_size // 2,
+    )
+    actual_w13 = tuple(layer.w13_weight.shape)
+    actual_w2 = tuple(layer.w2_weight.shape)
+    if actual_w13 != expected_w13 or actual_w2 != expected_w2:
+        return (
+            "trtllm-gen layerwise slots need kt-export-shaped raw weights; "
+            f"Mxfp4MoEMethod.create_weights padded them (w13 {actual_w13} "
+            f"vs expected {expected_w13}, w2 {actual_w2} vs expected "
+            f"{expected_w2})"
+        )
+    if hidden_size % 128 or intermediate_size % 128:
+        return (
+            "trtllm-gen shuffled layout requires hidden/intermediate "
+            f"multiples of 128, got {hidden_size}/{intermediate_size}"
+        )
+    return None
 
 
 def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None:
@@ -2555,6 +3001,23 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
         return
     if context is None or not getattr(context, "_is_mxfp4_quant", False):
         raise RuntimeError("MXFP4 layerwise prefill built a non-MXFP4 full context")
+    expected_layout, _ = _mxfp4_pipeline_layout_or_reason(method)
+    if context.mxfp4_prepared_layout != expected_layout:
+        raise RuntimeError(
+            "MXFP4 layerwise prefill context layout "
+            f"{context.mxfp4_prepared_layout!r} does not match the resident "
+            f"method's prepared layout {expected_layout!r}"
+        )
+    if expected_layout == _MXFP4_LAYOUT_TRTLLM:
+        # Deterministic on every rank (pure shape math on shared config), so
+        # no TP consensus round is needed before disabling.
+        shape_mismatch = _trtllm_export_shape_mismatch(
+            context=context, method=method
+        )
+        if shape_mismatch is not None:
+            context = None
+            _disable_mxfp4_layerwise_pipeline(signature, shape_mismatch)
+            return
 
     slot_storage, slot_failure = _try_mxfp4_initialization(
         lambda: _allocate_mxfp4_slot_storage(context)
@@ -2577,18 +3040,23 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
             "full-layer raw/prepared allocation failed on at least one TP rank",
         )
         return
-    slot1_raw, slot_marlin_prepared = slot_storage
+    slot0_raw, slot1_raw, slot_prepared = slot_storage
 
     manager, manager_failure = _try_mxfp4_initialization(
         lambda: _Mxfp4LayerwisePrefillManager(
-            context, signature, slot1_raw, slot_marlin_prepared
+            context=context,
+            signature=signature,
+            slot0_raw_tensors=slot0_raw,
+            slot1_raw_tensors=slot1_raw,
+            slot_prepared=slot_prepared,
         )
     )
     if not _all_tp_ranks_succeeded(manager_failure is None):
         manager = None
         slot_storage = None
+        slot0_raw.clear()
         slot1_raw.clear()
-        slot_marlin_prepared = None
+        slot_prepared = None
         context = None
         fatal_error = _any_tp_rank_true(
             manager_failure is not None and manager_failure[0] == "fatal"
@@ -2612,22 +3080,23 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
         raw_bytes = sum(
             getattr(slot, name).numel() * getattr(slot, name).element_size()
             for slot in manager.slots
-            for name in _Mxfp4PrefillSlot.RAW_NAMES
+            for name in manager.raw_names
         )
         prepared_bytes = sum(
             tensor.numel() * tensor.element_size()
             for slot in manager.slots
             for tensor in (
-                slot.marlin_prepared.w13,
-                slot.marlin_prepared.w13_scale,
-                slot.marlin_prepared.w2,
-                slot.marlin_prepared.w2_scale,
+                slot.prepared.w13,
+                slot.prepared.w13_scale,
+                slot.prepared.w2,
+                slot.prepared.w2_scale,
             )
         )
         logger.info(
-            "KT MXFP4 layerwise prefill lazily initialized two raw + two Marlin "
-            "prepared full-layer slots on %s (raw=%.2f GiB, "
+            "KT MXFP4 layerwise prefill lazily initialized two raw + two "
+            "%s-prepared full-layer slots on %s (raw=%.2f GiB, "
             "prepared=%.2f GiB, total=%.2f GiB)",
+            manager.prepared_layout,
             manager.device,
             raw_bytes / 1024**3,
             prepared_bytes / 1024**3,
@@ -3917,8 +4386,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
             if _mxfp4_manager is not None:
                 raise RuntimeError(
-                    "MXFP4 Marlin layerwise prefill was initialized, but the "
-                    "runtime layer has no compatible raw MXFP4 weights"
+                    "MXFP4 layerwise prefill was initialized, but the "
+                    "runtime layer has no compatible MXFP4 weights"
                 )
 
             # Non-MXFP4 and unsupported MXFP4 backends retain the existing
