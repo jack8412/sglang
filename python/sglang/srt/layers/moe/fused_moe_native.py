@@ -81,9 +81,12 @@ def moe_forward_native(
     # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
     len_experts = layer.num_experts
 
-    cnts = topk_ids.new_zeros((topk_ids.shape[0], len_experts))
-    cnts.scatter_(1, topk_ids.to(torch.int64), 1)
-    tokens_per_expert = cnts.sum(dim=0)
+    # bincount, not a scatter_(…, 1) count: rows may carry duplicate expert
+    # ids (the zeroed-out masked entries above all point at expert 0), and
+    # scatter collapses duplicates, undercounting tokens_per_expert.
+    tokens_per_expert = torch.bincount(
+        topk_ids.view(-1).to(torch.int64), minlength=len_experts
+    )
     idxs = topk_ids.view(-1).argsort()
 
     sorted_tokens = x[idxs // topk_ids.shape[1]]
