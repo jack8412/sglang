@@ -272,6 +272,50 @@ class TestPlacementMaskGenerators(CustomTestCase):
         self.assertEqual(int(first[2:].sum()), 100)
 
 
+class TestPlacementAwareDeferredSelector(CustomTestCase):
+    """Regression for the flat deferral measurement on the 8xB200 node: the
+    kt wheel's default ``select_deferred_experts`` defers the token's
+    lowest-score experts regardless of placement, so with ~69% of experts
+    GPU-resident most deferred slots fell on experts the CPU skips anyway
+    and ``--kt-max-deferred-experts-per-token`` bought nothing.  The
+    replacement must defer real CPU work only."""
+
+    def _selector(self, gpu_mask):
+        return ktw.make_placement_aware_deferred_selector(gpu_mask)
+
+    def test_defers_lowest_score_cpu_resident_only(self):
+        # Experts 0-2 GPU-resident, 3-5 CPU-resident.
+        gpu_mask = torch.tensor([True, True, True, False, False, False])
+        select = self._selector(gpu_mask)
+        expert_ids = torch.tensor([[0, 3, 4, 1, 5, 2]])
+        scores = torch.tensor([[0.05, 0.4, 0.2, 0.1, 0.3, 0.5]])
+        # budget 2 -> defer the two lowest-score CPU experts: 4 (.2), 5 (.3).
+        # A placement-blind selector would defer ids 0 (.05) and 1 (.1).
+        immediate, deferred = select(expert_ids, scores, protected_k=4)
+        self.assertEqual(immediate.tolist(), [[0, 3, -1, 1, -1, 2]])
+        self.assertEqual(deferred.tolist(), [[-1, -1, 4, -1, 5, -1]])
+
+    def test_token_with_fewer_cpu_experts_than_budget(self):
+        gpu_mask = torch.tensor([True, True, True, True, True, False])
+        select = self._selector(gpu_mask)
+        expert_ids = torch.tensor([[0, 1, 5, 2]])
+        scores = torch.tensor([[0.4, 0.3, 0.2, 0.1]])
+        # Budget 3 but only expert 5 is CPU-resident: the +inf placeholder
+        # picks must stay immediate, not become spurious deferrals.
+        immediate, deferred = select(expert_ids, scores, protected_k=1)
+        self.assertEqual(immediate.tolist(), [[0, 1, -1, 2]])
+        self.assertEqual(deferred.tolist(), [[-1, -1, 5, -1]])
+
+    def test_zero_budget_returns_wheel_disabled_contract(self):
+        gpu_mask = torch.tensor([True, False])
+        select = self._selector(gpu_mask)
+        expert_ids = torch.tensor([[0, 1]])
+        scores = torch.tensor([[0.6, 0.4]])
+        immediate, deferred = select(expert_ids, scores, protected_k=2)
+        self.assertIs(immediate, expert_ids)
+        self.assertIsNone(deferred)
+
+
 class TestSituCtorContract(CustomTestCase):
     """create_weights must resolve the Kimi-K3 SiTU activation into the
     dedicated situ_beta/situ_linear_beta ctor channel (zeroing the legacy

@@ -3685,6 +3685,53 @@ def mask_and_remap_expert_ids(
     return remapped_ids
 
 
+def make_placement_aware_deferred_selector(gpu_experts_mask_cuda: torch.Tensor):
+    """Build a deferral selector that only defers CPU-resident experts.
+
+    Drop-in replacement for the kt wheel's ``select_deferred_experts``
+    (same ``(expert_ids, expert_scores, protected_k) -> (immediate,
+    deferred)`` contract, ``-1``-masked tensors).  The wheel's default
+    protects the top-``protected_k`` by routing score and defers the rest
+    regardless of placement; with most experts GPU-resident the deferred
+    slots then fall mostly on experts the CPU skips anyway and deferral
+    saves almost nothing.  This selector defers the ``topk - protected_k``
+    LOWEST-score experts among the token's CPU-resident ones, moving real
+    CPU work off the per-layer critical path.
+
+    Reads the live per-layer ``gpu_experts_mask_cuda`` (updated in place by
+    dynamic promotion) with pure tensor ops, so it is CUDA-graph capturable
+    and follows mask updates at replay.
+    """
+
+    def select(
+        expert_ids: torch.Tensor,
+        expert_scores: torch.Tensor,
+        protected_k: int,
+    ):
+        topk = expert_ids.shape[-1]
+        defer_budget = topk - max(0, min(int(protected_k), topk))
+        if defer_budget <= 0:
+            return expert_ids, None
+        safe_ids = expert_ids.clamp_min(0)
+        cpu_routed = ~gpu_experts_mask_cuda[safe_ids] & (expert_ids >= 0)
+        candidate_scores = expert_scores.masked_fill(
+            ~cpu_routed, float("inf")
+        )
+        defer_slots = torch.topk(
+            candidate_scores, k=min(defer_budget, topk), dim=-1, largest=False
+        ).indices
+        picked_scores = torch.gather(candidate_scores, -1, defer_slots)
+        deferred_mask = torch.zeros_like(expert_ids, dtype=torch.bool)
+        # Tokens with fewer CPU-routed experts than the budget picked +inf
+        # placeholders — keep those slots immediate.
+        deferred_mask.scatter_(-1, defer_slots, torch.isfinite(picked_scores))
+        immediate_ids = expert_ids.masked_fill(deferred_mask, -1)
+        deferred_ids = expert_ids.masked_fill(~deferred_mask, -1)
+        return immediate_ids, deferred_ids
+
+    return select
+
+
 def select_top_experts_from_batch(
     topk_ids: torch.Tensor,
     num_experts: int,
@@ -4552,6 +4599,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 max_deferred_experts_per_token=layer_max_deferred,
                 **_kt_situ_kwargs,
             )
+            if layer_max_deferred > 0:
+                # The wheel's default deferral selector is placement-blind:
+                # it defers the token's lowest-score experts, most of which
+                # are GPU-resident and cost the CPU nothing — so the sync
+                # still waits for nearly all real CPU work.  Install a
+                # selector that defers CPU-resident experts specifically.
+                self.wrapper.select_deferred_experts = (
+                    make_placement_aware_deferred_selector(
+                        self.gpu_experts_mask_cuda
+                    )
+                )
 
         # Registration happens during model construction, not on the first
         # request, so layer N can identify and prepare N+1 immediately.
