@@ -144,17 +144,21 @@ def _scoped_layer_num_local_experts(layer: torch.nn.Module, num_experts: int):
     The KT wrapper allocates the GPU method's weights for only the resident
     subset via the ``num_experts`` argument, but the pin's native
     ``Mxfp4MoEMethod`` (Kimi-K3) sizes its parameters from
-    ``layer.num_local_experts`` instead — with the full count (896) that
+    ``layer.num_local_experts`` / ``layer.num_experts`` instead — with the
+    full count (896) that
     over-allocates ~40% VRAM and OOMs at construction. The override must be
     scoped: outside the wrapped-method delegations, ``num_local_experts``
     keeps global semantics (the weight loader's early bounds check must see
     the full count or non-contiguous masks would drop experts pre-remap)."""
-    original = layer.num_local_experts
+    original_local = layer.num_local_experts
+    original_global = layer.num_experts
     layer.num_local_experts = num_experts
+    layer.num_experts = num_experts
     try:
         yield
     finally:
-        layer.num_local_experts = original
+        layer.num_local_experts = original_local
+        layer.num_experts = original_global
 
 
 
@@ -4965,7 +4969,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             gpu_combine_input = None
             output = torch.zeros_like(x)
         else:
-            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
+                gpu_combine_input = self.gpu_method.apply(
+                    layer, masked_dispatch_output
+                )
             output = gpu_combine_input.hidden_states
         if _kt_timing:
             if self._kt_debug_timing_deep:
