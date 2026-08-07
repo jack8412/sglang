@@ -163,7 +163,17 @@ def run(kt: bool, seed=0):
     torch.manual_seed(seed)
     ctx = publish_ctx(kt, "")
     try:
-        with get_parallel().override(tp_rank=0, tp_size=1):
+        with get_parallel().override(
+            tp_rank=0,
+            tp_size=1,
+            moe_ep_rank=0,
+            moe_ep_size=1,
+            moe_tp_rank=0,
+            moe_tp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            ep_join_rank_offset=0,
+        ):
             from sglang.srt.models.kimi_k3 import KimiK3MoE
 
             config = build_config()
@@ -231,7 +241,17 @@ def main():
     mono_out, mono_moe = None, None
     ctx = publish_ctx(False, "")
     try:
-        with get_parallel().override(tp_rank=0, tp_size=1):
+        with get_parallel().override(
+            tp_rank=0,
+            tp_size=1,
+            moe_ep_rank=0,
+            moe_ep_size=1,
+            moe_tp_rank=0,
+            moe_tp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            ep_join_rank_offset=0,
+        ):
             from sglang.srt.models.kimi_k3 import KimiK3MoE
 
             config = build_config()
@@ -255,7 +275,17 @@ def main():
     # Full-model construction check (4 KDA + 1 MLA): imports + shapes only.
     ctx = publish_ctx(False, "")
     try:
-        with get_parallel().override(tp_rank=0, tp_size=1):
+        with get_parallel().override(
+            tp_rank=0,
+            tp_size=1,
+            moe_ep_rank=0,
+            moe_ep_size=1,
+            moe_tp_rank=0,
+            moe_tp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            ep_join_rank_offset=0,
+        ):
             from sglang.srt.models.kimi_k3 import KimiK3LinearForCausalLM
 
             model = KimiK3LinearForCausalLM(config=build_config(), quant_config=None)
