@@ -421,6 +421,28 @@ class KimiK3MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        # KT hybrid CPU-expert mode: kt_ep_wrapper wraps the experts' quant
+        # method inside FusedMoE when --kt-weight-path is set. The wrapper
+        # merges pre-weighted GPU+CPU partial sums in latent space inside
+        # quant_method.apply, which requires standard (unpacked) routing and
+        # the plain-TP path — every K3 fast path that bypasses
+        # quant_method.apply stays off below (megamoe raises, deferred
+        # finalize disabled, topk forced to STANDARD; route-quant fusion
+        # self-disables via its isinstance check on the wrapped method).
+        self._kt_enabled = get_exec().moe.kt_weight_path is not None
+        # With the KT wrapper, no layer applies routed_scaling_factor: the
+        # topk fuse is off (isinstance checks fail on the wrapper), the GPU
+        # runner config is stripped by the wrapper, and kt-kernel never
+        # scales. The model applies it exactly once, pre-_reduce_latent
+        # (before the latent AR + RMSNorm, matching the monolithic path).
+        self._kt_routed_scale = (
+            self.routed_scaling_factor
+            if self._kt_enabled
+            and self.routed_scaling_factor is not None
+            and self.routed_scaling_factor != 1.0
+            else None
+        )
+
         self.topk = TopK(
             top_k=config.num_experts_per_token,
             renormalize=moe_renormalize,
@@ -439,6 +461,8 @@ class KimiK3MoE(nn.Module):
             output_format=(
                 TopKOutputFormat.STANDARD
                 if quant_config is None
+                # kt_ep_wrapper.submit unpacks the 3-tuple standard format.
+                or self._kt_enabled
                 or (
                     config.hidden_act == "situ"
                     and get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -461,6 +485,12 @@ class KimiK3MoE(nn.Module):
         self._mega_intermediate_size = moe_intermediate_size
         self._mega_top_k = config.num_experts_per_token
         if self._use_mega_moe:
+            if self._kt_enabled:
+                raise ValueError(
+                    "--kt-weight-path is incompatible with the MegaMoE a2a "
+                    "backend (mega bypasses quant_method.apply, so CPU experts "
+                    "would never run); launch with --moe-a2a-backend none."
+                )
             assert self.use_latent_moe and config.hidden_act == "situ"
             assert (
                 config.activation_situ_beta,
@@ -495,6 +525,9 @@ class KimiK3MoE(nn.Module):
         self._defer_moe_finalize = (
             get_moe_runner_backend().is_flashinfer_mxfp4()
             and config.hidden_act == "situ"
+            # Deferred finalize never materializes the per-token routed sum,
+            # leaving the KT wrapper's CPU contribution nowhere to land.
+            and not self._kt_enabled
         )
 
         # Shared experts (operate in original hidden_size space).
@@ -932,6 +965,8 @@ class KimiK3MoE(nn.Module):
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
+            if self._kt_routed_scale is not None:
+                expert_output = expert_output * self._kt_routed_scale
             if shared_event is not None:
                 torch.cuda.current_stream().wait_event(shared_event)
             if shared_output is not None:
@@ -956,6 +991,8 @@ class KimiK3MoE(nn.Module):
             if self._use_mega_moe
             else self.experts(routed_input, topk_output)
         )
+        if self._kt_routed_scale is not None:
+            expert_output = expert_output * self._kt_routed_scale
         latent = self._reduce_latent(expert_output)
         # up_proj is replicated, so the routed output is now fully reduced.
         out, _ = self.routed_expert_up_proj(latent)
@@ -996,6 +1033,8 @@ class KimiK3MoE(nn.Module):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
+        if self._kt_routed_scale is not None:
+            expert_output.mul_(self._kt_routed_scale)
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 

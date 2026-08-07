@@ -5134,10 +5134,12 @@ class ServerArgs:
             from sglang.srt.arg_groups.kimi_k3_hook import (
                 apply_kimi_k3_linear_attn_defaults,
                 apply_kimi_k3_spec_backend_defaults,
+                validate_kimi_k3_kt,
             )
 
             apply_kimi_k3_linear_attn_defaults(self)
             apply_kimi_k3_spec_backend_defaults(self)
+            validate_kimi_k3_kt(self)
 
         if model_arch in [
             "DeepseekV4ForCausalLM",

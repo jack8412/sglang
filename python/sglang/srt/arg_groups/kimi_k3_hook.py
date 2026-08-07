@@ -101,3 +101,36 @@ def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:
             "Kimi hybrid model with bf16 SSM state: defaulting "
             "--linear-attn-decode-backend to triton."
         )
+
+
+def validate_kimi_k3_kt(server_args: ServerArgs) -> None:
+    """Gate the KT hybrid CPU-expert mode to the K3 configuration it is
+    correct on: plain TP with standard routing.
+
+    The kt_ep_wrapper computes CPU experts on tp_rank 0 only and merges the
+    pre-weighted partial sums in latent space inside quant_method.apply,
+    relying on the latent all-reduce to broadcast the CPU contribution.
+    EP a2a backends have no such all-reduce (and DeepEP swaps FusedMoE for
+    DeepEPMoE, so the wrapper never even attaches — CPU experts would be
+    silently dropped)."""
+    if server_args.kt_weight_path is None:
+        return
+
+    if server_args.moe_a2a_backend != "none":
+        raise ValueError(
+            f"Kimi-K3 with --kt-weight-path requires --moe-a2a-backend none "
+            f"(got {server_args.moe_a2a_backend!r}): EP a2a paths bypass or "
+            f"detach the KT wrapper's latent-space GPU+CPU merge."
+        )
+    if server_args.enable_dp_attention:
+        raise ValueError(
+            "Kimi-K3 with --kt-weight-path does not support "
+            "--enable-dp-attention yet (rank-0 CPU-expert merge is only "
+            "validated on the plain-TP path)."
+        )
+    if server_args.enable_two_batch_overlap:
+        raise ValueError(
+            "Kimi-K3 with --kt-weight-path does not support "
+            "--enable-two-batch-overlap yet (the KT staging buffer + CPU "
+            "stream handoff assumes one in-flight batch per layer)."
+        )
