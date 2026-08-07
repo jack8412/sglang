@@ -1735,7 +1735,12 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         return holder["masks"]
 
     # Get model config (unwrap VL configs that nest the text model config)
-    hf_config = server_args.get_model_config().hf_config
+    # Not get_model_config(): its lazy cache assigns on the instance, which
+    # the published-ServerArgs read-only guard forbids when the cache is cold
+    # (e.g. under override_server_args in tests). Construct directly instead.
+    from sglang.srt.configs.model_config import ModelConfig
+
+    hf_config = ModelConfig.from_server_args(server_args).hf_config
 
     # fix for kimi-k2.5 models where text_config holds the actual config
     if getattr(hf_config, "text_config", None) is not None:
@@ -1995,7 +2000,12 @@ def create_kt_config_from_server_args(
         return None
 
     # Get num_layers from model config (unwrap VL configs)
-    hf_config = server_args.get_model_config().hf_config
+    # Not get_model_config(): its lazy cache assigns on the instance, which
+    # the published-ServerArgs read-only guard forbids when the cache is cold
+    # (e.g. under override_server_args in tests). Construct directly instead.
+    from sglang.srt.configs.model_config import ModelConfig
+
+    hf_config = ModelConfig.from_server_args(server_args).hf_config
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
