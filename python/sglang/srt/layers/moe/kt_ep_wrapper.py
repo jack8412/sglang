@@ -41,6 +41,7 @@ from multiprocessing import shared_memory
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.distributed as dist
 
@@ -197,6 +198,14 @@ _MXFP4_RAW_NAMES_BY_LAYOUT = {
         "w2_weight_scale",
     ),
 }
+
+# Resident trtllm-gen parameter names (F2 dynamic expert update).
+# ``Mxfp4MoEMethod.process_weights_after_loading`` rebinds exactly these four
+# attributes to the shuffled weight stacks and interleaved fp8-viewed scale
+# stacks (mxfp4.py L827-830), so the raw names double as the prepared names.
+_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES = _MXFP4_RAW_NAMES_BY_LAYOUT[
+    _MXFP4_LAYOUT_TRTLLM
+]
 
 
 class SharedStagingBuffer:
@@ -2512,6 +2521,29 @@ class _Mxfp4LayerwisePrefillManager:
             compute_error, f"compute launch for layer {layer_idx}"
         )
 
+        # Dynamic expert update (F2), manager path. Placed AFTER the compute
+        # consensus so promotion's collectives can never pair with a diverged
+        # rank's phase commit; its own phase commit keeps rank-local
+        # promotion errors symmetric. The gate (kt_config) is replicated, so
+        # every rank enters or skips this block together.
+        if method.kt_config.kt_enable_dynamic_expert_update:
+            promo_error = None
+            promoted = False
+            try:
+                promoted = method._maybe_promote_experts_from_slot(
+                    layer=layer, slot=slot, dispatch_output=dispatch_output
+                )
+            except Exception as exc:  # noqa: BLE001 — fed into the consensus
+                promo_error = exc
+            self._commit_tp_runtime_phase(
+                promo_error, f"dynamic expert promotion for layer {layer_idx}"
+            )
+            if promoted and main_stream is not None:
+                # Push the reuse fence past the promotion copies: no waiter
+                # has observed the earlier record yet — this slot's next
+                # load is scheduled later on this same host thread.
+                slot.consumed_event.record(main_stream)
+
         # GPU compute is now enqueued.  Host KT writes and successor transfer
         # scheduling can overlap it without requiring an async kt-kernel API.
         self._prefetch_successor(slot)
@@ -3790,6 +3822,339 @@ def copy_experts_weights_bf16(
             dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
 
 
+class Mxfp4RawExpertSource(msgspec.Struct, frozen=True):
+    """Full-expert raw kt-export stacks for the re-swizzle copy mode.
+
+    ``w13`` holds FP4 nibble bytes as ``[gate | up]`` halves (the kt export
+    orientation) and ``w2`` the down projection; scales are the export's bf16
+    expansion of the resident E8M0 codes.  fp32 scales are accepted when they
+    are an exact staging cast of that bf16 payload (the marlin-layout raw
+    slots stage the bf16 export through fp32 params) — the cast back to bf16
+    is exact, and ``bf16_scales_to_e8m0`` still asserts E8M0 exactness.
+    """
+
+    w13: torch.Tensor
+    w13_scale: torch.Tensor
+    w2: torch.Tensor
+    w2_scale: torch.Tensor
+
+
+class Mxfp4DynUpdatePlan(msgspec.Struct, frozen=True):
+    """Cached per-layer decision for MXFP4 dynamic expert updates.
+
+    ``disabled_reason is None`` means the resident layer holds the trtllm-gen
+    shuffled image and ``param_names`` are the four resident attributes to
+    write; otherwise the reason explains the TP-consistent disable.
+    """
+
+    param_names: Tuple[str, ...] = ()
+    disabled_reason: Optional[str] = None
+
+
+def _mxfp4_shadow_source_mismatch(
+    *,
+    ctx: "SharedFullContext",
+    resident_layer: torch.nn.Module,
+    param_names: Tuple[str, ...],
+) -> Optional[str]:
+    """Reason the post-fallback shadow cannot source direct row copies, or None.
+
+    At the dynamic-update call site the shadow ``ctx.gpu_layer`` has already
+    re-run ``Mxfp4MoEMethod.process_weights_after_loading`` (phase 3 of
+    ``_prepare_weight_mxfp4``), so its flat attributes must hold the prepared
+    trtllm-gen stacks: interleaved scales viewed as float8_e4m3fn
+    (mxfp4.py L805-830) with per-expert rows shaped like the resident's
+    (identical create_weights geometry; only the expert count differs).
+    """
+    if ctx.mxfp4_prepared_layout != _MXFP4_LAYOUT_TRTLLM:
+        return (
+            "full-expert shadow context targets the "
+            f"{ctx.mxfp4_prepared_layout!r} prepared layout, not trtllm"
+        )
+    for lyr, role in (
+        (ctx.gpu_layer, "full-expert shadow"),
+        (resident_layer, "resident"),
+    ):
+        for name in param_names:
+            if not hasattr(lyr, name):
+                return f"{role} layer has no `{name}` attribute"
+        for name in (param_names[1], param_names[3]):
+            if getattr(lyr, name).dtype != torch.float8_e4m3fn:
+                return (
+                    f"{role} `{name}` dtype {getattr(lyr, name).dtype} is not "
+                    "the interleaved float8_e4m3fn prepared-scale form"
+                )
+    for name in param_names:
+        src = getattr(ctx.gpu_layer, name)
+        dst = getattr(resident_layer, name)
+        if src.shape[1:] != dst.shape[1:] or src.dtype != dst.dtype:
+            return (
+                f"shadow/resident `{name}` per-expert layouts differ: "
+                f"{tuple(src.shape[1:])}/{src.dtype} vs "
+                f"{tuple(dst.shape[1:])}/{dst.dtype}"
+            )
+    return None
+
+
+def resolve_mxfp4_dyn_update_plan(
+    *,
+    gpu_method,
+    resident_layer: torch.nn.Module,
+    ctx: "SharedFullContext",
+) -> Mxfp4DynUpdatePlan:
+    """Classify the resident MXFP4 layer for dynamic expert updates.
+
+    Supported: the ``Mxfp4MoEMethod`` flashinfer trtllm-gen resident — after
+    its process_weights_after_loading, per-expert rows of the four resident
+    params are independent shuffled/interleaved images (permute indices are
+    computed once from a single-expert sample and applied per expert,
+    mxfp4.py L740-803), so selected rows can be overwritten in place.
+
+    Disabled with a reason (each derives from process-global config, the
+    device capability, or deterministic shapes, so the local result is
+    TP-consistent; the caller still commits it through a TP consensus):
+    - the V4 triton_kernels resident (``_v4_tk_path``) — a diagnostic path;
+      the fork never implemented tk expert copies and neither do we;
+    - the V4 prepared-Marlin resident (``_v4_marlin_path``);
+    - ``DeepSeekMxfp4MoEMethod``'s trtllm resident — its stacks live under
+      ``w13_weight_scale_inv``/``w2_weight_scale_inv`` (mxfp4_deepseek.py
+      L398-411) and its row shuffle is composed inside flashinfer's
+      ``_maybe_get_cached_w3_w1_permute_indices`` (mxfp4_deepseek.py
+      L344-386), which is not verified against the kt export swizzle;
+    - non-trtllm ``Mxfp4MoEMethod`` modes (deep_gemm / marlin / cutlass).
+    """
+    if getattr(resident_layer, "_v4_tk_path", False):
+        return Mxfp4DynUpdatePlan(
+            disabled_reason=(
+                "resident layer is on the V4 triton_kernels (tk) diagnostic "
+                "path; dynamic expert updates implement no tk swizzled copies"
+            )
+        )
+    if getattr(resident_layer, "_v4_marlin_path", False):
+        return Mxfp4DynUpdatePlan(
+            disabled_reason=(
+                "resident layer holds prepared V4 Marlin weights; dynamic "
+                "expert updates support only the trtllm-gen shuffled resident"
+            )
+        )
+
+    # Class-name checks avoid circular imports of the quant methods, matching
+    # SharedFullContext._detect_quant_type_from_created_weights.
+    method_class = gpu_method.__class__.__name__
+    if method_class == "DeepSeekMxfp4MoEMethod":
+        return Mxfp4DynUpdatePlan(
+            disabled_reason=(
+                "resident DeepSeekMxfp4MoEMethod trtllm image does not match "
+                "the Mxfp4MoEMethod contract (scales under "
+                "w13_weight_scale_inv/w2_weight_scale_inv; row shuffle "
+                "composed inside flashinfer's cached w3_w1 permute helper, "
+                "unverified against the kt export swizzle); only the "
+                "Mxfp4MoEMethod resident is supported"
+            )
+        )
+    if method_class != "Mxfp4MoEMethod":
+        return Mxfp4DynUpdatePlan(
+            disabled_reason=(
+                f"unrecognized MXFP4 resident method {method_class}; dynamic "
+                "expert updates support only the Mxfp4MoEMethod trtllm-gen "
+                "resident"
+            )
+        )
+    if gpu_method.use_deep_gemm:
+        return Mxfp4DynUpdatePlan(
+            disabled_reason=(
+                "resident Mxfp4MoEMethod is in deep_gemm mode; dynamic expert "
+                "updates support only the flashinfer trtllm-gen (SM100) "
+                "resident image"
+            )
+        )
+    if gpu_method.use_marlin:
+        return Mxfp4DynUpdatePlan(
+            disabled_reason=(
+                "resident Mxfp4MoEMethod is in marlin mode; dynamic expert "
+                "updates support only the flashinfer trtllm-gen (SM100) "
+                "resident image"
+            )
+        )
+    if gpu_method._fi_kernel != "trtllm_sm100":
+        return Mxfp4DynUpdatePlan(
+            disabled_reason=(
+                "resident Mxfp4MoEMethod is not in flashinfer trtllm-gen mode "
+                f"(fi_kernel={gpu_method._fi_kernel!r}, "
+                f"use_flashinfer={gpu_method.use_flashinfer}); dynamic expert "
+                "updates support only the SM100 trtllm-gen resident image"
+            )
+        )
+
+    param_names = _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+    source_mismatch = _mxfp4_shadow_source_mismatch(
+        ctx=ctx, resident_layer=resident_layer, param_names=param_names
+    )
+    if source_mismatch is not None:
+        return Mxfp4DynUpdatePlan(disabled_reason=source_mismatch)
+    return Mxfp4DynUpdatePlan(param_names=param_names)
+
+
+def _as_bf16_export_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Return the export's bf16 scale payload, undoing an fp32 staging cast.
+
+    bf16 -> fp32 staging is value-exact, so the cast back is too; any value a
+    genuine fp32-scale wheel produced still trips ``bf16_scales_to_e8m0``'s
+    E8M0-exactness assertion downstream.
+    """
+    if scales.dtype == torch.bfloat16:
+        return scales
+    if scales.dtype == torch.float32:
+        return scales.to(torch.bfloat16)
+    raise TypeError(
+        f"MXFP4 export scales must be bf16 (or fp32-staged bf16), got "
+        f"{scales.dtype}"
+    )
+
+
+def _copy_mxfp4_experts_from_raw_source(
+    *,
+    raw_source: Mxfp4RawExpertSource,
+    dst_layer: torch.nn.Module,
+    selected_ids: List[int],
+    param_names: Tuple[str, ...],
+) -> None:
+    """Re-swizzle raw kt-export experts straight into resident trtllm rows.
+
+    Valid per expert because both the trtllm weight shuffle and the block
+    scale interleave permute within one expert (kt_mxfp4_export.py
+    ``TrtllmPermuteIndices`` docstring).  All resident writes go through
+    ``swizzle_trtllm_expert``'s ``out_*`` path, which is ``copy_``-only into
+    the given row views; the swizzle's gather/interleave temporaries are
+    source-side scratch and never alias resident storage.
+    """
+    from sglang.srt.layers.moe.kt_mxfp4_export import (
+        Mxfp4ExpertBytes,
+        bf16_scales_to_e8m0,
+        swizzle_trtllm_expert,
+        trtllm_permute_indices,
+    )
+
+    w13_name, w13_scale_name, w2_name, w2_scale_name = param_names
+    dst_w13 = getattr(dst_layer, w13_name)
+    dst_w13_scale = getattr(dst_layer, w13_scale_name)
+    dst_w2 = getattr(dst_layer, w2_name)
+    dst_w2_scale = getattr(dst_layer, w2_scale_name)
+    for name, tensor in (
+        (w13_scale_name, dst_w13_scale),
+        (w2_scale_name, dst_w2_scale),
+    ):
+        if tensor.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"resident `{name}` dtype {tensor.dtype} is not the "
+                "interleaved float8_e4m3fn prepared-scale form"
+            )
+
+    # Gather selected rows before code recovery: unselected raw rows may
+    # never have been written by the export and must not reach the E8M0
+    # exactness assertion (mirrors prepare_trtllm_mxfp4).
+    index = torch.tensor(
+        selected_ids, dtype=torch.long, device=raw_source.w13.device
+    )
+    codes13 = bf16_scales_to_e8m0(
+        _as_bf16_export_scales(raw_source.w13_scale.index_select(0, index))
+    )
+    codes2 = bf16_scales_to_e8m0(
+        _as_bf16_export_scales(raw_source.w2_scale.index_select(0, index))
+    )
+    indices = trtllm_permute_indices(
+        w13_sample=raw_source.w13[selected_ids[0]],
+        w13_scale_sample=codes13[0],
+        w2_sample=raw_source.w2[selected_ids[0]],
+        w2_scale_sample=codes2[0],
+        w13_gate_up_halves=True,
+    )
+    for dst_idx, logical_id in enumerate(selected_ids):
+        swizzle_trtllm_expert(
+            Mxfp4ExpertBytes(
+                w13=raw_source.w13[logical_id],
+                w13_scale_e8m0=codes13[dst_idx],
+                w2=raw_source.w2[logical_id],
+                w2_scale_e8m0=codes2[dst_idx],
+            ),
+            indices,
+            out_w13=dst_w13[dst_idx],
+            out_w13_scale=dst_w13_scale[dst_idx],
+            out_w2=dst_w2[dst_idx],
+            out_w2_scale=dst_w2_scale[dst_idx],
+        )
+
+
+def copy_experts_weights_mxfp4(
+    src_layer: Optional[torch.nn.Module],
+    dst_layer: torch.nn.Module,
+    selected_experts: torch.Tensor,
+    *,
+    param_names: Tuple[str, ...] = _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES,
+    raw_source: Optional[Mxfp4RawExpertSource] = None,
+) -> None:
+    """Copy MXFP4 expert weights into a trtllm-gen resident layer.
+
+    Args:
+        src_layer: Source layer whose four ``param_names`` attributes hold
+            the full-expert trtllm-gen prepared image (e.g. the post-fallback
+            shadow ``ctx.gpu_layer``, or a layerwise slot's prepared params).
+            May be None when ``raw_source`` is given.
+        dst_layer: Destination resident layer (subset of GPU experts).
+        selected_experts: Logical expert IDs to copy ([num_gpu_experts]);
+            position i lands in resident row i (the mapping
+            ``update_gpu_expert_mappings`` installs).
+        param_names: The four resident attribute names, ordered
+            (w13, w13_scale, w2, w2_scale).
+        raw_source: Raw kt-export stacks to re-swizzle from when no prepared
+            trtllm image is available (marlin-layout slots, tests).
+
+    Direct mode copies the shuffled weight rows and interleaved scale rows
+    verbatim — exact because the trtllm shuffle and scale interleave permute
+    within one expert (mxfp4.py L740-803) and source/destination share the
+    per-expert geometry.  Every write is an in-place ``copy_`` into existing
+    resident rows (CUDA-graph safety: no parameter rebinding, no resident
+    allocation).
+    """
+    if (src_layer is None) == (raw_source is None):
+        raise ValueError(
+            "copy_experts_weights_mxfp4 needs exactly one source: a prepared "
+            "src_layer or a raw_source"
+        )
+    selected_ids = [int(expert_id) for expert_id in selected_experts.tolist()]
+    if not selected_ids:
+        return
+
+    if raw_source is not None:
+        _copy_mxfp4_experts_from_raw_source(
+            raw_source=raw_source,
+            dst_layer=dst_layer,
+            selected_ids=selected_ids,
+            param_names=param_names,
+        )
+        return
+
+    for name in (param_names[1], param_names[3]):
+        for lyr, role in ((src_layer, "source"), (dst_layer, "destination")):
+            if getattr(lyr, name).dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    f"{role} `{name}` dtype {getattr(lyr, name).dtype} is not "
+                    "the interleaved float8_e4m3fn prepared-scale form; "
+                    "refusing a raw-vs-prepared MXFP4 row copy"
+                )
+    for name in param_names:
+        src_weight = getattr(src_layer, name)  # [global_num_experts, ...]
+        dst_weight = getattr(dst_layer, name)  # [num_gpu_experts, ...]
+        if src_weight.shape[1:] != dst_weight.shape[1:]:
+            raise ValueError(
+                f"`{name}` per-expert shapes differ between source "
+                f"{tuple(src_weight.shape[1:])} and destination "
+                f"{tuple(dst_weight.shape[1:])}"
+            )
+        for dst_idx, logical_id in enumerate(selected_ids):
+            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+
+
 def update_gpu_expert_mappings(
     selected_experts: torch.Tensor,
     num_experts: int,
@@ -3894,6 +4259,35 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         self.gpu_method = gpu_method
         self.kt_config = kt_config
+
+        # F2 (MXFP4 dynamic expert update) wheel precondition, checked at the
+        # earliest point kt_config is available.  The update path recovers the
+        # exact resident E8M0 codes from the export's bf16 scale buffers, a
+        # contract only E8M0-resident kt-kernel wheels honor (fp32-scale
+        # wheels export arbitrary bf16 values); fail at construction instead
+        # of tripping the exactness assertion mid-serving.  Feature-check, not
+        # a version check.
+        if (
+            kt_config.kt_enable_dynamic_expert_update
+            and (kt_config.method or "").upper() == "MXFP4"
+        ):
+            from sglang.srt.layers.moe.kt_mxfp4_export import (
+                kt_wheel_has_e8m0_resident_scales,
+            )
+
+            if not kt_wheel_has_e8m0_resident_scales():
+                raise ValueError(
+                    "--kt-enable-dynamic-expert-update with --kt-method MXFP4 "
+                    "requires a kt-kernel wheel with E8M0-resident MXFP4 "
+                    "scales (feat/mxfp4-kimi-k3 line): the dynamic update "
+                    "path recovers exact E8M0 codes from the export's bf16 "
+                    "scale buffers, which fp32-scale wheels cannot provide"
+                )
+        # Lazily resolved on the first qualifying fallback fire; None means
+        # "not yet resolved", a plan with disabled_reason means the update is
+        # TP-consistently off for this layer.
+        self._mxfp4_dyn_update_plan: Optional[Mxfp4DynUpdatePlan] = None
+
         self.gpu_experts_mask = kt_config.gpu_experts_mask  # bool tensor [num_experts], on CPU
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
         self.override_num_local_experts = True
@@ -4418,15 +4812,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # Marlin repack changes weight shapes/dtypes, and
             # _restore_raw_attrs() creates empty tensors (torch.empty) to
             # restore the raw fp8 format, destroying the weight data.
-            # Skip for V4-Flash MXFP4 — `_update_gpu_experts_from_batch` →
-            # `copy_experts_weights_int4` hardcodes int4 weight names
-            # (`w13_weight_packed` etc.) and crashes on MXFP4 layouts. The
-            # full-GPU fallback re-loads all 256 experts on every fire anyway,
-            # so the dynamic-promote optimization is a no-op for MXFP4. Origin:
-            # sglang 本身 (V4-Flash full-GPU prefill fallback compat).
-            _mxfp4_skip_dyn_update = getattr(ctx, "_is_mxfp4_quant", False)
-            if (self.kt_config.kt_enable_dynamic_expert_update
-                    and not _mxfp4_skip_dyn_update):
+            # MXFP4 (F2): after the fire the shadow gpu_layer holds the
+            # full-expert trtllm-gen prepared image (its PWAL re-ran in
+            # `_prepare_weight_mxfp4` phase 3), so selected rows copy straight
+            # into a trtllm-gen resident via `copy_experts_weights_mxfp4`.
+            # Unsupported MXFP4 residents (tk / marlin / DeepSeek trtllm)
+            # resolve to a TP-consistent, once-logged disable — every rank
+            # takes the same skip, keeping the broadcast flow aligned.
+            _dyn_update_enabled = self.kt_config.kt_enable_dynamic_expert_update
+            if _dyn_update_enabled and ctx._is_mxfp4_quant:
+                _dyn_update_enabled = (
+                    self._mxfp4_dyn_update_plan_for(
+                        ctx=ctx, layer=layer
+                    ).disabled_reason
+                    is None
+                )
+            if _dyn_update_enabled:
                 t_update = time.perf_counter()
                 self._update_gpu_experts_from_batch(
                     layer=layer,
@@ -4608,6 +5009,72 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
         return StandardCombineInput(hidden_states=output)
 
+    def _mxfp4_dyn_update_plan_for(
+        self, *, ctx: "SharedFullContext", layer: torch.nn.Module
+    ) -> Mxfp4DynUpdatePlan:
+        """Resolve (once) whether MXFP4 dynamic expert updates can run here.
+
+        The first qualifying fallback fire classifies the resident layout and
+        commits the local verdict through a TP consensus so every rank takes
+        the same update-or-skip path; a disable is logged once (rank 0) and
+        cached, so later fires cost one attribute read and no collective.
+        """
+        if self._mxfp4_dyn_update_plan is not None:
+            return self._mxfp4_dyn_update_plan
+        plan = resolve_mxfp4_dyn_update_plan(
+            gpu_method=self.gpu_method, resident_layer=layer, ctx=ctx
+        )
+        if not _all_tp_ranks_succeeded(plan.disabled_reason is None):
+            if plan.disabled_reason is None:
+                plan = Mxfp4DynUpdatePlan(
+                    disabled_reason=(
+                        "MXFP4 dynamic expert update is unsupported on at "
+                        "least one TP rank"
+                    )
+                )
+        if plan.disabled_reason is not None and self.tp_rank == 0:
+            logger.warning(
+                "KT MXFP4 dynamic expert update disabled for layer %d; GPU "
+                "expert placement stays static: %s",
+                self.kt_config.layer_idx,
+                plan.disabled_reason,
+            )
+        self._mxfp4_dyn_update_plan = plan
+        return plan
+
+    def _maybe_promote_experts_from_slot(
+        self, *, layer: torch.nn.Module, slot, dispatch_output
+    ) -> bool:
+        """Manager-path dynamic expert update (F2).
+
+        On the layerwise-prefill manager path the serial ctx fallback never
+        runs, so promotion sources from the fired slot instead: its prepared
+        parameters ARE the full-expert trtllm-gen image for this layer, and
+        promotion reduces to per-expert row copies into the resident layer.
+        Runs after the caller's compute-launch TP consensus; the caller
+        re-records the slot's consumed fence afterwards so the next
+        postprocess cannot overwrite prepared storage mid-copy."""
+        if not self.kt_config.kt_enable_dynamic_expert_update:
+            return False
+        if slot.prepared_params is None:
+            # Marlin-prepared slots (DSV4) have no direct-copy source here;
+            # their (disabled) plan resolution belongs to the serial ctx path.
+            return False
+        from types import SimpleNamespace
+
+        source_ctx = SimpleNamespace(
+            _is_mxfp4_quant=True,
+            mxfp4_prepared_layout=_MXFP4_LAYOUT_TRTLLM,
+            gpu_layer=SimpleNamespace(**slot.prepared_params),
+        )
+        plan = self._mxfp4_dyn_update_plan_for(ctx=source_ctx, layer=layer)
+        if plan.disabled_reason is not None:
+            return False
+        self._update_gpu_experts_from_batch(
+            layer=layer, ctx=source_ctx, dispatch_output=dispatch_output
+        )
+        return True
+
     def _update_gpu_experts_from_batch(
         self,
         layer: torch.nn.Module,
@@ -4650,7 +5117,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Copy selected expert weights from ctx.gpu_layer to layer.
         # Both are already in inference format: apply() already called
         # process_weights_after_loading() which handles Marlin repack.
-        if ctx._is_fp8_quant:
+        if ctx._is_mxfp4_quant:
+            plan = self._mxfp4_dyn_update_plan_for(ctx=ctx, layer=layer)
+            if plan.disabled_reason is not None:
+                raise ValueError(
+                    "MXFP4 dynamic expert update invoked while disabled for "
+                    f"layer {self.kt_config.layer_idx}: {plan.disabled_reason}"
+                )
+            copy_experts_weights_mxfp4(
+                src_layer=ctx.gpu_layer,
+                dst_layer=layer,
+                selected_experts=selected_experts,
+                param_names=plan.param_names,
+            )
+        elif ctx._is_fp8_quant:
             # Ampere Marlin vs native FP8 block quant: Marlin repack renames
             # w13_weight_scale_inv → w13_weight_scale and changes w13_weight
             # dtype fp8→int32.  Use gpu_method class name (invariant) to pick
