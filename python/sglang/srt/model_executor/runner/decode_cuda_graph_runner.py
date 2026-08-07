@@ -305,10 +305,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # (not num_seqs): register the effective num_tokens per captured
             # batch — ragged-verify token buckets when present, else
             # bs * captured_req_width.
-            KTMoEWrapper.set_capture_batch_sizes(
+            kt_capture_num_tokens = (
                 list(self.capture_num_tokens)
                 if self.capture_num_tokens is not None
                 else [bs * self.captured_req_width for bs in self.capture_bs]
+            )
+            KTMoEWrapper.set_capture_batch_sizes(kt_capture_num_tokens)
+            # The eager runner's autotune warmup ran BEFORE this registration
+            # and its get_buffer(max_running) landed the largest tier's pinned
+            # buffers in the wheel's single temp slot.  get_buffer's temp-hit
+            # early-return never promotes into the persistent capture cache,
+            # so capturing the largest graph against the temp slot bakes
+            # host pointers that the next different-sized request frees —
+            # first replay of that tier then segfaults inside cudaGraphLaunch.
+            # Drop the temp slot so capture allocates fresh into the
+            # persistent per-tier cache.
+            from kt_kernel.experts_base import KExpertsCPUBuffer
+
+            KExpertsCPUBuffer.temp_bs = 0
+            KExpertsCPUBuffer.temp_buffer = tuple()
+            logger.info(
+                "KT capture buffer registration: num_tokens=%s "
+                "(capture_bs=%s, req_width=%d); temp staging slot cleared",
+                kt_capture_num_tokens,
+                self.capture_bs,
+                self.captured_req_width,
             )
         self._ragged_graph_size = 0
         # Per-tier capture layouts; their verify_lens / qo_indptr tensors are
