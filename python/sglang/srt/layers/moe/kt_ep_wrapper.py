@@ -304,13 +304,12 @@ class SharedFullContext:
         # docstring). Origin: kt-sglang 耦合 (V4-Flash routed experts MXFP4
         # detection in kt_ep_wrapper).
         try:
-            import os as _os_v4
             from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
             from sglang.srt.layers.quantization.mxfp4_deepseek import (
                 DeepSeekMxfp4MoEMethod,
             )
             from sglang.srt.runtime_context import get_exec
-            _v4_env = _os_v4.environ.get("SGLANG_V4_USE_TRITON_KERNELS")
+            _v4_env = envs.SGLANG_V4_USE_TRITON_KERNELS.get()
             if _v4_env == "1":
                 _do_v4_wrap = True
             elif _v4_env == "0":
