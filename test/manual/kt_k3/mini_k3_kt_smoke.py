@@ -174,9 +174,39 @@ def publish_ctx(kt: bool):
     return ctx
 
 
+_DIST_READY = False
+
+
+def init_single_process_distributed():
+    """Real gloo world-size-1 groups: layer forwards call get_tp_group()
+    even at tp==1 (pattern from test_dsa_layer_split_broadcast.py)."""
+    global _DIST_READY
+    if _DIST_READY:
+        return
+    import os
+
+    from sglang.srt.distributed import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29723")
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method="tcp://127.0.0.1:29723",
+        backend="gloo",
+    )
+    initialize_model_parallel(tensor_model_parallel_size=1)
+    _DIST_READY = True
+
+
 def run(kt: bool, seed=0):
     torch.manual_seed(seed)
     ctx = publish_ctx(kt)
+    init_single_process_distributed()
     try:
         with get_parallel().override(
             tp_rank=0,
@@ -254,6 +284,7 @@ def main():
     # the union weight set into the full expert table.
     mono_out, mono_moe = None, None
     ctx = publish_ctx(False)
+    init_single_process_distributed()
     try:
         with get_parallel().override(
             tp_rank=0,
@@ -287,6 +318,7 @@ def main():
 
     # Full-model construction check (4 KDA + 1 MLA): imports + shapes only.
     ctx = publish_ctx(False)
+    init_single_process_distributed()
     try:
         with get_parallel().override(
             tp_rank=0,
