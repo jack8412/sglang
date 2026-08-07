@@ -1239,9 +1239,11 @@ __global__ void Marlin(
     }
 
     // FP4/FP8 scale dequantization (E4M3 for NVFP4 and E8M0 for MXFP4).
-    if constexpr (
-        (s_type == host::kFE4M3fn || s_type == host::kFE8M0fnu) &&
-        !(std::is_same<scalar_t2, half2>::value && s_type == host::kFE8M0fnu)) {
+    // The half2 + FE8M0 combination is handled via the
+    // dequant_fp8_scales<half2, kFE8M0fnu> specialization in
+    // gemm/marlin/dequant.h; skipping dequant for it would leave raw ue8m0
+    // bytes in frag_s and make MXFP4 + fp16 activations explode by 2^byte.
+    if constexpr (s_type == host::kFE4M3fn || s_type == host::kFE8M0fnu) {
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 

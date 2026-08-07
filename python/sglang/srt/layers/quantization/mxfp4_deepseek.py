@@ -23,11 +23,21 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import next_power_of_2
 
-if is_flashinfer_available():
-    # V4-Flash needs flashinfer >= 0.6.9 (mxfp8_quantize, trtllm_fp4_block_scale_routed_moe
-    # and friends were not exported in 0.6.3, the version pinned by sglang-kt's pyproject).
-    # Fail loud with the exact upgrade command rather than letting the imports below crash
-    # with a bare ImportError. Origin: sglang 本身.
+
+def _ensure_trtllm_mxfp4_ops() -> None:
+    """Load FlashInfer-only symbols only when the SM100 backend is selected.
+
+    Consumer Blackwell/Ada use the in-tree Marlin backend and must not inherit
+    the newer FlashInfer version requirement of TRT-LLM's SM100 binary.
+    """
+    global mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
+    global block_scale_interleave, trtllm_fp4_block_scale_routed_moe
+    global _maybe_get_cached_w3_w1_permute_indices
+    global get_w2_permute_indices_with_cache
+    if "trtllm_fp4_block_scale_routed_moe" in globals():
+        return
+    if not is_flashinfer_available():
+        raise ImportError("FlashInfer is required for the SM100 MXFP4 backend")
     import flashinfer as _flashinfer
     from packaging.version import Version as _Version
 
@@ -47,6 +57,7 @@ if is_flashinfer_available():
         get_w2_permute_indices_with_cache,
     )
 
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -62,6 +73,7 @@ _USE_OFFICIAL_SHUFFLE = envs.SGLANG_MXFP4_USE_OFFICIAL_SHUFFLE.get()
 # `triton_kernels.matmul_ogs` path in `v4_triton_kernels_moe.py`. Keep
 # this in sync with the same constant in `v4_triton_kernels_moe.py`.
 _TRTLLM_FP4_CAPS = {(10, 0)}
+_MARLIN_MXFP4_CAPS = {(8, 9), (12, 0)}
 
 
 def _trtllm_fp4_supported() -> bool:
@@ -178,8 +190,8 @@ class DeepSeekMxfp4MoEMethod:
 
         # V4 GPU MoE dispatch (capability-driven, env override available).
         #
-        # Default: capability in `_TRTLLM_FP4_CAPS` -> trtllm path below;
-        # any other capability -> triton_kernels (this branch).
+        # Default: SM89/SM120 -> deterministic W4A16 Marlin, SM100 -> TRT-LLM,
+        # everything else -> the portable triton_kernels fallback.
         #
         # Override via `SGLANG_V4_USE_TRITON_KERNELS`:
         #   "1" -> force triton_kernels even on whitelist (debugging).
@@ -193,9 +205,9 @@ class DeepSeekMxfp4MoEMethod:
         # Origin: sglang 本身.
         try:
             from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
-                use_v4_triton_kernels,
-                force_disable_v4_triton_kernels,
                 convert_v4_weights_to_triton_kernels,
+                force_disable_v4_triton_kernels,
+                use_v4_triton_kernels,
             )
         except Exception:
             use_v4_triton_kernels = lambda: False
@@ -204,9 +216,60 @@ class DeepSeekMxfp4MoEMethod:
 
         _force_tk = use_v4_triton_kernels()
         _force_trtllm = force_disable_v4_triton_kernels()
-        _take_tk_path = (
-            convert_v4_weights_to_triton_kernels is not None
-            and (_force_tk or (not _force_trtllm and not _trtllm_fp4_supported()))
+        _capability = (
+            torch.cuda.get_device_capability(layer.w13_weight.device)
+            if torch.cuda.is_available()
+            else None
+        )
+        _prefill_threshold = get_exec().moe.kt_gpu_prefill_token_threshold or 0
+        _resident_experts = layer.w13_weight.shape[0]
+        _global_experts = getattr(layer, "num_experts", _resident_experts)
+        # The resident partial-expert image is shared by hybrid prefill and
+        # decode.  Keep that image in the existing TK representation for both
+        # threshold=0 reference runs and layerwise-prefill runs; Marlin is
+        # reserved for an ordinary full-expert layer or the manager's full
+        # prefill shadow.
+        _resident_partial = _resident_experts < _global_experts
+        _take_marlin_path = (
+            not _force_tk
+            and not _force_trtllm
+            and _capability in _MARLIN_MXFP4_CAPS
+            and not _resident_partial
+        )
+        if _take_marlin_path:
+            from sglang.srt.layers.quantization.v4_marlin_moe import (
+                prepare_v4_mxfp4_marlin,
+            )
+
+            w13_raw = layer.w13_weight.data
+            w2_raw = layer.w2_weight.data
+            hidden_size = w13_raw.shape[2] * 2
+            intermediate_size = w2_raw.shape[2] * 2
+            log_info_on_rank0(
+                logger,
+                f"[v4-marlin] Preparing native MXFP4 weights "
+                f"(layer: {self.prefix}, capability={_capability}, "
+                f"hidden_size={hidden_size}, intermediate_size={intermediate_size})...",
+            )
+            layer._v4_marlin_weights = prepare_v4_mxfp4_marlin(
+                w13_raw,
+                layer.w13_weight_scale_inv.data,
+                w2_raw,
+                layer.w2_weight_scale_inv.data,
+            )
+            # The full-expert prefill shadow still consumes raw checkpoint
+            # tensors.  Ordinary/non-layerwise layers release them after the
+            # prepared copy has been enqueued.
+            if _prefill_threshold <= 0:
+                del layer.w13_weight
+                del layer.w2_weight
+                del layer.w13_weight_scale_inv
+                del layer.w2_weight_scale_inv
+            layer._v4_marlin_path = True
+            return
+
+        _take_tk_path = convert_v4_weights_to_triton_kernels is not None and (
+            _force_tk or (not _force_trtllm and not _trtllm_fp4_supported())
         )
         if _take_tk_path:
             w13_raw = layer.w13_weight.data
@@ -222,12 +285,15 @@ class DeepSeekMxfp4MoEMethod:
             intermediate_size_tk = w2_raw.shape[2] * 2
             log_info_on_rank0(
                 logger,
-                f'[v4-triton-kernels] Swizzling V4 MXFP4 weights for matmul_ogs '
-                f'(layer: {self.prefix}, hidden_size={hidden_size_tk}, '
-                f'intermediate_size={intermediate_size_tk})...',
+                f"[v4-triton-kernels] Swizzling V4 MXFP4 weights for matmul_ogs "
+                f"(layer: {self.prefix}, hidden_size={hidden_size_tk}, "
+                f"intermediate_size={intermediate_size_tk})...",
             )
             w13_swiz, w13_pcg, w2_swiz, w2_pcg = convert_v4_weights_to_triton_kernels(
-                w13_raw, w13_scale_raw, w2_raw, w2_scale_raw,
+                w13_raw,
+                w13_scale_raw,
+                w2_raw,
+                w2_scale_raw,
             )
             # Free raw tensors; the triton_kernels Tensor objects keep their
             # own swizzled storage. The kt_ep_wrapper's full-GPU prefill
@@ -235,9 +301,7 @@ class DeepSeekMxfp4MoEMethod:
             # attributes around to materialize all 256 experts on GPU when
             # the gate fires, so opt-in keep them in that mode. Origin: sglang
             # 本身 (V4-Flash full-GPU prefill fallback compat).
-            _keep_raw_for_full_gpu_fallback = (
-                get_exec().moe.kt_gpu_prefill_token_threshold or 0
-            ) > 0
+            _keep_raw_for_full_gpu_fallback = _prefill_threshold > 0
             if not _keep_raw_for_full_gpu_fallback:
                 del layer.w13_weight
                 del layer.w2_weight
@@ -252,6 +316,7 @@ class DeepSeekMxfp4MoEMethod:
             layer._v4_tk_path = True
             return
 
+        _ensure_trtllm_mxfp4_ops()
         w13_w, w13_s = reorder_w1w3_to_w3w1(
             layer.w13_weight.data, layer.w13_weight_scale_inv.data
         )
@@ -373,24 +438,62 @@ class DeepSeekMxfp4MoEMethod:
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        # NEW (2026-04-29): V4 triton_kernels MoE path. Origin: sglang 本身.
-        # Must dispatch before accessing layer.w13_weight (we deleted it
-        # during process_weights_after_loading on the triton_kernels path).
-        if getattr(layer, "_v4_tk_path", False):
-            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
-                apply_v4_triton_kernels_moe,
+        if getattr(layer, "_v4_marlin_path", False):
+            from sglang.srt.layers.quantization.v4_marlin_moe import (
+                apply_v4_marlin_moe,
             )
-            # Extract topk_ids/weights from topk_output (mirror the trtllm
-            # extraction below, which happens after this dispatch). Mainline
-            # HashTopK emits StandardTopKOutput (the fork's separate hash
-            # format was folded into the standard format upstream), so the
+
+            # The fork also accepted its hash topk format here; mainline
+            # HashTopK emits StandardTopKOutput (the separate hash format
+            # was folded into the standard format upstream), so the
             # standard branch covers it.
             if TopKOutputChecker.format_is_standard(topk_output):
                 topk_ids = topk_output.topk_ids
                 topk_weights = topk_output.topk_weights
             else:
                 raise NotImplementedError(
-                    f'triton_kernels V4 path: unsupported topk format {topk_output.format}'
+                    f"Marlin V4 path: unsupported topk format {topk_output.format}"
+                )
+            # Marlin's prepared tensor is indexed by local expert.  Unlike
+            # TRT-LLM it does not consume a global expert offset, so keep the
+            # dispatcher's local/remapped ids and sanitize them in-place into
+            # the cached routing workspace.
+
+            routed_scale = 1.0
+            if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
+                configured_scale = layer.moe_runner_config.routed_scaling_factor
+                if configured_scale is not None:
+                    routed_scale = configured_scale
+            swiglu_limit = layer.moe_runner_config.swiglu_limit
+            output = apply_v4_marlin_moe(
+                hidden_states=hidden_states,
+                prepared=layer._v4_marlin_weights,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                routed_scaling_factor=routed_scale,
+                swiglu_limit=swiglu_limit,
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        # NEW (2026-04-29): V4 triton_kernels MoE path. Origin: sglang 本身.
+        # Must dispatch before accessing layer.w13_weight (we deleted it
+        # during process_weights_after_loading on the triton_kernels path).
+        if getattr(layer, "_v4_tk_path", False):
+            # Extract topk_ids/weights from topk_output (mirror the trtllm
+            # extraction below, which happens after this dispatch). Mainline
+            # HashTopK emits StandardTopKOutput (the fork's separate hash
+            # format was folded into the standard format upstream), so the
+            # standard branch covers it.
+            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+                apply_v4_triton_kernels_moe,
+            )
+
+            if TopKOutputChecker.format_is_standard(topk_output):
+                topk_ids = topk_output.topk_ids
+                topk_weights = topk_output.topk_weights
+            else:
+                raise NotImplementedError(
+                    f"triton_kernels V4 path: unsupported topk format {topk_output.format}"
                 )
             # On mainline the StandardDispatcher never maps topk ids to the
             # local range for the flashinfer_mxfp4 backend, so the default
@@ -564,6 +667,7 @@ class DeepSeekMxfp4MoEMethod:
 # check). Activated when DSV4 model module loads.
 # ---------------------------------------------------------------------------
 
+
 def _mxfp4_predicate(layer, server_args):
     env = envs.SGLANG_V4_USE_TRITON_KERNELS.get()
     if env == "1":
@@ -579,6 +683,7 @@ def _mxfp4_predicate(layer, server_args):
 
 def _mxfp4_factory(layer, gpu_method, _ctx):
     from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
     if not isinstance(gpu_method, Fp8MoEMethod):
         return gpu_method
     prefix = getattr(layer, "_registry_prefix", "")
