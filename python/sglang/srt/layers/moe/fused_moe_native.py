@@ -70,6 +70,14 @@ def moe_forward_native(
 
     topk_weights, topk_ids, _ = topk_output
 
+    # Masked entries (-1, e.g. CPU-resident experts under the KT hybrid
+    # wrapper) must contribute nothing: zero their weight and point them at
+    # expert 0 — scatter_ cannot take negative indices.
+    invalid_ids = topk_ids < 0
+    if bool(invalid_ids.any()):
+        topk_weights = topk_weights.masked_fill(invalid_ids, 0.0)
+        topk_ids = topk_ids.masked_fill(invalid_ids, 0)
+
     # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
     len_experts = layer.num_experts
 

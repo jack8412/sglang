@@ -719,11 +719,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         moe_runner_config = self.moe_runner_config
 
-        assert (
-            moe_runner_config.activation == "silu"
-        ), f"activation = {moe_runner_config.activation} is not supported."
+        assert moe_runner_config.activation in ("silu", "gelu", "situ"), (
+            f"activation = {moe_runner_config.activation} is not supported."
+        )
 
-        if use_intel_amx_backend(layer):
+        # The AMX fused kernel implements silu only; gelu/situ (Kimi-K3) run
+        # through the torch-native reference below.
+        if use_intel_amx_backend(layer) and moe_runner_config.activation == "silu":
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
