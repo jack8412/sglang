@@ -3154,6 +3154,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
             return self.config.text_config.num_hidden_layers
         return self.language_model.model.end_layer
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+        text_config = config.text_config
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_experts,
+            num_groups=None,
+        )
+
     def prepare_context_parallel_metadata_for_dcp(
         self,
         seq_lens: torch.Tensor,
