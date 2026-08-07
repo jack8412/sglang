@@ -218,7 +218,10 @@ class TestMxfp4LayerwiseStateMachine(CustomTestCase):
         log = []
         methods = {
             layer_idx: SimpleNamespace(
-                kt_config=SimpleNamespace(layer_idx=layer_idx), tp_rank=1
+                kt_config=SimpleNamespace(
+                    layer_idx=layer_idx, kt_enable_dynamic_expert_update=False
+                ),
+                tp_rank=1,
             )
             for layer_idx in (3, 17, 41)
         }
@@ -356,7 +359,12 @@ class TestMxfp4LayerwiseStateMachine(CustomTestCase):
             state="READY",
         )
         main_stream = _RecordingStream("main", log)
-        method = SimpleNamespace(kt_config=SimpleNamespace(layer_idx=17), tp_rank=0)
+        method = SimpleNamespace(
+            kt_config=SimpleNamespace(
+                layer_idx=17, kt_enable_dynamic_expert_update=False
+            ),
+            tp_rank=0,
+        )
 
         with (
             mock.patch.object(manager, "_acquire", return_value=(slot, True)),
