@@ -76,11 +76,16 @@ class _FakeLayer:
         top_k=8,
         intermediate_size_per_partition=INTERMEDIATE,
         moe_tp_size=2,
+        num_experts=NUM_EXPERTS,
     ):
         self.top_k = top_k
         self.intermediate_size_per_partition = intermediate_size_per_partition
         self.moe_tp_size = moe_tp_size
         self.moe_runner_config = moe_runner_config
+        # _scoped_layer_num_local_experts overrides both counts around the
+        # wrapped method's create/load/apply delegations.
+        self.num_local_experts = num_experts
+        self.num_experts = num_experts
         self._device_anchor = torch.zeros(1)
 
     def parameters(self):

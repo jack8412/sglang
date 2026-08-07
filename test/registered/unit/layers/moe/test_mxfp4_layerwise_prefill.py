@@ -694,6 +694,11 @@ class TestMxfp4HostTransport(CustomTestCase):
                 name: [1000 + 100 * index, 2000 + 100 * index]
                 for index, name in enumerate(names)
             },
+            host_ring_depth=2,
+            host_expert_nbytes={
+                name: buffer.numel() // 2 * buffer.element_size()
+                for name, buffer in host_buffers.items()
+            },
         )
         manager = object.__new__(ktw._Mxfp4LayerwisePrefillManager)
         manager.context = context
@@ -992,6 +997,10 @@ class TestMxfp4ApplyFallbacks(CustomTestCase):
             w2_weight=object(),
             w2_weight_scale_inv=object(),
             _v4_tk_path=True,
+            # The resident apply scopes both counts to the GPU subset around
+            # the wrapped method's delegation.
+            num_local_experts=1,
+            num_experts=1,
         )
 
     @staticmethod

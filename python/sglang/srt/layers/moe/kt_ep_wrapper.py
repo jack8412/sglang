@@ -207,6 +207,11 @@ _MXFP4_LAYERWISE_DISABLED_REASONS = {}
 _MXFP4_LAYOUT_MARLIN = "marlin"
 _MXFP4_LAYOUT_TRTLLM = "trtllm"
 
+# Host SHM staging ring for MXFP4 transports.  The layerwise manager consumes
+# the ring as two half-ring chunks so one TP consensus + one kt sync covers
+# ring/2 experts instead of one; serial transports keep using slots 0/1.
+_KT_MXFP4_HOST_RING_DEPTH = 64
+
 # Raw (pre-swizzle) slot tensor names per prepared layout.  They mirror the
 # attribute names each GPU method's create_weights registers:
 #   marlin: DeepSeekMxfp4MoEMethod.create_weights (mxfp4_deepseek.py L151-180)
@@ -844,9 +849,17 @@ class SharedFullContext:
 
         allocation_error = None
         try:
+            # Serial transports ping-pong slots 0/1; the MXFP4 layerwise
+            # manager batches its per-expert control plane over half-ring
+            # chunks, so it stages a deeper ring (~2.3 MiB/slot/rank).
+            self.host_ring_depth = (
+                _KT_MXFP4_HOST_RING_DEPTH
+                if getattr(self, "_is_mxfp4_quant", False)
+                else 2
+            )
+            self.host_expert_nbytes = {}
             for name in self.weight_names:
                 gpu_tensor = getattr(self.gpu_layer, name)
-                # Only allocate 2 experts worth of buffer (double buffering)
                 expert_shape = gpu_tensor.shape[1:]  # Shape per expert
                 if (
                     getattr(self, "_is_mxfp4_quant", False)
@@ -866,23 +879,24 @@ class SharedFullContext:
                     buf_dtype = gpu_tensor.dtype
                 element_size = torch.empty((), dtype=buf_dtype).element_size()
                 expert_nbytes = gpu_tensor.numel() // num_experts * element_size
-                double_buf_nbytes = expert_nbytes * 2
+                self.host_expert_nbytes[name] = expert_nbytes
+                ring_nbytes = expert_nbytes * self.host_ring_depth
 
                 shm_name = f"kt_buf_{name}_r{tp_rank}_{self.shm_unique_id}"
                 shm = shared_memory.SharedMemory(
-                    name=shm_name, create=True, size=double_buf_nbytes
+                    name=shm_name, create=True, size=ring_nbytes
                 )
                 self.shm_handles[name] = shm
 
-                # Shape: [2, ...expert_shape...]
+                # Shape: [host_ring_depth, ...expert_shape...]
                 cpu_buffer = torch.frombuffer(shm.buf, dtype=buf_dtype).reshape(
-                    (2,) + expert_shape
+                    (self.host_ring_depth,) + expert_shape
                 )
 
                 # Register as pinned memory for fast DMA
                 if torch.cuda.is_available():
                     register_result = torch.cuda.cudart().cudaHostRegister(
-                        cpu_buffer.data_ptr(), double_buf_nbytes, 0
+                        cpu_buffer.data_ptr(), ring_nbytes, 0
                     )
                     if int(register_result) != 0:
                         raise RuntimeError(
@@ -1058,19 +1072,11 @@ class SharedFullContext:
             w2_packed_buf = self.cpu_buffers["w2_weight_packed"]
             w2_scale_buf = self.cpu_buffers["w2_weight_scale"]
 
-            # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
-            w13_packed_expert_nbytes = (
-                w13_packed_buf.numel() // 2 * w13_packed_buf.element_size()
-            )
-            w13_scale_expert_nbytes = (
-                w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
-            )
-            w2_packed_expert_nbytes = (
-                w2_packed_buf.numel() // 2 * w2_packed_buf.element_size()
-            )
-            w2_scale_expert_nbytes = (
-                w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
-            )
+            # Per-expert sizes are fixed at ring allocation time.
+            w13_packed_expert_nbytes = self.host_expert_nbytes["w13_weight_packed"]
+            w13_scale_expert_nbytes = self.host_expert_nbytes["w13_weight_scale"]
+            w2_packed_expert_nbytes = self.host_expert_nbytes["w2_weight_packed"]
+            w2_scale_expert_nbytes = self.host_expert_nbytes["w2_weight_scale"]
 
             def submit_write_expert(expert_id):
                 # Use expert_id % 2 for double buffering slot selection
@@ -1226,19 +1232,11 @@ class SharedFullContext:
             w2_weight_buf = self.cpu_buffers["w2_weight"]
             w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
 
-            # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
-            w13_weight_expert_nbytes = (
-                w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
-            )
-            w13_scale_expert_nbytes = (
-                w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
-            )
-            w2_weight_expert_nbytes = (
-                w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
-            )
-            w2_scale_expert_nbytes = (
-                w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
-            )
+            # Per-expert sizes are fixed at ring allocation time.
+            w13_weight_expert_nbytes = self.host_expert_nbytes["w13_weight"]
+            w13_scale_expert_nbytes = self.host_expert_nbytes["w13_weight_scale_inv"]
+            w2_weight_expert_nbytes = self.host_expert_nbytes["w2_weight"]
+            w2_scale_expert_nbytes = self.host_expert_nbytes["w2_weight_scale_inv"]
 
             def submit_write_expert(expert_id, slot):
                 # Use provided slot for double buffering
@@ -1474,19 +1472,11 @@ class SharedFullContext:
             w2_weight_buf = self.cpu_buffers["w2_weight"]
             w2_scale_buf = self.cpu_buffers["w2_weight_scale"]
 
-            # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
-            w13_weight_expert_nbytes = (
-                w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
-            )
-            w13_scale_expert_nbytes = (
-                w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
-            )
-            w2_weight_expert_nbytes = (
-                w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
-            )
-            w2_scale_expert_nbytes = (
-                w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
-            )
+            # Per-expert sizes are fixed at ring allocation time.
+            w13_weight_expert_nbytes = self.host_expert_nbytes["w13_weight"]
+            w13_scale_expert_nbytes = self.host_expert_nbytes["w13_weight_scale"]
+            w2_weight_expert_nbytes = self.host_expert_nbytes["w2_weight"]
+            w2_scale_expert_nbytes = self.host_expert_nbytes["w2_weight_scale"]
 
             def submit_write_expert(expert_id, slot):
                 # Use provided slot for double buffering
@@ -1637,13 +1627,9 @@ class SharedFullContext:
             w13_weight_buf = self.cpu_buffers["w13_weight"]
             w2_weight_buf = self.cpu_buffers["w2_weight"]
 
-            # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
-            w13_weight_expert_nbytes = (
-                w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
-            )
-            w2_weight_expert_nbytes = (
-                w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
-            )
+            # Per-expert sizes are fixed at ring allocation time.
+            w13_weight_expert_nbytes = self.host_expert_nbytes["w13_weight"]
+            w2_weight_expert_nbytes = self.host_expert_nbytes["w2_weight"]
 
             def submit_write_expert(expert_id, slot):
                 # Use provided slot for double buffering
@@ -2109,15 +2095,17 @@ class _Mxfp4LayerwisePrefillManager:
         raise RuntimeError(message)
 
     def _submit_host_write(self, method, expert_id: int, host_slot: int) -> None:
-        buffers = self.context.cpu_buffers
-        pointers = self.context.all_rank_buffer_ptrs
+        """Queue one expert's SHM write on the kt task queue (no sync).
 
-        def expert_nbytes(name: str) -> int:
-            tensor = buffers[name]
-            return tensor.numel() // 2 * tensor.element_size()
+        The caller batches submissions and issues a single
+        ``sync_write_weight_scale_to_buffer`` per chunk — the kt task queue
+        preserves submission order and ``sync`` drains every pending task.
+        """
+        pointers = self.context.all_rank_buffer_ptrs
+        expert_nbytes = self.context.host_expert_nbytes
 
         offsets = {
-            name: host_slot * expert_nbytes(name) for name in self.raw_names
+            name: host_slot * expert_nbytes[name] for name in self.raw_names
         }
 
         def rank_pointers(name: str) -> List[int]:
@@ -2134,7 +2122,6 @@ class _Mxfp4LayerwisePrefillManager:
             rank_pointers(w2_name),
             rank_pointers(w2_scale_name),
         )
-        method.wrapper.sync_write_weight_scale_to_buffer()
 
     def _copy_resident_trtllm_experts(
         self,
@@ -2162,12 +2149,22 @@ class _Mxfp4LayerwisePrefillManager:
             (original_layer.w2_weight, prepared.w2),
             (original_layer.w2_weight_scale, prepared.w2_scale),
         )
-        for expert_id in gpu_expert_ids:
-            gpu_index = method.logical_to_gpu_index[expert_id].item()
+        if not gpu_expert_ids:
+            return
+        device = prepared.w13.device
+        dst_index = torch.tensor(gpu_expert_ids, dtype=torch.long, device=device)
+        src_index = (
+            method.logical_to_gpu_index[gpu_expert_ids]
+            .to(device=device, dtype=torch.long)
+        )
+        # Gather-scatter in bounded chunks: advanced indexing materializes the
+        # gathered rows, so cap the transient at ~1/4 of a layer's residents.
+        chunk = max(1, len(gpu_expert_ids) // 4)
+        for start in range(0, len(gpu_expert_ids), chunk):
+            dst_part = dst_index[start : start + chunk]
+            src_part = src_index[start : start + chunk]
             for source, destination in resident_pairs:
-                destination[expert_id].copy_(
-                    source[gpu_index], non_blocking=True
-                )
+                destination[dst_part] = source[src_part]
 
     def _postprocess_slot(
         self, slot: _Mxfp4PrefillSlot, *, cpu_expert_ids: List[int]
@@ -2275,10 +2272,17 @@ class _Mxfp4LayerwisePrefillManager:
                     saved_affinity = os.sched_getaffinity(0)
                     available_cpus = sorted(saved_affinity)
                     if available_cpus:
-                        target = available_cpus[
-                            -1 - (method.tp_rank % len(available_cpus))
-                        ]
-                        os.sched_setaffinity(0, {target})
+                        # A per-rank band (not a single core) keeps the
+                        # transport thread away from the kt threadpool's
+                        # cores without serializing it behind whatever else
+                        # the scheduler parks on one CPU.
+                        band_width = 4
+                        band_end = len(available_cpus) - method.tp_rank * band_width
+                        band_start = band_end - band_width
+                        band = set(
+                            available_cpus[max(0, band_start) : max(0, band_end)]
+                        )
+                        os.sched_setaffinity(0, band or set(available_cpus))
             except Exception as exc:
                 setup_error = exc
             self._commit_tp_runtime_phase(
@@ -2317,26 +2321,37 @@ class _Mxfp4LayerwisePrefillManager:
                 gpu_copy_error, f"GPU expert copy for layer {layer_idx}"
             )
 
+            # The SHM ring is consumed as two half-ring chunks so the control
+            # plane runs per chunk, not per expert: one host reuse fence, one
+            # batched kt submit + single sync, one producer-ready consensus,
+            # then the whole chunk's H2D enqueues.  Halves ping-pong so rank
+            # 0's SHM writes for chunk N+1 overlap the DMA drain of chunk N.
+            chunk_capacity = max(1, self.context.host_ring_depth // 2)
             pending_h2d_error = None
-            for position, expert_id in enumerate(cpu_expert_ids):
-                host_slot = position % 2
+            chunks = [
+                cpu_expert_ids[start : start + chunk_capacity]
+                for start in range(0, len(cpu_expert_ids), chunk_capacity)
+            ]
+            for chunk_idx, chunk in enumerate(chunks):
+                half = chunk_idx % 2
+                base_slot = half * chunk_capacity
 
                 # Rank 0 writes every rank's SHM.  Every rank must therefore
-                # finish its own DMA before that host slot can be overwritten.
+                # finish its own DMA before this half-ring can be overwritten.
                 # A prior H2D enqueue failure is sticky until this common
                 # control point, which lets every rank leave the hot loop in
                 # the same collective order instead of stranding a peer.
                 host_free_error = pending_h2d_error
                 pending_h2d_error = None
                 try:
-                    if self.host_slot_was_used[host_slot]:
-                        self.host_slot_free_events[host_slot].synchronize()
+                    if self.host_slot_was_used[half]:
+                        self.host_slot_free_events[half].synchronize()
                 except Exception as exc:
                     if host_free_error is None:
                         host_free_error = exc
                 self._commit_tp_device_runtime_phase(
                     host_free_error,
-                    f"host-slot {host_slot} reuse for expert {expert_id}",
+                    f"host half-ring {half} reuse for chunk {chunk_idx}",
                 )
 
                 write_error = None
@@ -2347,7 +2362,11 @@ class _Mxfp4LayerwisePrefillManager:
                                 "MXFP4 TP0 has no KT wrapper for host weight "
                                 "transport"
                             )
-                        self._submit_host_write(method, expert_id, host_slot)
+                        for position, expert_id in enumerate(chunk):
+                            self._submit_host_write(
+                                method, expert_id, base_slot + position
+                            )
+                        method.wrapper.sync_write_weight_scale_to_buffer()
                     except Exception as exc:
                         write_error = exc
 
@@ -2355,35 +2374,39 @@ class _Mxfp4LayerwisePrefillManager:
                 # an error broadcast.  TP0 therefore cannot strand peer ranks
                 # in a later phase if its KT writer fails.
                 self._commit_tp_device_runtime_phase(
-                    write_error, f"host write for expert {expert_id}"
+                    write_error,
+                    f"host write for chunk {chunk_idx} "
+                    f"({len(chunk)} experts)",
                 )
 
                 host_free_recorded = False
                 try:
                     with torch.cuda.stream(self.transfer_stream):
                         try:
-                            for _, cpu_buffer, destination in weight_infos:
-                                destination[expert_id].copy_(
-                                    cpu_buffer[host_slot], non_blocking=True
-                                )
+                            for position, expert_id in enumerate(chunk):
+                                cpu_slot = base_slot + position
+                                for _, cpu_buffer, destination in weight_infos:
+                                    destination[expert_id].copy_(
+                                        cpu_buffer[cpu_slot], non_blocking=True
+                                    )
                         finally:
                             # Once any DMA may have been enqueued, a peer's
                             # failure must not make this rank forget the local
-                            # host-slot fence before the consensus raises.
-                            self.host_slot_was_used[host_slot] = True
-                            self.host_slot_free_events[host_slot].record(
+                            # half-ring fence before the consensus raises.
+                            self.host_slot_was_used[half] = True
+                            self.host_slot_free_events[half].record(
                                 self.transfer_stream
                             )
                             host_free_recorded = True
                 except Exception as exc:
                     pending_h2d_error = exc
-                    if self.host_slot_was_used[host_slot] and not host_free_recorded:
+                    if self.host_slot_was_used[half] and not host_free_recorded:
                         try:
                             # Event publication itself failed.  A local-stream
                             # sync is the exception-only safe fallback before
                             # this rank reports failure to its peers.
                             self.transfer_stream.synchronize()
-                            self.host_slot_was_used[host_slot] = False
+                            self.host_slot_was_used[half] = False
                         except Exception:
                             pass
 
@@ -4148,11 +4171,11 @@ def copy_experts_weights_mxfp4(
             "copy_experts_weights_mxfp4 needs exactly one source: a prepared "
             "src_layer or a raw_source"
         )
-    selected_ids = [int(expert_id) for expert_id in selected_experts.tolist()]
-    if not selected_ids:
+    if selected_experts.numel() == 0:
         return
 
     if raw_source is not None:
+        selected_ids = [int(expert_id) for expert_id in selected_experts.tolist()]
         _copy_mxfp4_experts_from_raw_source(
             raw_source=raw_source,
             dst_layer=dst_layer,
@@ -4169,6 +4192,8 @@ def copy_experts_weights_mxfp4(
                     "the interleaved float8_e4m3fn prepared-scale form; "
                     "refusing a raw-vs-prepared MXFP4 row copy"
                 )
+    num_selected = selected_experts.numel()
+    gather_index = None
     for name in param_names:
         src_weight = getattr(src_layer, name)  # [global_num_experts, ...]
         dst_weight = getattr(dst_layer, name)  # [num_gpu_experts, ...]
@@ -4178,8 +4203,16 @@ def copy_experts_weights_mxfp4(
                 f"{tuple(src_weight.shape[1:])} and destination "
                 f"{tuple(dst_weight.shape[1:])}"
             )
-        for dst_idx, logical_id in enumerate(selected_ids):
-            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+        if gather_index is None:
+            gather_index = selected_experts.to(
+                device=src_weight.device, dtype=torch.long
+            )
+        # Position i lands in resident row i; index_select(out=) writes the
+        # gathered rows straight into the existing resident storage (no
+        # temporary, no parameter rebinding — CUDA-graph safe).
+        torch.index_select(
+            src_weight, 0, gather_index, out=dst_weight[:num_selected]
+        )
 
 
 def update_gpu_expert_mappings(
@@ -4206,12 +4239,13 @@ def update_gpu_expert_mappings(
     gpu_experts_mask_cpu = torch.zeros(num_experts, dtype=torch.bool, device='cpu')
     gpu_experts_mask_cpu[selected_experts.cpu()] = True
 
-    # Create logical_to_gpu_index (CUDA tensor)
+    # Create logical_to_gpu_index (CUDA tensor) with one scatter.
     logical_to_gpu_index = torch.full(
         (num_experts,), -1, dtype=torch.int32, device=device
     )
-    for gpu_idx, logical_id in enumerate(selected_experts):
-        logical_to_gpu_index[logical_id] = gpu_idx
+    logical_to_gpu_index[selected_experts.to(device=device, dtype=torch.long)] = (
+        torch.arange(num_gpu_experts, dtype=torch.int32, device=device)
+    )
 
     # Create gpu_index_to_logical (CPU tensor for weight loading)
     gpu_index_to_logical_cpu = selected_experts.cpu().to(torch.int32)
@@ -5219,8 +5253,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0:
             update_kt_wrapper_masks(self.wrapper, gpu_experts_mask_cpu)
 
-        # Log expert changes (rank 0 only)
-        if self.tp_rank == 0:
+        # Log expert changes (rank 0 only).  The argument gate matters: the
+        # .cpu().tolist() is a host sync that would otherwise serialize the
+        # successor transport behind this layer's compute at every level.
+        if self.tp_rank == 0 and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "KT dynamic update: layer %d updated GPU experts to: %s",
                 self.kt_config.layer_idx,
