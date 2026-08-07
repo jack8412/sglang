@@ -164,7 +164,7 @@ class TestMaskUpdateInPlace(CustomTestCase):
                 param_names=ktw._MXFP4_TRTLLM_RESIDENT_PARAM_NAMES,
                 disabled_reason=None,
             )
-            source_ctx = SimpleNamespace(_is_mxfp4_quant=True)
+            source_ctx = SimpleNamespace(_is_mxfp4_quant=True, gpu_layer=MagicMock())
             with patch.object(
                 method, "_mxfp4_dyn_update_plan_for", return_value=plan
             ), patch.object(

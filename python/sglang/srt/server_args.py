@@ -6871,16 +6871,11 @@ class ServerArgs:
                 "data (.pt/.json)."
             )
 
-        if (
-            self.kt_enable_dynamic_expert_update
-            and (self.kt_method or "").upper() == "MXFP4"
-        ):
-            raise ValueError(
-                "--kt-enable-dynamic-expert-update is not supported for "
-                "--kt-method MXFP4: the expert-weight copy path handles "
-                "int4/fp8/bf16 layouts only (MXFP4 needs the E8M0-scale-aware "
-                "copy; planned follow-up)."
-            )
+        # MXFP4 + dynamic expert update is supported (F2,
+        # copy_experts_weights_mxfp4). The E8M0-resident wheel requirement is
+        # feature-checked at KTEPWrapperMethod init via the wheel's own
+        # mxfp4_buffer_bytes footprint — a config-time rail here could only
+        # version-guess, so none is kept.
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""
