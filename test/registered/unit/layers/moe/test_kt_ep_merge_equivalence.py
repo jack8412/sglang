@@ -175,6 +175,7 @@ class TestKTEPMergeEquivalence(CustomTestCase):
             KTRANSFORMERS_AVAILABLE=True,
             KTMoEWrapper=_MockKTMoEWrapper,
             KT_WHEEL_SUPPORTS_SITU=True,
+            create=True,
         ), get_parallel().override(tp_rank=0, tp_size=1):
             method = KTEPWrapperMethod(MagicMock(), kt_config)
             fake_gpu = _FakeGpuMethod(method.logical_to_gpu_index)

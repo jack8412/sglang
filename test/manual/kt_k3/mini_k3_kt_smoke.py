@@ -265,7 +265,8 @@ def main():
         KTRANSFORMERS_AVAILABLE=True,
         KTMoEWrapper=_RefKTMoEWrapper,
         KT_WHEEL_SUPPORTS_SITU=True,
-    ), patch.object(ktw, "get_stream", lambda name: object()), patch(
+            create=True,
+        ), patch.object(ktw, "get_stream", lambda name: object()), patch(
         "torch.cuda.Event", lambda *a, **k: None
     ), patch(
         # The wrapper passes torch.cuda.current_stream(...).cuda_stream to the
