@@ -2977,10 +2977,17 @@ class ServerArgs:
         NS("exec.moe"),
     ] = None
     kt_expert_placement_strategy: A[
-        Literal["frequency", "front-loading", "uniform", "random"],
-        "[ktransformers parameter] GPU expert placement strategy. frequency: top-k by activation frequency (needs --init-expert-location logical_count data). front-loading: fill from the first MoE layer onwards. uniform: equal experts per layer. random: random placement with a fixed seed.",
+        Literal[
+            "frequency", "front-loading", "uniform", "random", "layer_concentrated"
+        ],
+        "[ktransformers parameter] GPU expert placement strategy. frequency: top-k by activation frequency (needs --init-expert-location logical_count data). front-loading: fill from the first MoE layer onwards. uniform: equal experts per layer. random: random placement with a fixed seed. layer_concentrated: whole layers are either fully GPU-resident (unwrapped) or fully CPU-resident (--kt-num-cpu-layers evenly spaced CPU layers); trades per-layer hybrid round-trips for a few all-CPU layers.",
         NS("exec.moe"),
     ] = "uniform"
+    kt_num_cpu_layers: A[
+        Optional[int],
+        "[ktransformers parameter] Number of MoE layers placed fully on CPU under the layer_concentrated placement strategy (evenly spaced across the MoE stack; the dense prefix is excluded by construction). Required when the strategy is layer_concentrated.",
+        NS("exec.moe"),
+    ] = None
     kt_enable_dynamic_expert_update: A[
         bool,
         "[ktransformers parameter] Enable dynamic GPU expert updates from runtime statistics: after a full-GPU prefill fallback, the resident GPU expert set is updated to the batch's most-activated experts. Not supported for MXFP4 expert layouts.",
@@ -6851,6 +6858,27 @@ class ServerArgs:
                 f"--kt-numa-nodes has {len(self.kt_numa_nodes)} entries but "
                 f"--kt-threadpool-count is {self.kt_threadpool_count}; they must "
                 f"match (one NUMA node per KT threadpool)."
+            )
+
+        if self.kt_expert_placement_strategy == "layer_concentrated":
+            if not self.kt_num_cpu_layers or self.kt_num_cpu_layers < 1:
+                raise ValueError(
+                    "--kt-num-cpu-layers (>= 1) is required with "
+                    "--kt-expert-placement-strategy layer_concentrated."
+                )
+            if self.kt_max_deferred_experts_per_token:
+                self.kt_max_deferred_experts_per_token = 0
+                logger.warning(
+                    "layer_concentrated placement forces "
+                    "--kt-max-deferred-experts-per-token to 0: deferred "
+                    "contributions target the successor layer's kt slot, and "
+                    "with unwrapped GPU-only successors they would be "
+                    "silently dropped."
+                )
+        elif self.kt_num_cpu_layers is not None:
+            logger.warning(
+                "--kt-num-cpu-layers has no effect without "
+                "--kt-expert-placement-strategy layer_concentrated."
             )
 
         if self.kt_gpu_experts_ratio is not None and not (

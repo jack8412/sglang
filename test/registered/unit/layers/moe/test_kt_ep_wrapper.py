@@ -16,6 +16,8 @@ Covers, on CPU only:
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -270,6 +272,80 @@ class TestPlacementMaskGenerators(CustomTestCase):
         self.assertTrue(first[0].all())
         self.assertTrue(first[1].all())
         self.assertEqual(int(first[2:].sum()), 100)
+
+
+class TestLayerConcentratedMasks(CustomTestCase):
+    """Derived-property pins for the layer_concentrated placement geometry:
+    whole layers are all-True (unwrapped, fully GPU) or all-False (fully
+    CPU), CPU layers are evenly spaced across the MoE stack only, and the
+    dense prefix can never be selected."""
+
+    def test_rows_are_whole_layer_and_count_exact(self):
+        masks = ktw.generate_layer_concentrated_masks(
+            num_layers=93,
+            num_experts=896,
+            num_cpu_layers=25,
+            first_k_dense_replace=1,
+            moe_layer_freq=1,
+        )
+        per_row = masks.sum(dim=1)
+        self.assertTrue(
+            bool(((per_row == 0) | (per_row == 896)).all()),
+            "every row must be all-CPU or all-GPU",
+        )
+        self.assertEqual(int((per_row == 0).sum()), 25)
+        self.assertEqual(int(per_row[0]), 896)  # dense prefix stays GPU
+
+    def test_cpu_layers_evenly_spaced(self):
+        masks = ktw.generate_layer_concentrated_masks(
+            num_layers=93,
+            num_experts=8,
+            num_cpu_layers=25,
+            first_k_dense_replace=1,
+            moe_layer_freq=1,
+        )
+        cpu_layers = (masks.sum(dim=1) == 0).nonzero().flatten().tolist()
+        gaps = [b - a for a, b in zip(cpu_layers, cpu_layers[1:])]
+        self.assertTrue(
+            all(3 <= g <= 5 for g in gaps),
+            f"92/25 spacing must give gaps of 3-4 (+edge): {gaps}",
+        )
+
+    def test_cpu_count_clamped_to_moe_layers(self):
+        masks = ktw.generate_layer_concentrated_masks(
+            num_layers=5,
+            num_experts=4,
+            num_cpu_layers=99,
+            first_k_dense_replace=1,
+            moe_layer_freq=1,
+        )
+        self.assertEqual(int((masks.sum(dim=1) == 0).sum()), 4)
+
+
+class TestZeroGpuExpertPwalGuard(CustomTestCase):
+    """Regression guard for the layer-concentrated CPU-full layers: the
+    pin's Mxfp4MoEMethod.process_weights_after_loading indexes expert row 0
+    and raises IndexError on a zero-expert parameter, so the wrapper must
+    not delegate when num_gpu_experts == 0."""
+
+    def _wrapper(self, num_gpu_experts):
+        wrapper = object.__new__(ktw.KTEPWrapperMethod)
+        wrapper.num_gpu_experts = num_gpu_experts
+        wrapper.tp_rank = 1
+        wrapper.wrapper = None
+        wrapper.gpu_method = mock.Mock(spec=["process_weights_after_loading"])
+        return wrapper
+
+    def test_zero_gpu_experts_skips_gpu_pwal(self):
+        wrapper = self._wrapper(0)
+        wrapper.process_weights_after_loading(SimpleNamespace())
+        wrapper.gpu_method.process_weights_after_loading.assert_not_called()
+
+    def test_nonzero_gpu_experts_still_delegates(self):
+        wrapper = self._wrapper(3)
+        layer = SimpleNamespace(num_local_experts=64, num_experts=64)
+        wrapper.process_weights_after_loading(layer)
+        wrapper.gpu_method.process_weights_after_loading.assert_called_once_with(layer)
 
 
 class TestPlacementAwareDeferredSelector(CustomTestCase):

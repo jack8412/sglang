@@ -3247,6 +3247,47 @@ def generate_front_loading_masks(
     return masks
 
 
+def generate_layer_concentrated_masks(
+    num_layers: int,
+    num_experts: int,
+    num_cpu_layers: int,
+    first_k_dense_replace: int,
+    moe_layer_freq: int,
+) -> torch.Tensor:
+    """Whole-layer placement: every layer is fully GPU-resident (all-True,
+    which the wrapping predicate leaves unwrapped) except ``num_cpu_layers``
+    evenly spaced MoE layers that are fully CPU-resident (all-False).
+
+    The dense prefix and any non-MoE layers stay all-True by construction.
+    Rationale: the hybrid per-layer CPU round-trip is paid per LAYER, not per
+    expert — concentrating the CPU work into a few all-CPU layers removes the
+    round-trip from every other layer entirely.
+    """
+    masks = torch.ones(num_layers, num_experts, dtype=torch.bool)
+    moe_layers = [
+        layer_idx
+        for layer_idx in range(num_layers)
+        if layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0
+    ]
+    num_cpu = max(0, min(num_cpu_layers, len(moe_layers)))
+    if num_cpu == 0:
+        return masks
+    positions = sorted(
+        {
+            min(int((k + 0.5) * len(moe_layers) / num_cpu), len(moe_layers) - 1)
+            for k in range(num_cpu)
+        }
+    )
+    if len(positions) != num_cpu:
+        raise ValueError(
+            f"layer_concentrated spacing collapsed: {num_cpu} CPU layers over "
+            f"{len(moe_layers)} MoE layers produced {len(positions)} slots"
+        )
+    for position in positions:
+        masks[moe_layers[position]] = False
+    return masks
+
+
 def generate_uniform_masks(
     num_layers: int,
     num_experts: int,
@@ -3555,6 +3596,20 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
 
+    elif strategy == "layer_concentrated":
+        if tp_rank == 0:
+            logger.info(
+                "Using layer_concentrated strategy: %d fully-CPU MoE layers, "
+                "the rest fully GPU-resident (unwrapped)",
+                server_args.kt_num_cpu_layers,
+            )
+            masks = generate_layer_concentrated_masks(
+                num_layers, num_experts, server_args.kt_num_cpu_layers,
+                first_k_dense_replace, moe_layer_freq
+            )
+        else:
+            masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
+
     else:
         raise ValueError(f"Unknown kt_expert_placement_strategy: {strategy}")
 
@@ -3642,6 +3697,12 @@ def create_kt_config_from_server_args(
 
     # Get mask for this specific layer
     gpu_experts_mask = masks[layer_idx]
+
+    if bool(gpu_experts_mask.all()):
+        # Fully GPU-resident layer: leave the plain quant method unwrapped —
+        # no CPU submit, no staging, no per-layer round-trip.  The loader and
+        # the layerwise-prefill registry tolerate per-layer absence.
+        return None
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -4621,8 +4682,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Args:
             layer: The MoE layer module
         """
-        # 1. Process GPU weights
-        if hasattr(self.gpu_method, "process_weights_after_loading"):
+        # 1. Process GPU weights.  Fully-CPU layers (layer_concentrated
+        # placement) keep their zero-size GPU params unprocessed: the pin's
+        # Mxfp4MoEMethod post-load indexes expert row 0, which does not exist
+        # at num_gpu_experts == 0, and there is nothing to shuffle anyway.
+        if self.num_gpu_experts > 0 and hasattr(
+            self.gpu_method, "process_weights_after_loading"
+        ):
             with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
                 self.gpu_method.process_weights_after_loading(layer)
 
