@@ -4887,11 +4887,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
-        _kt_timing = (
-            self._kt_debug_timing
-            and self.tp_rank == 0
-            and getattr(self.kt_config, "layer_idx", None) in (0, 5, 20, 35)
-        )
+        # No layer filter: placement strategies (layer_concentrated) put
+        # wrappers on arbitrary layer indices; the per-layer step rate-limit
+        # at the emission site keeps volume bounded.
+        _kt_timing = self._kt_debug_timing and self.tp_rank == 0
         _kt_t_apply_start = time.perf_counter() if _kt_timing else None
         _kt_t_after_submit = None
         _kt_t_after_mask = None
