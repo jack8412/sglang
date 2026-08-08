@@ -4915,10 +4915,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             or hasattr(layer, "w13_weight_packed")
             or getattr(layer, "_v4_tk_path", False)
         )
+        # Only genuine extend (prefill) batches may take the layerwise path:
+        # a TARGET_VERIFY pass can clear the token threshold (bs x
+        # draft_tokens) but must stay on the hybrid path, and graph capture
+        # forces is_extend_in_batch False so hostfunc-heavy layerwise work
+        # can never be baked into a decode/verify graph.
+        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+
         _full_gpu_gate = (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
             and _full_gpu_fallback_supported
+            and get_is_extend_in_batch()
         )
         _mxfp4_requested = _mxfp4_pipeline_requested(self)
         _mxfp4_signature = getattr(self, "_mxfp4_pipeline_signature", None)

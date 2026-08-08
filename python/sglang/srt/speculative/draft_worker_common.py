@@ -80,16 +80,23 @@ def build_draft_tp_worker(
             server_args=server_args, algo_label=algo_label
         )
     )
-    draft_worker = TpModelWorker(
-        server_args=server_args,
-        gpu_id=gpu_id,
-        ps=ps,
-        nccl_port=nccl_port,
-        is_draft_worker=True,
-        # The draft runs at absolute target positions.
-        context_length=target_model_config.context_len,
-        draft_attention_backend=draft_backend,
-    )
+    from sglang.srt.layers.moe.utils import speculative_kt_ep_disabled_context
+
+    # The draft must never route through the KT CPU-GPU hybrid path: kt
+    # flags are global server args, and without this guard an MoE draft's
+    # layers would be KT-wrapped against the TARGET model's expert masks
+    # (the EAGLE/STANDALONE v2 workers already wrap their construction).
+    with speculative_kt_ep_disabled_context():
+        draft_worker = TpModelWorker(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            ps=ps,
+            nccl_port=nccl_port,
+            is_draft_worker=True,
+            # The draft runs at absolute target positions.
+            context_length=target_model_config.context_len,
+            draft_attention_backend=draft_backend,
+        )
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner

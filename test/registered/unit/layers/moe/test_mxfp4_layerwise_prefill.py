@@ -1014,7 +1014,13 @@ class TestMxfp4ApplyFallbacks(CustomTestCase):
         return _DispatchOutput(hidden_states=hidden, topk_output=topk)
 
     def _apply(self, wrapper, layer, dispatch, runtime_supported):
+        from sglang.srt.runtime_context import get_forward
+
         with (
+            # The layerwise gate only opens on genuine extend batches
+            # (TARGET_VERIFY / capture carve-out); these fallback tests
+            # exercise prefill routing, so run under an extend forward.
+            get_forward().scoped(is_extend_in_batch=True),
             mock.patch.dict(
                 sys.modules,
                 _runtime_stubs(standard_combine_input=_StandardCombineInput),
