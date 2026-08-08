@@ -3495,6 +3495,10 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             f"total GPU experts: {num_gpu_experts} "
             f"(= {server_args.kt_num_gpu_experts} × {num_moe_layers} MoE layers)"
         )
+    elif server_args.kt_expert_placement_strategy == "layer_concentrated":
+        # Whole-layer placement is derived from kt_num_cpu_layers alone;
+        # the per-layer expert count knobs do not apply.
+        num_gpu_experts = 0
     else:
         logger.warning("Either kt_num_gpu_experts or kt_gpu_experts_ratio is required but not set.")
         return None
