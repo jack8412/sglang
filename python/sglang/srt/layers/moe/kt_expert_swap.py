@@ -23,9 +23,12 @@ traffic, not the whole history, or the set freezes once early traffic
 dominates the totals.
 """
 
-from typing import List, NamedTuple, Optional
+import logging
+from typing import Callable, List, NamedTuple, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class ExpertSwap(NamedTuple):
@@ -35,6 +38,94 @@ class ExpertSwap(NamedTuple):
     demote: int  # logical expert id, currently GPU-resident
     demand: float  # EMA demand of the promoted expert
     hits: float  # EMA resident hits of the demoted expert
+
+
+class SwapTables(NamedTuple):
+    """The four tables that must agree about where an expert lives.
+
+    Kept together because a swap has to update them as one unit: any window in
+    which they disagree is a window in which a token is computed with the
+    wrong weights, on whichever side read the stale table.
+    """
+
+    gpu_experts_mask: torch.Tensor  # bool [num_experts], CPU
+    gpu_experts_mask_cuda: torch.Tensor  # bool [num_experts], device
+    logical_to_gpu_index: torch.Tensor  # int32 [num_experts], -1 = not resident
+    logical_to_gpu_index_cuda: torch.Tensor  # int32 [num_experts], device
+    gpu_index_to_logical: torch.Tensor  # int32 [num_gpu_experts]
+    pinned_mask: Optional[torch.Tensor]  # uint8/bool, pointer held by kt C++
+
+
+def apply_swaps_to_tables(tables: SwapTables, swaps: List[ExpertSwap]) -> List[int]:
+    """Point every membership table at the new occupants. Returns the rows used.
+
+    Every write is in place (``copy_``/index assignment, never rebinding),
+    because decode CUDA graphs captured these tensors' addresses and the
+    kt-kernel C++ side holds a raw pointer to ``pinned_mask``. Rebinding any of
+    them would leave the graph and the C++ half reading freed memory -- the
+    failure the existing dynamic-update path already guards against.
+
+    Row assignment is preserved rather than re-densified: the promoted expert
+    takes exactly the demoted expert's row, so no other expert's row moves and
+    no other resident weight has to be touched.
+    """
+    rows: List[int] = []
+    for s in swaps:
+        row = int(tables.logical_to_gpu_index[s.demote].item())
+        if row < 0:
+            raise ValueError(
+                f"demote target {s.demote} is not GPU-resident (row {row})"
+            )
+        if int(tables.logical_to_gpu_index[s.promote].item()) >= 0:
+            raise ValueError(f"promote target {s.promote} is already resident")
+
+        tables.gpu_experts_mask[s.promote] = True
+        tables.gpu_experts_mask[s.demote] = False
+        tables.logical_to_gpu_index[s.promote] = row
+        tables.logical_to_gpu_index[s.demote] = -1
+        tables.gpu_index_to_logical[row] = s.promote
+        rows.append(row)
+
+    tables.gpu_experts_mask_cuda.copy_(tables.gpu_experts_mask, non_blocking=True)
+    tables.logical_to_gpu_index_cuda.copy_(
+        tables.logical_to_gpu_index, non_blocking=True
+    )
+    if tables.pinned_mask is not None:
+        # kt-kernel reads this every forward with no lock; it must be written
+        # last, after the GPU rows already hold the new weights, so the CPU
+        # half never disclaims an expert whose weights are not yet on GPU.
+        tables.pinned_mask.copy_(tables.gpu_experts_mask)
+    return rows
+
+
+def assert_tables_consistent(tables: SwapTables, num_gpu_experts: int) -> None:
+    """Post-window invariant: every expert resident in exactly one place.
+
+    Cheap enough to run after every swap window, and worth it: the failure
+    mode of a desynced table is a silently wrong answer, not a crash.
+    """
+    mask = tables.gpu_experts_mask
+    l2g = tables.logical_to_gpu_index
+    g2l = tables.gpu_index_to_logical
+
+    resident = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+    if len(resident) != num_gpu_experts:
+        raise AssertionError(
+            f"mask says {len(resident)} residents, expected {num_gpu_experts}"
+        )
+    rows = sorted(int(l2g[e].item()) for e in resident)
+    if rows != list(range(num_gpu_experts)):
+        raise AssertionError("resident rows are not a permutation of 0..N-1")
+    for e in resident:
+        row = int(l2g[e].item())
+        if int(g2l[row].item()) != e:
+            raise AssertionError(
+                f"round trip broken: expert {e} -> row {row} -> "
+                f"{int(g2l[row].item())}"
+            )
+    non_resident = (~mask).nonzero(as_tuple=False).flatten()
+    if non_resident.numel() and int(l2g[non_resident].max().item()) >= 0:
+        raise AssertionError("a non-resident expert still maps to a GPU row")
 
 
 class ExpertSwapPolicy:
@@ -176,6 +267,24 @@ class ExpertSwapPolicy:
             self.demand_ema[s.demote] = 0.0
             self.hits_ema[s.demote] = 0.0
 
+    def snapshot_counters(
+        self,
+        insist: torch.Tensor,
+        override: torch.Tensor,
+        resident_hits: torch.Tensor,
+    ) -> None:
+        """Fold one interval from the three device counters.
+
+        ``insist`` and ``override`` both mean "the router asked for a
+        non-resident expert" and are summed into demand; whether we paid the
+        CPU or substituted is a serving decision, not a statement about what
+        the traffic wanted.
+        """
+        self.observe(
+            (insist.to(torch.int64) + override.to(torch.int64)).cpu(),
+            resident_hits.to(torch.int64).cpu(),
+        )
+
     def state_dict(self) -> dict:
         """Serialisable state, for persisting across restarts as a seed."""
         return {
@@ -193,3 +302,100 @@ class ExpertSwapPolicy:
         self.demand_ema = torch.tensor(state["demand_ema"], dtype=torch.float64)
         self.hits_ema = torch.tensor(state["hits_ema"], dtype=torch.float64)
         self._observed = True
+
+
+# ---------------------------------------------------------------------------
+# Swap window driver
+# ---------------------------------------------------------------------------
+
+# Moves one expert's weights into a resident GPU row:
+#   move_weights(layer, dst_row, logical_expert_id) -> None
+# Isolated behind this alias deliberately. Everything else in a swap window is
+# bookkeeping that can be asserted; this is the one step that physically
+# rewrites weights, so it is the one step worth testing on its own (bitwise,
+# against a known-good full-set copy for the same expert) before it is trusted.
+MoveWeightsFn = Callable[[object, int, int], None]
+
+
+class SwapWindowResult(NamedTuple):
+    swaps_applied: int
+    layers_touched: int
+    skipped_layers: int
+
+
+def run_swap_window(
+    layers: List[dict],
+    *,
+    move_weights: MoveWeightsFn,
+    quiesce: Optional[Callable[[], None]] = None,
+) -> SwapWindowResult:
+    """Apply pending swaps for every layer, at an already-paused point.
+
+    ``layers`` is a list of dicts with keys ``policy``, ``tables``, ``layer``,
+    ``num_gpu_experts`` and ``layer_idx``.
+
+    The caller is responsible for having quiesced the pipeline: this function
+    rewrites resident weights and flips the membership tables that both the
+    GPU MoE and the kt-kernel CPU half read, so nothing may be in flight. The
+    optional ``quiesce`` callback is invoked once before any mutation as a
+    last-line barrier.
+
+    Ordering within a layer is deliberate and load-bearing:
+      1. write the promoted expert's weights into the demoted expert's row
+      2. only then flip the tables
+    Doing it the other way round would, for the window between the two,
+    advertise an expert as GPU-resident while its row still held the previous
+    occupant's weights -- every token routed there would silently compute with
+    the wrong expert. Nothing crashes; the answers are just wrong.
+
+    Eager demotion: the demoted expert stays computable on the CPU side, so at
+    no point is an expert resident nowhere. This is why the tables can be
+    asserted consistent immediately on return, instead of "eventually".
+    """
+    if quiesce is not None:
+        quiesce()
+
+    applied = 0
+    touched = 0
+    skipped = 0
+    for entry in layers:
+        policy: ExpertSwapPolicy = entry["policy"]
+        tables: SwapTables = entry["tables"]
+        swaps = policy.select(tables.gpu_experts_mask)
+        if not swaps:
+            continue
+        try:
+            rows = [
+                int(tables.logical_to_gpu_index[s.demote].item()) for s in swaps
+            ]
+            for s, row in zip(swaps, rows):
+                move_weights(entry["layer"], row, s.promote)
+            apply_swaps_to_tables(tables, swaps)
+            assert_tables_consistent(tables, entry["num_gpu_experts"])
+        except Exception:
+            # A layer that fails mid-window is left as it was found: weights
+            # may have been written but the tables were not flipped, so the
+            # rewritten row is still advertised as its previous occupant and
+            # nothing routes to it. Skipping is therefore safe, while raising
+            # would take down a live server for a cache-tuning operation.
+            logger.exception(
+                "[kt-swap] layer %s: swap window failed, layer left unchanged",
+                entry.get("layer_idx"),
+            )
+            skipped += 1
+            continue
+        policy.note_swapped(swaps)
+        applied += len(swaps)
+        touched += 1
+        logger.info(
+            "[kt-swap] layer=%s applied %d swap(s): %s",
+            entry.get("layer_idx"),
+            len(swaps),
+            ", ".join(
+                f"{s.promote}(d={s.demand:.1f})<-row{r}-{s.demote}(h={s.hits:.1f})"
+                for s, r in zip(swaps, rows)
+            ),
+        )
+    return SwapWindowResult(
+        swaps_applied=applied, layers_touched=touched, skipped_layers=skipped
+    )

@@ -150,5 +150,158 @@ class TestStateRoundTrip(CustomTestCase):
             q.load_state_dict(p.state_dict())
 
 
+def _tables(num_experts=8, resident=(0, 1, 2, 3)):
+    from sglang.srt.layers.moe.kt_expert_swap import SwapTables
+
+    mask = torch.zeros(num_experts, dtype=torch.bool)
+    l2g = torch.full((num_experts,), -1, dtype=torch.int32)
+    for row, e in enumerate(resident):
+        mask[e] = True
+        l2g[e] = row
+    g2l = torch.tensor(list(resident), dtype=torch.int32)
+    return SwapTables(
+        gpu_experts_mask=mask,
+        gpu_experts_mask_cuda=mask.clone(),
+        logical_to_gpu_index=l2g,
+        logical_to_gpu_index_cuda=l2g.clone(),
+        gpu_index_to_logical=g2l,
+        pinned_mask=mask.clone(),
+    )
+
+
+class TestTableUpdate(CustomTestCase):
+    """Derived property: a swap must leave all four membership tables agreeing,
+    with the promoted expert in exactly the demoted expert's row. Red if the
+    row is re-densified (which would move OTHER experts' rows without moving
+    their weights) or if any table is missed — both produce tokens computed
+    against the wrong expert, silently."""
+
+    def test_promoted_takes_the_demoted_row(self):
+        from sglang.srt.layers.moe.kt_expert_swap import (
+            ExpertSwap,
+            apply_swaps_to_tables,
+            assert_tables_consistent,
+        )
+
+        t = _tables()
+        rows = apply_swaps_to_tables(t, [ExpertSwap(6, 2, 100.0, 0.0)])
+        self.assertEqual(rows, [2])  # expert 2 lived in row 2
+        self.assertTrue(t.gpu_experts_mask[6])
+        self.assertFalse(t.gpu_experts_mask[2])
+        self.assertEqual(int(t.logical_to_gpu_index[6]), 2)
+        self.assertEqual(int(t.logical_to_gpu_index[2]), -1)
+        self.assertEqual(int(t.gpu_index_to_logical[2]), 6)
+        # every other expert's row is untouched
+        self.assertEqual(int(t.logical_to_gpu_index[0]), 0)
+        self.assertEqual(int(t.logical_to_gpu_index[3]), 3)
+        assert_tables_consistent(t, 4)
+
+    def test_device_and_pinned_copies_track(self):
+        from sglang.srt.layers.moe.kt_expert_swap import (
+            ExpertSwap,
+            apply_swaps_to_tables,
+        )
+
+        t = _tables()
+        ptrs = (t.gpu_experts_mask_cuda.data_ptr(), t.pinned_mask.data_ptr())
+        apply_swaps_to_tables(t, [ExpertSwap(5, 1, 50.0, 0.0)])
+        self.assertTrue(bool(t.gpu_experts_mask_cuda[5]))
+        self.assertFalse(bool(t.gpu_experts_mask_cuda[1]))
+        self.assertTrue(bool(t.pinned_mask[5]))
+        # in-place: decode graphs captured these addresses, kt C++ holds the
+        # pinned pointer
+        self.assertEqual(
+            (t.gpu_experts_mask_cuda.data_ptr(), t.pinned_mask.data_ptr()), ptrs
+        )
+
+    def test_rejects_incoherent_swap(self):
+        from sglang.srt.layers.moe.kt_expert_swap import (
+            ExpertSwap,
+            apply_swaps_to_tables,
+        )
+
+        t = _tables()
+        with self.assertRaises(ValueError):  # demote a non-resident expert
+            apply_swaps_to_tables(t, [ExpertSwap(6, 7, 1.0, 0.0)])
+        with self.assertRaises(ValueError):  # promote an already-resident one
+            apply_swaps_to_tables(t, [ExpertSwap(0, 1, 1.0, 0.0)])
+
+    def test_invariant_catches_desync(self):
+        from sglang.srt.layers.moe.kt_expert_swap import assert_tables_consistent
+
+        t = _tables()
+        t.gpu_experts_mask[7] = True  # mask says resident, no row assigned
+        with self.assertRaises(AssertionError):
+            assert_tables_consistent(t, 4)
+
+
+class TestSwapWindow(CustomTestCase):
+    """Critical-path bookkeeping for the window driver. Red if weights stop
+    being written BEFORE the tables flip (a window where a row is advertised
+    as one expert while holding another's weights), or if a failing layer
+    stops being isolated."""
+
+    def _entry(self, policy=None):
+        from sglang.srt.layers.moe.kt_expert_swap import ExpertSwapPolicy
+
+        p = policy or ExpertSwapPolicy(8, ema_alpha=1.0, min_demand=1.0, max_swaps=2)
+        p.observe(_cum({}), _cum({}))
+        p.observe(_cum({6: 100}), _cum({2: 0}))
+        return {
+            "policy": p,
+            "tables": _tables(),
+            "layer": object(),
+            "num_gpu_experts": 4,
+            "layer_idx": 40,
+        }
+
+    def test_weights_move_before_tables_flip(self):
+        from sglang.srt.layers.moe.kt_expert_swap import run_swap_window
+
+        entry = self._entry()
+        order = []
+
+        def move(layer, row, expert):
+            # tables must still show the OLD occupant at this point
+            order.append(
+                (row, expert, int(entry["tables"].gpu_index_to_logical[row]))
+            )
+
+        res = run_swap_window([entry], move_weights=move)
+        self.assertEqual(res.swaps_applied, 1)
+        row, promoted, occupant_at_write = order[0]
+        self.assertEqual((row, promoted), (2, 6))
+        self.assertEqual(occupant_at_write, 2)  # flip had not happened yet
+        self.assertEqual(int(entry["tables"].gpu_index_to_logical[2]), 6)
+
+    def test_failing_layer_is_isolated_not_fatal(self):
+        from sglang.srt.layers.moe.kt_expert_swap import run_swap_window
+
+        entry = self._entry()
+
+        def boom(layer, row, expert):
+            raise RuntimeError("export failed")
+
+        res = run_swap_window([entry], move_weights=boom)
+        self.assertEqual(res.swaps_applied, 0)
+        self.assertEqual(res.skipped_layers, 1)
+        # tables untouched, so the rewritten row is still advertised as its
+        # previous occupant and nothing routes to a half-updated expert
+        self.assertEqual(int(entry["tables"].gpu_index_to_logical[2]), 2)
+        self.assertTrue(bool(entry["tables"].gpu_experts_mask[2]))
+
+    def test_quiesce_runs_before_any_mutation(self):
+        from sglang.srt.layers.moe.kt_expert_swap import run_swap_window
+
+        entry = self._entry()
+        seq = []
+        run_swap_window(
+            [entry],
+            move_weights=lambda l, r, e: seq.append("move"),
+            quiesce=lambda: seq.append("quiesce"),
+        )
+        self.assertEqual(seq[0], "quiesce")
+
+
 if __name__ == "__main__":
     unittest.main()
