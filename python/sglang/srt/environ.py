@@ -1369,6 +1369,11 @@ class Envs:
     SGLANG_DEBUG_KT_BYPASS_GPU_MOE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_KT_BYPASS_GPU_MOE"
     )
+    # One-shot bitwise self-check of the expert-swap weight mover: rebuild an
+    # already-resident expert from the checkpoint and compare against the row
+    # the loader produced. Read-only; the gate the mover must pass before it
+    # is trusted to rewrite resident weights.
+    SGLANG_KT_VERIFY_EXPERT_MOVER = EnvBool(False)
 
     # ===================================================================
     # DeepSeek-V4-Flash MXFP4 GPU MoE

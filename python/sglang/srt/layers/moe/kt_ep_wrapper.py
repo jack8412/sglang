@@ -5283,6 +5283,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         topk_output=topk_output
                     )
                 self._maybe_log_margin_stats()
+                self._maybe_verify_expert_mover(layer)
             elif not self._margin_format_warned:
                 self._margin_format_warned = True
                 logger.warning(
@@ -5455,6 +5456,56 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
                 )
         return StandardCombineInput(hidden_states=output)
+
+    def _maybe_verify_expert_mover(self, layer) -> None:
+        """SGLANG_KT_VERIFY_EXPERT_MOVER=1: prove the swap mover, once.
+
+        Rebuilds an expert that is ALREADY resident straight from the
+        checkpoint and compares byte-for-byte with the row the production
+        loader filled. This is the gate the weight mover has to pass before it
+        is allowed to rewrite anything: a wrong TP slice or gate/up assembly
+        produces a correctly-shaped tensor full of the wrong numbers, which
+        degrades output without ever raising.
+
+        Read-only and one-shot; never runs under capture.
+        """
+        if getattr(type(self), "_kt_mover_verified", False):
+            return
+        if self.tp_rank != 0 or torch.cuda.is_current_stream_capturing():
+            return
+        if not envs.SGLANG_KT_VERIFY_EXPERT_MOVER.get():
+            return
+        type(self)._kt_mover_verified = True
+        try:
+            from sglang.srt.layers.moe.kt_expert_mover import CheckpointExpertMover
+
+            resident_rows = torch.nonzero(self.gpu_experts_mask).flatten()
+            if resident_rows.numel() == 0:
+                return
+            logical_id = int(resident_rows[0].item())
+            row = int(self.logical_to_gpu_index[logical_id].item())
+            layer_idx = self.kt_config.layer_idx
+            mover = CheckpointExpertMover(
+                self.kt_config.weight_path,
+                expert_prefix_for_layer=lambda _l: (
+                    f"language_model.model.layers.{layer_idx}"
+                    f".block_sparse_moe.experts"
+                ),
+                tp_rank=get_parallel().tp_rank,
+                tp_size=get_parallel().tp_size,
+                param_names=_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES,
+            )
+            ok = mover.verify_row(layer, row, logical_id)
+            logger.info(
+                "[kt-swap-verify] layer=%d expert=%d row=%d -> %s",
+                layer_idx,
+                logical_id,
+                row,
+                "PASS" if ok else "FAIL",
+            )
+            mover.reader.close()
+        except Exception:
+            logger.exception("[kt-swap-verify] mover verification errored")
 
     def _maybe_log_margin_stats(self) -> None:
         """Rate-limited INFO line with cumulative insist/override counts.
