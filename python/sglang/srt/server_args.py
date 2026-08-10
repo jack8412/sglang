@@ -2973,7 +2973,7 @@ class ServerArgs:
     ] = None
     kt_gpu_prefill_token_threshold: A[
         Optional[int],
-        "[ktransformers parameter] Token threshold for the full-GPU prefill fallback: when a batch's token count reaches it, the complete layer's experts are temporarily streamed to GPU instead of using CPU experts.",
+        "[ktransformers parameter] Token threshold for the full-GPU prefill fallback: when a batch's token count reaches it, the complete layer's experts are temporarily streamed to GPU instead of using CPU experts. DEPRECATED for margin-routed serving — it is slower, costs 7.54 GiB/GPU, and bypasses margin routing. Leave unset.",
         NS("exec.moe"),
     ] = None
     kt_expert_placement_strategy: A[
@@ -6882,6 +6882,24 @@ class ServerArgs:
             raise ValueError(
                 f"--kt-routing-margin must be a number >= 0.0 (0.0 = "
                 f"count-only), got {self.kt_routing_margin}."
+            )
+
+        if self.kt_gpu_prefill_token_threshold and self.kt_routing_margin is not None:
+            # The full-GPU sweep predates margin routing and is strictly worse
+            # with it. Measured on Kimi-K3 (8xB200), margin 0.5, placement held
+            # constant: 30k-token prefill 448.9 tok/s with the sweep vs 2,335
+            # without (5.2x); 1k-token prompts paid 35 s for a full sweep. It
+            # also allocates 7.54 GiB/GPU of slots, and -- because it returns
+            # before the override block -- it bypasses margin routing entirely,
+            # so those tokens are computed under different routing than decode
+            # AND contribute nothing to the counters that drive expert swaps.
+            raise ValueError(
+                "--kt-gpu-prefill-token-threshold is incompatible with "
+                "--kt-routing-margin: the full-GPU prefill sweep is 5.2x "
+                "SLOWER than margin-routed prefill (448.9 vs 2,335 tok/s at "
+                "30k tokens), costs 7.54 GiB/GPU, bypasses margin routing so "
+                "prefill and decode disagree, and starves expert swapping of "
+                "its statistics. Unset it."
             )
 
         if self.kt_expert_swap_interval and self.kt_routing_margin is None:

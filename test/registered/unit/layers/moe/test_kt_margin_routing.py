@@ -225,3 +225,37 @@ class TestMarginConfigPlumbing(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSweepRefusedUnderMargin(CustomTestCase):
+    """Critical-path bookkeeping: the full-GPU prefill sweep must not run
+    alongside margin routing. Measured on K3: 5.2x SLOWER prefill, 7.54 GiB/GPU
+    of slots, and -- because the sweep returns before the override block -- it
+    bypasses margin routing entirely, so prefill and decode disagree on
+    routing AND the sweep's tokens contribute nothing to the counters that
+    drive expert swapping. Red if the rail is dropped and the combination
+    silently becomes servable again."""
+
+    def _args(self, **kw):
+        from sglang.srt.server_args import ServerArgs
+
+        base = dict(
+            model_path="/dummy",
+            kt_weight_path="/dummy",
+            kt_method="MXFP4",
+        )
+        base.update(kw)
+        return ServerArgs(**base)
+
+    def test_sweep_with_margin_raises(self):
+        with self.assertRaises(ValueError) as cm:
+            self._args(kt_routing_margin=0.5, kt_gpu_prefill_token_threshold=1024)
+        self.assertIn("kt-gpu-prefill-token-threshold", str(cm.exception))
+
+    def test_sweep_without_margin_still_allowed(self):
+        # Non-margin deployments keep the old behaviour: the sweep is only
+        # strictly worse once margin routing exists to replace it.
+        self._args(kt_gpu_prefill_token_threshold=1024)
+
+    def test_margin_without_sweep_is_the_recipe(self):
+        self._args(kt_routing_margin=0.5)
