@@ -198,10 +198,20 @@ class KTConfig:
     kt_enable_dynamic_expert_update: bool = False
     routing_margin: Optional[float] = None
     routing_full_override: bool = False
+    expert_swap_interval: int = 0
+    expert_swap_max: int = 4
+    expert_swap_hysteresis: float = 2.0
 
 
 # Process-level registries for the MXFP4 layerwise-prefill slot machinery
 # (mutated in place only — no module rebinding; carried from ktfork #72/#73).
+# Every wrapped MoE layer, in construction order, so the swap driver can walk
+# them. Registered unconditionally: the layerwise-prefill registry below is
+# populated only when gpu_prefill_token_threshold > 0, and the validated
+# recipe runs 0, which would leave a swap driver with nothing to iterate.
+_KT_EP_METHODS = []
+_KT_SWAP_STATE = {"eager_forwards": 0, "windows": 0, "swaps": 0}
+
 _MXFP4_PREFILL_LAYER_REGISTRY = {}
 _MXFP4_LAYERWISE_MANAGERS = {}
 _MXFP4_LAYERWISE_DISABLED_REASONS = {}
@@ -3729,6 +3739,9 @@ def create_kt_config_from_server_args(
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
         routing_margin=server_args.kt_routing_margin,
         routing_full_override=server_args.kt_routing_full_override,
+        expert_swap_interval=server_args.kt_expert_swap_interval,
+        expert_swap_max=server_args.kt_expert_swap_max,
+        expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
     )
 
 
@@ -4822,6 +4835,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     )
                 )
 
+        # Swap driver registry: keep the layer with the method, since the
+        # weight mover writes into the layer's resident parameter rows.
+        if self.kt_config.expert_swap_interval > 0 and self._margin is not None:
+            self._swap_layer = layer
+            self._swap_policy = None  # built lazily, needs num_experts
+            _KT_EP_METHODS.append(self)
+
         # Registration happens during model construction, not on the first
         # request, so layer N can identify and prepare N+1 immediately.
         _register_mxfp4_prefill_layer(self, layer)
@@ -5284,6 +5304,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     )
                 self._maybe_log_margin_stats()
                 self._maybe_verify_expert_mover(layer)
+                # The first registered layer drives the swap window for the
+                # whole model: later layers have not read their membership
+                # yet this forward, so one window keeps the batch consistent.
+                if (
+                    self.kt_config.expert_swap_interval > 0
+                    and _KT_EP_METHODS
+                    and _KT_EP_METHODS[0] is self
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    try:
+                        maybe_run_expert_swap_window(self)
+                    except Exception:
+                        logger.exception("[kt-swap] window failed; serving continues")
             elif not self._margin_format_warned:
                 self._margin_format_warned = True
                 logger.warning(
@@ -5805,3 +5838,146 @@ from sglang.srt.layers.moe.quant_method_registry import register_moe_quant_wrapp
 register_moe_quant_wrapper(
     "kt_ep", _kt_ep_predicate, _kt_ep_factory, priority=20
 )
+
+
+def _kt_swap_tables(method) -> "object":
+    """Bundle a wrapper's four membership tables for the swap driver."""
+    from sglang.srt.layers.moe.kt_expert_swap import SwapTables
+
+    return SwapTables(
+        gpu_experts_mask=method.gpu_experts_mask,
+        gpu_experts_mask_cuda=method.gpu_experts_mask_cuda,
+        logical_to_gpu_index=method.logical_to_gpu_index,
+        logical_to_gpu_index_cuda=method.logical_to_gpu_index_cuda,
+        gpu_index_to_logical=method.gpu_index_to_logical,
+        pinned_mask=(
+            method.wrapper.gpu_experts_mask if method.wrapper is not None else None
+        ),
+    )
+
+
+def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
+    """Quiesce and re-cut expert membership, every N eager forwards.
+
+    Called from the FIRST registered layer's apply(). Two properties make that
+    a legal place. It only runs eagerly (prefill), so Python is actually
+    executing and a device sync is allowed — under a captured decode replay
+    none of this code runs at all. And membership is consumed exclusively
+    *inside* apply(): the margin override, the id remap, and kt-kernel's own
+    mask read. A later layer's tables are therefore not yet read this forward,
+    and the anchor layer re-reads its own below, so the whole model sees one
+    consistent membership for the batch.
+
+    The device sync is the quiesce: when it returns, every previously issued
+    forward has completed, including the host nodes that enqueue CPU expert
+    work, so nothing is mid-flight while weights and masks change.
+    """
+    from sglang.srt.layers.moe.kt_expert_swap import (
+        ExpertSwapPolicy,
+        run_swap_window,
+    )
+
+    cfg = anchor.kt_config
+    _KT_SWAP_STATE["eager_forwards"] += 1
+    if _KT_SWAP_STATE["eager_forwards"] % cfg.expert_swap_interval:
+        return
+
+    entries = []
+    for method in _KT_EP_METHODS:
+        if method.gpu_experts_mask_cuda is None or method._margin_insist_count is None:
+            continue
+        if method._swap_policy is None:
+            method._swap_policy = ExpertSwapPolicy(
+                method.global_num_experts,
+                hysteresis=cfg.expert_swap_hysteresis,
+                max_swaps=cfg.expert_swap_max,
+            )
+        method._swap_policy.snapshot_counters(
+            method._margin_insist_count,
+            method._margin_override_count,
+            method._resident_hit_count,
+        )
+        entries.append(
+            {
+                "policy": method._swap_policy,
+                "tables": _kt_swap_tables(method),
+                "layer": method._swap_layer,
+                "num_gpu_experts": method.num_gpu_experts,
+                "layer_idx": method.kt_config.layer_idx,
+                "method": method,
+            }
+        )
+    if not entries:
+        return
+
+    mover = _get_or_create_expert_mover(anchor)
+    if mover is None:
+        return
+
+    def _move(layer, dst_row, logical_id):
+        mover.move(layer, dst_row, logical_id)
+
+    result = run_swap_window(
+        entries,
+        move_weights=_move,
+        quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
+    )
+    _KT_SWAP_STATE["windows"] += 1
+    _KT_SWAP_STATE["swaps"] += result.swaps_applied
+    if result.swaps_applied or result.skipped_layers:
+        logger.info(
+            "[kt-swap] window %d: %d swap(s) across %d layer(s), %d skipped "
+            "(cumulative %d)",
+            _KT_SWAP_STATE["windows"],
+            result.swaps_applied,
+            result.layers_touched,
+            result.skipped_layers,
+            _KT_SWAP_STATE["swaps"],
+        )
+
+
+class _PerLayerMover:
+    """One CheckpointExpertMover per layer (permute indices are per-shape)."""
+
+    def __init__(self, weight_path, tp_rank, tp_size):
+        self._by_layer = {}
+        self._args = (weight_path, tp_rank, tp_size)
+
+    def move(self, layer, dst_row, logical_id):
+        from sglang.srt.layers.moe.kt_expert_mover import CheckpointExpertMover
+
+        layer_idx = getattr(layer, "layer_id", None)
+        if layer_idx is None:
+            raise RuntimeError("layer has no layer_id; cannot resolve its experts")
+        mover = self._by_layer.get(layer_idx)
+        if mover is None:
+            weight_path, tp_rank, tp_size = self._args
+            prefix = (
+                f"language_model.model.layers.{layer_idx}"
+                f".block_sparse_moe.experts"
+            )
+            mover = CheckpointExpertMover(
+                weight_path,
+                expert_prefix_for_layer=lambda _l, _p=prefix: _p,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                param_names=_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES,
+            )
+            self._by_layer[layer_idx] = mover
+        mover(layer, dst_row, logical_id)
+
+
+def _get_or_create_expert_mover(anchor):
+    mover = _KT_SWAP_STATE.get("mover")
+    if mover is None:
+        try:
+            mover = _PerLayerMover(
+                anchor.kt_config.weight_path,
+                get_parallel().tp_rank,
+                get_parallel().tp_size,
+            )
+            _KT_SWAP_STATE["mover"] = mover
+        except Exception:
+            logger.exception("[kt-swap] could not build the expert mover")
+            return None
+    return mover

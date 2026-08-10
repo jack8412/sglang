@@ -2998,6 +2998,21 @@ class ServerArgs:
         "Margin routing over KT-wrapped MoE layers: a routed expert that is CPU-resident is replaced by the token's best not-yet-selected GPU-resident expert when its router-logit lead over that alternative is below this margin (an 'override'); larger leads keep the CPU expert (an 'insist'). Unit: router-logit gap. 0.0 counts insists/overrides without substituting; unset disables the feature entirely (bit-exact routing).",
         NS("exec.moe"),
     ] = None
+    kt_expert_swap_interval: A[
+        int,
+        "Run an expert-swap window every N eager forwards (0 disables). At the window the pipeline is briefly quiesced, high-demand offloaded experts are promoted into the GPU rows of low-use resident experts, and both sides of each pair are re-sourced from the checkpoint. Requires --kt-routing-margin.",
+        NS("exec.moe"),
+    ] = 0
+    kt_expert_swap_max: A[
+        int,
+        "Maximum 1:1 expert swaps applied per layer per window. Each swap is a weight transfer inside the pause, so this is effectively how long the pause may last.",
+        NS("exec.moe"),
+    ] = 4
+    kt_expert_swap_hysteresis: A[
+        float,
+        "A promotion must beat its demotion victim's recent usage by this factor. >1 creates a dead band so two similar experts cannot trade places every window.",
+        NS("exec.moe"),
+    ] = 2.0
     kt_routing_full_override: A[
         bool,
         "Route every token entirely to GPU-resident experts: each CPU-resident pick is replaced by the token's best not-yet-selected GPU-resident expert, whatever the router-logit gap. Because no token can then reach a CPU expert, the per-layer CPU round-trip (staging copy, submit, sync, merge) is skipped statically. Requires at least top_k GPU-resident experts per layer and forces --kt-max-deferred-experts-per-token to 0.",
@@ -6867,6 +6882,13 @@ class ServerArgs:
             raise ValueError(
                 f"--kt-routing-margin must be a number >= 0.0 (0.0 = "
                 f"count-only), got {self.kt_routing_margin}."
+            )
+
+        if self.kt_expert_swap_interval and self.kt_routing_margin is None:
+            raise ValueError(
+                "--kt-expert-swap-interval needs --kt-routing-margin: the swap "
+                "policy is driven by the insist/override/resident-hit counters, "
+                "which only exist when margin routing is on."
             )
 
         if self.kt_routing_full_override:
