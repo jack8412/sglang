@@ -144,6 +144,55 @@ class TestMarginDegenerateRails(CustomTestCase):
         self.assertFalse(override[0, 1:].any().item())
 
 
+class TestFullOverride(CustomTestCase):
+    """Derived property: full override leaves ZERO insists whenever a layer
+    holds at least top_k residents — the invariant the static CPU-path skip
+    rests on. Red if the lead comparison leaks back into the full-override
+    branch, or if the isfinite rail is dropped (which would let an expert
+    from the -inf pool be chosen as a 'resident' substitute)."""
+
+    def test_zero_insists_when_residents_at_least_topk(self):
+        # 4 residents, top_k 4, every pick CPU-resident and every CPU logit
+        # far above every resident logit: without full override each slot
+        # would insist; with it all four must be replaced.
+        mask = torch.tensor([True, True, True, True, False, False, False, False])
+        topk_ids = torch.tensor([[4, 5, 6, 7]])
+        logits = torch.tensor([[0.1, 0.2, 0.3, 0.4, 90.0, 91.0, 92.0, 93.0]])
+        new_ids, insist, override = _margin_override_topk_ids_impl(
+            topk_ids, logits, mask, 0.0, True
+        )
+        self.assertFalse(insist.any().item())
+        self.assertTrue(override.all().item())
+        self.assertCountEqual(new_ids.tolist()[0], [0, 1, 2, 3])
+
+    def test_fewer_residents_than_topk_leaves_insists(self):
+        # 3 residents vs top_k 4: the tightness of the >= top_k guard. One
+        # slot cannot be given a distinct resident, so it must remain an
+        # insist rather than silently duplicating or taking a CPU expert.
+        mask = torch.tensor([True, True, True, False, False, False, False, False])
+        topk_ids = torch.tensor([[4, 5, 6, 7]])
+        logits = torch.tensor([[0.1, 0.2, 0.3, 0.0, 90.0, 91.0, 92.0, 93.0]])
+        _, insist, override = _margin_override_topk_ids_impl(
+            topk_ids, logits, mask, 0.0, True
+        )
+        self.assertEqual(int(insist.sum()), 1)
+        self.assertEqual(int(override.sum()), 3)
+
+    def test_full_override_ignores_margin_value(self):
+        mask = torch.tensor([True, True, True, True, False, False, False, False])
+        topk_ids = torch.tensor([[4, 0, 5, 1]])
+        logits = torch.tensor([[5.0, 4.0, 0.1, 0.2, 99.0, 98.0, 0.0, 0.0]])
+        _, insist_a, override_a = _margin_override_topk_ids_impl(
+            topk_ids, logits, mask, 0.0, True
+        )
+        _, insist_b, override_b = _margin_override_topk_ids_impl(
+            topk_ids, logits, mask, 12345.0, True
+        )
+        self.assertEqual(insist_a.tolist(), insist_b.tolist())
+        self.assertEqual(override_a.tolist(), override_b.tolist())
+        self.assertFalse(insist_a.any().item())
+
+
 class TestMarginConfigPlumbing(CustomTestCase):
     """Critical-path bookkeeping: the flag travels ServerArgs -> KTConfig ->
     wrapper state, and OFF means no margin state at all. Red if someone adds

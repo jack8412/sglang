@@ -2998,6 +2998,11 @@ class ServerArgs:
         "Margin routing over KT-wrapped MoE layers: a routed expert that is CPU-resident is replaced by the token's best not-yet-selected GPU-resident expert when its router-logit lead over that alternative is below this margin (an 'override'); larger leads keep the CPU expert (an 'insist'). Unit: router-logit gap. 0.0 counts insists/overrides without substituting; unset disables the feature entirely (bit-exact routing).",
         NS("exec.moe"),
     ] = None
+    kt_routing_full_override: A[
+        bool,
+        "Route every token entirely to GPU-resident experts: each CPU-resident pick is replaced by the token's best not-yet-selected GPU-resident expert, whatever the router-logit gap. Because no token can then reach a CPU expert, the per-layer CPU round-trip (staging copy, submit, sync, merge) is skipped statically. Requires at least top_k GPU-resident experts per layer and forces --kt-max-deferred-experts-per-token to 0.",
+        NS("exec.moe"),
+    ] = False
     record_kt_gpu_expert_distribution: A[
         bool,
         "[ktransformers parameter] Record the per-layer GPU-resident expert mask each forward pass; dumped with the expert distribution stats.",
@@ -6852,11 +6857,36 @@ class ServerArgs:
                 )
             return
 
-        if self.kt_routing_margin is not None and self.kt_routing_margin < 0.0:
+        if self.kt_routing_margin is not None and not (
+            self.kt_routing_margin >= 0.0
+        ):
+            # NaN fails the >= test too: `NaN < 0.0` is False, so a naive
+            # lower-bound check would admit it, and a NaN margin compares
+            # False everywhere — i.e. 100% insists, the exact inverse of the
+            # intended bias and fatal under the full-override skip.
             raise ValueError(
-                f"--kt-routing-margin must be >= 0.0 (0.0 = count-only), got "
-                f"{self.kt_routing_margin}."
+                f"--kt-routing-margin must be a number >= 0.0 (0.0 = "
+                f"count-only), got {self.kt_routing_margin}."
             )
+
+        if self.kt_routing_full_override:
+            if self.kt_max_deferred_experts_per_token:
+                self.kt_max_deferred_experts_per_token = 0
+                logger.warning(
+                    "--kt-routing-full-override forces "
+                    "--kt-max-deferred-experts-per-token to 0: a deferred "
+                    "contribution is collected by the SUCCESSOR layer's kt "
+                    "sync, which full-override layers no longer perform, so "
+                    "it would be silently dropped (and its in-flight task "
+                    "would race the next layer's staging write)."
+                )
+            if self.kt_expert_placement_strategy == "layer_concentrated":
+                raise ValueError(
+                    "--kt-routing-full-override is incompatible with "
+                    "layer_concentrated placement: its CPU layers hold zero "
+                    "GPU-resident experts, so there is nothing to override "
+                    "to and the routed contribution would be dropped."
+                )
 
         if not self.disable_shared_experts_fusion:
             self.disable_shared_experts_fusion = True

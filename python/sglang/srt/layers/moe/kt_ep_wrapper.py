@@ -180,6 +180,8 @@ class KTConfig:
         kt_enable_dynamic_expert_update: Enable dynamic GPU expert updates based on runtime statistics
         routing_margin: Router-logit margin for GPU-preferred routing overrides
             (None = feature off, bit-exact routing; 0.0 = count-only)
+        routing_full_override: Override EVERY CPU-resident pick, making the
+            layer's CPU path provably dead so it can be skipped statically
     """
 
     layer_idx: int
@@ -195,6 +197,7 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     routing_margin: Optional[float] = None
+    routing_full_override: bool = False
 
 
 # Process-level registries for the MXFP4 layerwise-prefill slot machinery
@@ -3725,6 +3728,7 @@ def create_kt_config_from_server_args(
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
         routing_margin=server_args.kt_routing_margin,
+        routing_full_override=server_args.kt_routing_full_override,
     )
 
 
@@ -3759,6 +3763,7 @@ def _margin_override_topk_ids_impl(
     router_logits: torch.Tensor,
     gpu_experts_mask: torch.Tensor,
     margin: float,
+    full_override: bool = False,
 ) -> tuple:
     """Margin routing (SPEC-MARGIN-ROUTING P1): GPU-preferred top-k rewrite.
 
@@ -3798,9 +3803,19 @@ def _margin_override_topk_ids_impl(
     k = topk_ids.shape[-1]
     alt_scores, alt_ids = torch.topk(resident_scores, k=k, dim=-1)
     best_alt = alt_scores[:, :1]
-    slot_logit = torch.gather(logits, -1, safe_ids)
-    lead = slot_logit - best_alt
-    override_slots = cpu_routed & (lead < margin) & torch.isfinite(best_alt)
+    finite_alt = torch.isfinite(best_alt)
+    if full_override:
+        # Static Python bool: Dynamo specializes it into its own graph, so the
+        # lead comparison is compiled out rather than run against a sentinel
+        # (a float("inf") margin would also break under non-finite logits).
+        # The isfinite rail stays: without a real resident alternative there
+        # is nothing to override to, and dropping it would let topk hand back
+        # an expert from the -inf pool — i.e. a CPU expert again.
+        override_slots = cpu_routed & finite_alt
+    else:
+        slot_logit = torch.gather(logits, -1, safe_ids)
+        lead = slot_logit - best_alt
+        override_slots = cpu_routed & (lead < margin) & finite_alt
 
     # Rank overridden slots within each token, then drop any slot whose
     # assigned alternative is -inf (fewer unselected residents than
@@ -4544,6 +4559,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._kt_bypass_gpu_moe = envs.SGLANG_DEBUG_KT_BYPASS_GPU_MOE.get()
         # Margin routing (SPEC-MARGIN-ROUTING P1). None = off, bit-exact.
         self._margin = kt_config.routing_margin
+        self._full_override = kt_config.routing_full_override
+        if self._full_override and self._margin is None:
+            # Full override subsumes the margin: counters still record what
+            # the router wanted, so the mode reports its own quality cost.
+            self._margin = 0.0
+        # Armed in create_weights once num_gpu_experts and top_k are known.
+        self._skip_cpu_path = False
         self._margin_insist_count: Optional[torch.Tensor] = None
         self._margin_override_count: Optional[torch.Tensor] = None
         self._margin_format_warned = False
@@ -4647,6 +4669,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         target_device = next(layer.parameters()).device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
+
+        # Full override arms the static CPU-path skip, but only where the
+        # override is PROVABLE: each displaced slot needs its own distinct
+        # unselected resident expert, so a layer must hold at least top_k of
+        # them.  Below that the op legitimately declines some overrides, the
+        # surviving CPU picks get -1'd by mask_and_remap, and with the CPU
+        # path skipped their contribution would vanish silently.  Raise, never
+        # warn: the failure mode is wrong numbers, not a crash.
+        if self._full_override:
+            if self.num_gpu_experts < num_experts_per_tok:
+                raise ValueError(
+                    f"--kt-routing-full-override needs at least top_k="
+                    f"{num_experts_per_tok} GPU-resident experts per layer to "
+                    f"guarantee every CPU-resident pick can be replaced, but "
+                    f"layer {self.kt_config.layer_idx} has "
+                    f"{self.num_gpu_experts}. Raise --kt-num-gpu-experts / "
+                    f"--kt-gpu-experts-ratio, or drop full override."
+                )
+            self._skip_cpu_path = True
+            logger.info(
+                "[kt-margin] layer=%s full override armed: %d/%d experts "
+                "GPU-resident, CPU round-trip skipped (staging/submit/sync/"
+                "merge)",
+                self.kt_config.layer_idx,
+                self.num_gpu_experts,
+                num_experts,
+            )
 
         # Margin-routing counters: persistent per-layer buffers, accumulated
         # in-place (scatter_add_) so decode CUDA-graph replays keep counting.
@@ -5169,13 +5218,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self._margin is not None:
             from sglang.srt.layers.moe.topk import StandardTopKOutput
 
-            if isinstance(topk_output, StandardTopKOutput):
+            _format_ok = (
+                isinstance(topk_output, StandardTopKOutput)
+                and topk_output.router_logits is not None
+                and topk_output.router_logits.shape[-1] == self.global_num_experts
+            )
+            if self._skip_cpu_path and not _format_ok:
+                # Fail closed: with the CPU path statically skipped, silently
+                # falling back to unmodified routing drops every CPU-resident
+                # pick instead of computing it.
+                raise RuntimeError(
+                    f"--kt-routing-full-override requires the standard topk "
+                    f"output with full router logits (layer "
+                    f"{self.kt_config.layer_idx} got "
+                    f"{type(topk_output).__name__}); the CPU path is skipped, "
+                    f"so unoverridden CPU picks would be dropped."
+                )
+            if _format_ok:
                 new_topk_ids, _insist_slots, _override_slots = (
                     margin_override_topk_ids(
                         topk_output.topk_ids,
                         topk_output.router_logits,
                         self.gpu_experts_mask_cuda,
                         self._margin,
+                        self._full_override,
                     )
                 )
                 _orig_safe_ids = (
@@ -5189,7 +5255,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
                 # margin == 0.0 is count-only (documented flag contract):
                 # counters record what WOULD override, routing stays exact.
-                if self._margin > 0.0:
+                if self._full_override or self._margin > 0.0:
                     topk_output = topk_output._replace(topk_ids=new_topk_ids)
                     dispatch_output = dispatch_output._replace(
                         topk_output=topk_output
@@ -5207,8 +5273,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
+        #
+        # _skip_cpu_path (full override) elides Steps 1 and 4 entirely: no
+        # token can reach a CPU expert, so the CPU half would compute exact
+        # zeros and only cost the per-layer round-trip (staging D2H, submit,
+        # sync, event join, merge add).  The flag is fixed in create_weights,
+        # never derived from tensor data, so decode graph capture records the
+        # same shape it replays — the same static-branch contract the
+        # num_gpu_experts == 0 and tp_rank != 0 paths already rely on.
         staging_buffer = None
-        if self.tp_rank == 0 and self._cpu_stream is not None:
+        if self.tp_rank == 0 and self._cpu_stream is not None and not self._skip_cpu_path:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
             staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
@@ -5296,7 +5370,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _kt_t_after_gpu = time.perf_counter()
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
-        if self.tp_rank == 0 and self._cpu_stream is not None:
+        if self.tp_rank == 0 and self._cpu_stream is not None and not self._skip_cpu_path:
             _no_cpu_stream = self._kt_no_cpu_stream
             from contextlib import nullcontext as _ctx_null
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
@@ -5381,6 +5455,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         insists = self._margin_insist_count
         total_insist = int(insists.sum().item())
         total_override = int(self._margin_override_count.sum().item())
+        if self._skip_cpu_path and total_insist:
+            # The static analysis said this is impossible (>= top_k residents
+            # and finite logits); this is the end-to-end falsification hook.
+            # Every insist here is a routed contribution the skipped CPU path
+            # never computed — wrong numbers, so stop rather than serve them.
+            raise RuntimeError(
+                f"[kt-margin] layer={self.kt_config.layer_idx}: "
+                f"{total_insist} CPU-resident picks survived full override "
+                f"while the CPU path is skipped — their contribution was "
+                f"dropped. Routing/mask invariant violated."
+            )
         top_vals, top_ids = torch.topk(insists, k=min(8, insists.numel()))
         top = [
             (int(i), int(v))
