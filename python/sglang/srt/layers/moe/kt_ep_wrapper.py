@@ -178,6 +178,8 @@ class KTConfig:
         num_layers: Total number of layers in the model (optional)
         gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
         kt_enable_dynamic_expert_update: Enable dynamic GPU expert updates based on runtime statistics
+        routing_margin: Router-logit margin for GPU-preferred routing overrides
+            (None = feature off, bit-exact routing; 0.0 = count-only)
     """
 
     layer_idx: int
@@ -192,6 +194,7 @@ class KTConfig:
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
+    routing_margin: Optional[float] = None
 
 
 # Process-level registries for the MXFP4 layerwise-prefill slot machinery
@@ -3721,6 +3724,7 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
+        routing_margin=server_args.kt_routing_margin,
     )
 
 
@@ -3748,6 +3752,73 @@ def mask_and_remap_expert_ids(
     # For GPU experts: remap to GPU weight index; for CPU experts: set to -1
     remapped_ids = torch.where(is_gpu_expert, logical_to_gpu_index[topk_ids], -1)
     return remapped_ids
+
+
+def _margin_override_topk_ids_impl(
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    gpu_experts_mask: torch.Tensor,
+    margin: float,
+) -> tuple:
+    """Margin routing (SPEC-MARGIN-ROUTING P1): GPU-preferred top-k rewrite.
+
+    For each routed slot holding a CPU-resident expert, compare its router
+    logit against the token's best GPU-resident expert that is not already
+    selected.  If the lead is below ``margin`` the slot is rewritten to a
+    resident alternative (an "override"); otherwise the CPU expert is kept
+    (an "insist").  The i-th overridden slot of a token takes the token's
+    i-th best unselected resident, so multiple overrides in one token land
+    on distinct experts.  Slot weights are NOT touched: the substitute
+    inherits the overridden slot's weight (least-perturbation stand-in).
+
+    Margins are compared in router-logit space: per token, logit order
+    equals score order for both sigmoid and softmax routers, so the rule is
+    activation-independent (the noaux_tc selection bias is not visible here;
+    the margin sweep absorbs that systematic offset).
+
+    Pure tensor ops over the LIVE ``gpu_experts_mask`` — CUDA-graph
+    capturable, and replays follow in-place mask updates (same contract as
+    ``make_placement_aware_deferred_selector``).
+
+    Returns:
+        (new_topk_ids, insist_slots, override_slots) — masks are per-slot
+        bools aligned with the ORIGINAL topk_ids (true router preference).
+    """
+    safe_ids = topk_ids.clamp_min(0).to(torch.int64)
+    routed = topk_ids >= 0
+    cpu_routed = ~gpu_experts_mask[safe_ids] & routed
+
+    logits = router_logits.float()
+    neg_inf = float("-inf")
+    resident_scores = logits.masked_fill(~gpu_experts_mask.unsqueeze(0), neg_inf)
+    # An already-selected expert (resident picks included) is not an
+    # alternative: substituting a duplicate would only re-weight it.
+    resident_scores = resident_scores.scatter(-1, safe_ids, neg_inf)
+
+    k = topk_ids.shape[-1]
+    alt_scores, alt_ids = torch.topk(resident_scores, k=k, dim=-1)
+    best_alt = alt_scores[:, :1]
+    slot_logit = torch.gather(logits, -1, safe_ids)
+    lead = slot_logit - best_alt
+    override_slots = cpu_routed & (lead < margin) & torch.isfinite(best_alt)
+
+    # Rank overridden slots within each token, then drop any slot whose
+    # assigned alternative is -inf (fewer unselected residents than
+    # overrides — degenerate layers only; production keeps residents >> k).
+    alt_rank = (torch.cumsum(override_slots.to(torch.int64), dim=-1) - 1).clamp_min(0)
+    override_slots = override_slots & torch.isfinite(
+        torch.gather(alt_scores, -1, alt_rank)
+    )
+    insist_slots = cpu_routed & ~override_slots
+
+    substitute = torch.gather(alt_ids, -1, alt_rank).to(topk_ids.dtype)
+    new_topk_ids = torch.where(override_slots, substitute, topk_ids)
+    return new_topk_ids, insist_slots, override_slots
+
+
+margin_override_topk_ids = torch.compile(
+    dynamic=True, backend=get_compiler_backend()
+)(_margin_override_topk_ids_impl)
 
 
 def make_placement_aware_deferred_selector(gpu_experts_mask_cuda: torch.Tensor):
@@ -4471,6 +4542,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._kt_debug_timing_deep = envs.SGLANG_DEBUG_KT_HYBRID_TIMING_DEEP.get()
         self._kt_no_cpu_stream = envs.SGLANG_DISABLE_KT_CPU_STREAM.get()
         self._kt_bypass_gpu_moe = envs.SGLANG_DEBUG_KT_BYPASS_GPU_MOE.get()
+        # Margin routing (SPEC-MARGIN-ROUTING P1). None = off, bit-exact.
+        self._margin = kt_config.routing_margin
+        self._margin_insist_count: Optional[torch.Tensor] = None
+        self._margin_override_count: Optional[torch.Tensor] = None
+        self._margin_format_warned = False
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "[kt-wrap-init] tp_rank=%d layer_idx=%s num_gpu_experts=%d "
@@ -4571,6 +4647,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         target_device = next(layer.parameters()).device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
+
+        # Margin-routing counters: persistent per-layer buffers, accumulated
+        # in-place (scatter_add_) so decode CUDA-graph replays keep counting.
+        # Cumulative since launch; indexed by ORIGINAL (pre-override) ids.
+        if self._margin is not None:
+            self._margin_insist_count = torch.zeros(
+                num_experts, dtype=torch.int32, device=target_device
+            )
+            self._margin_override_count = torch.zeros(
+                num_experts, dtype=torch.int32, device=target_device
+            )
 
         # Initialize dual-stream for CPU-GPU parallelism (rank 0 only)
         if self.tp_rank == 0:
@@ -5067,6 +5154,57 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
             return result
 
+        # Margin routing (SPEC-MARGIN-ROUTING P1): rewrite below-margin
+        # CPU-resident picks to resident alternatives BEFORE the Step-1 CPU
+        # submit — the CPU side receives raw topk_ids and applies its own
+        # pinned membership mask in C++, so a GPU-only rewrite at the Step-2
+        # mask would desync the two halves (CPU computing overridden experts,
+        # or dropped/double-counted contributions).  Counters accumulate on
+        # the ORIGINAL ids so they measure true router preference, and the
+        # scatter_add_ runs over all slots with 0/1 addends (static shapes,
+        # in-place persistent buffers) so it is capture-safe and keeps
+        # counting across decode graph replays.  The full-GPU prefill paths
+        # above bypass this on purpose: they compute every routed expert on
+        # GPU, so overriding there would cost accuracy for nothing.
+        if self._margin is not None:
+            from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+            if isinstance(topk_output, StandardTopKOutput):
+                new_topk_ids, _insist_slots, _override_slots = (
+                    margin_override_topk_ids(
+                        topk_output.topk_ids,
+                        topk_output.router_logits,
+                        self.gpu_experts_mask_cuda,
+                        self._margin,
+                    )
+                )
+                _orig_safe_ids = (
+                    topk_output.topk_ids.clamp_min(0).reshape(-1).to(torch.int64)
+                )
+                self._margin_insist_count.scatter_add_(
+                    0, _orig_safe_ids, _insist_slots.reshape(-1).to(torch.int32)
+                )
+                self._margin_override_count.scatter_add_(
+                    0, _orig_safe_ids, _override_slots.reshape(-1).to(torch.int32)
+                )
+                # margin == 0.0 is count-only (documented flag contract):
+                # counters record what WOULD override, routing stays exact.
+                if self._margin > 0.0:
+                    topk_output = topk_output._replace(topk_ids=new_topk_ids)
+                    dispatch_output = dispatch_output._replace(
+                        topk_output=topk_output
+                    )
+                self._maybe_log_margin_stats()
+            elif not self._margin_format_warned:
+                self._margin_format_warned = True
+                logger.warning(
+                    "[kt-margin] layer=%s: --kt-routing-margin needs the "
+                    "standard topk output (router logits); got %s — margin "
+                    "routing is OFF for this layer.",
+                    self.kt_config.layer_idx,
+                    type(topk_output).__name__,
+                )
+
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
@@ -5221,6 +5359,44 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
                 )
         return StandardCombineInput(hidden_states=output)
+
+    def _maybe_log_margin_stats(self) -> None:
+        """Rate-limited INFO line with cumulative insist/override counts.
+
+        Runs only on eager (non-captured) applies — graph-mode decode replays
+        never execute Python, so decode traffic surfaces here at the next
+        eager forward (prefill or eager decode).  The counter reads below are
+        host syncs and must never run under capture.
+        """
+        if self.tp_rank != 0 or torch.cuda.is_current_stream_capturing():
+            return
+        _cls = type(self)
+        if not hasattr(_cls, "_kt_margin_step"):
+            _cls._kt_margin_step = {}
+        _li = self.kt_config.layer_idx
+        _cls._kt_margin_step[_li] = _cls._kt_margin_step.get(_li, 0) + 1
+        _step = _cls._kt_margin_step[_li]
+        if _step != 1 and _step % 64 != 0:
+            return
+        insists = self._margin_insist_count
+        total_insist = int(insists.sum().item())
+        total_override = int(self._margin_override_count.sum().item())
+        top_vals, top_ids = torch.topk(insists, k=min(8, insists.numel()))
+        top = [
+            (int(i), int(v))
+            for i, v in zip(top_ids.tolist(), top_vals.tolist())
+            if v > 0
+        ]
+        logger.info(
+            "[kt-margin] layer=%s eager_step=%d margin=%.4g "
+            "insists=%d overrides=%d top_insisted=%s",
+            _li,
+            _step,
+            self._margin,
+            total_insist,
+            total_override,
+            top,
+        )
 
     def _mxfp4_dyn_update_plan_for(
         self, *, ctx: "SharedFullContext", layer: torch.nn.Module

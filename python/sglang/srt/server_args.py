@@ -2993,6 +2993,11 @@ class ServerArgs:
         "[ktransformers parameter] Enable dynamic GPU expert updates from runtime statistics: after a full-GPU prefill fallback, the resident GPU expert set is updated to the batch's most-activated experts. Not supported for MXFP4 expert layouts.",
         NS("exec.moe"),
     ] = False
+    kt_routing_margin: A[
+        Optional[float],
+        "Margin routing over KT-wrapped MoE layers: a routed expert that is CPU-resident is replaced by the token's best not-yet-selected GPU-resident expert when its router-logit lead over that alternative is below this margin (an 'override'); larger leads keep the CPU expert (an 'insist'). Unit: router-logit gap. 0.0 counts insists/overrides without substituting; unset disables the feature entirely (bit-exact routing).",
+        NS("exec.moe"),
+    ] = None
     record_kt_gpu_expert_distribution: A[
         bool,
         "[ktransformers parameter] Record the per-layer GPU-resident expert mask each forward pass; dumped with the expert distribution stats.",
@@ -6841,7 +6846,17 @@ class ServerArgs:
                     "--kt-gpu-experts-ratio/--kt-num-gpu-experts have no effect "
                     "without --kt-weight-path."
                 )
+            if self.kt_routing_margin is not None:
+                logger.warning(
+                    "--kt-routing-margin has no effect without --kt-weight-path."
+                )
             return
+
+        if self.kt_routing_margin is not None and self.kt_routing_margin < 0.0:
+            raise ValueError(
+                f"--kt-routing-margin must be >= 0.0 (0.0 = count-only), got "
+                f"{self.kt_routing_margin}."
+            )
 
         if not self.disable_shared_experts_fusion:
             self.disable_shared_experts_fusion = True

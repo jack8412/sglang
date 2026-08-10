@@ -284,3 +284,5 @@ internal-docs/
 # k3-hybrid local working docs (kept out of the repo)
 /CLAUDE.md
 /RUNBOOK.md
+BENCHMARK.md
+SPEC-MARGIN-ROUTING.md
