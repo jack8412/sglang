@@ -5439,7 +5439,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 if self._kt_ablate_hostnodes:
                     # Same shape and same merge-add, without the sync host
                     # node: isolates dispatch cost from the copies/merge.
-                    if self._kt_ablate_zero is None:
+                    # Grow-on-demand: the staging slice is batch-sized, so a
+                    # buffer cached from the first (small) batch cannot serve a
+                    # later larger one. Reallocating only on growth keeps the
+                    # steady-state cost at zero so the measurement stays clean.
+                    if (
+                        self._kt_ablate_zero is None
+                        or self._kt_ablate_zero.shape[0] < staging_buffer.shape[0]
+                    ):
                         self._kt_ablate_zero = torch.zeros_like(staging_buffer)
                     cpu_output = self._kt_ablate_zero[: staging_buffer.shape[0]]
                 else:
