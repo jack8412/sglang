@@ -246,7 +246,10 @@ class TestSwapWindow(CustomTestCase):
 
         p = policy or ExpertSwapPolicy(8, ema_alpha=1.0, min_demand=1.0, max_swaps=2)
         p.observe(_cum({}), _cum({}))
-        p.observe(_cum({6: 100}), _cum({2: 0}))
+        # Expert 2 must be the unambiguous demotion victim: give every other
+        # resident real traffic, so the choice does not depend on tie-break
+        # order among equally-unused experts.
+        p.observe(_cum({6: 100}), _cum({0: 50, 1: 40, 3: 30}))
         return {
             "policy": p,
             "tables": _tables(),
