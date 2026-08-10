@@ -4570,6 +4570,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._kt_debug_timing_deep = envs.SGLANG_DEBUG_KT_HYBRID_TIMING_DEEP.get()
         self._kt_no_cpu_stream = envs.SGLANG_DISABLE_KT_CPU_STREAM.get()
         self._kt_bypass_gpu_moe = envs.SGLANG_DEBUG_KT_BYPASS_GPU_MOE.get()
+        self._kt_ablate_hostnodes = envs.SGLANG_KT_ABLATE_HOSTNODES.get()
+        self._kt_ablate_zero: Optional[torch.Tensor] = None
         # Margin routing (SPEC-MARGIN-ROUTING P1). None = off, bit-exact.
         self._margin = kt_config.routing_margin
         self._full_override = kt_config.routing_full_override
@@ -5355,9 +5357,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
                 # Submit uses staging_buffer, so GPU can modify original x freely
-                self._submit_with_staged_input(
-                    layer, dispatch_output, staging_buffer
-                )
+                if not self._kt_ablate_hostnodes:
+                    self._submit_with_staged_input(
+                        layer, dispatch_output, staging_buffer
+                    )
         if _kt_timing:
             if self._kt_debug_timing_deep:
                 torch.cuda.synchronize(x.device)
@@ -5433,7 +5436,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             with _stream_ctx:
                 # Use staging_buffer for sync to get correct buffer reference
                 _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
-                cpu_output = self._sync_with_staged_input(staging_buffer)
+                if self._kt_ablate_hostnodes:
+                    # Same shape and same merge-add, without the sync host
+                    # node: isolates dispatch cost from the copies/merge.
+                    if self._kt_ablate_zero is None:
+                        self._kt_ablate_zero = torch.zeros_like(staging_buffer)
+                    cpu_output = self._kt_ablate_zero[: staging_buffer.shape[0]]
+                else:
+                    cpu_output = self._sync_with_staged_input(staging_buffer)
                 if _kt_t_sync_pre is not None:
                     _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
                 if not _no_cpu_stream:

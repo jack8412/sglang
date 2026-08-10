@@ -1374,6 +1374,13 @@ class Envs:
     # the loader produced. Read-only; the gate the mover must pass before it
     # is trusted to rewrite resident weights.
     SGLANG_KT_VERIFY_EXPERT_MOVER = EnvBool(False)
+    # P0 ablation for the doorbell-transport design: skip ONLY the two
+    # cudaLaunchHostFunc submissions (submit/sync) while keeping the staging
+    # D2H, the result H2D and the merge-add. Differencing this against the
+    # normal path isolates host-node dispatch cost from the copies. Produces
+    # wrong numbers by construction (CPU contributions are dropped) — a timing
+    # instrument only, never a serving mode.
+    SGLANG_KT_ABLATE_HOSTNODES = EnvBool(False)
 
     # ===================================================================
     # DeepSeek-V4-Flash MXFP4 GPU MoE
