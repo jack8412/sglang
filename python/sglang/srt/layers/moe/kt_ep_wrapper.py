@@ -4560,6 +4560,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Margin routing (SPEC-MARGIN-ROUTING P1). None = off, bit-exact.
         self._margin = kt_config.routing_margin
         self._full_override = kt_config.routing_full_override
+        self._resident_hit_count: Optional[torch.Tensor] = None
         if self._full_override and self._margin is None:
             # Full override subsumes the margin: counters still record what
             # the router wanted, so the mode reports its own quality cost.
@@ -4700,11 +4701,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Margin-routing counters: persistent per-layer buffers, accumulated
         # in-place (scatter_add_) so decode CUDA-graph replays keep counting.
         # Cumulative since launch; indexed by ORIGINAL (pre-override) ids.
+        #
+        # insist + override = demand for a NON-resident expert (promotion
+        # candidates); resident_hit = demand actually served on GPU (its
+        # inverse picks demotion victims).  Together they are the whole input
+        # to the swap policy, so both sides of a swap decision come from the
+        # same forward passes and need no extra instrumentation.
         if self._margin is not None:
             self._margin_insist_count = torch.zeros(
                 num_experts, dtype=torch.int32, device=target_device
             )
             self._margin_override_count = torch.zeros(
+                num_experts, dtype=torch.int32, device=target_device
+            )
+            self._resident_hit_count = torch.zeros(
                 num_experts, dtype=torch.int32, device=target_device
             )
 
@@ -5252,6 +5262,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
                 self._margin_override_count.scatter_add_(
                     0, _orig_safe_ids, _override_slots.reshape(-1).to(torch.int32)
+                )
+                # Resident hits: slots the router picked that were ALREADY on
+                # GPU (neither insisted nor overridden).  Counted on the
+                # original ids for symmetry with the demand counters, so
+                # "demand for a non-resident expert" and "traffic served by a
+                # resident expert" are on the same scale.
+                _routed = topk_output.topk_ids >= 0
+                _resident_slots = (
+                    _routed & ~_insist_slots & ~_override_slots
+                )
+                self._resident_hit_count.scatter_add_(
+                    0, _orig_safe_ids, _resident_slots.reshape(-1).to(torch.int32)
                 )
                 # margin == 0.0 is count-only (documented flag contract):
                 # counters record what WOULD override, routing stays exact.
