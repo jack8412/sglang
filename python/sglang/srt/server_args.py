@@ -6946,13 +6946,20 @@ class ServerArgs:
                     "would be silently dropped."
                 )
 
-        if self.kt_conditional_cpu_branch and self.kt_transport != "doorbell":
+        if self.kt_conditional_cpu_branch:
             raise ValueError(
-                "--kt-conditional-cpu-branch requires --kt-transport doorbell. "
-                "The elided region is written against the doorbell's "
-                "arm/ring/wait ordering; the host-node path completes through "
-                "callbacks whose skipping has not been reasoned about, let "
-                "alone measured."
+                "--kt-conditional-cpu-branch does not work and is refused. "
+                "CUDA stream memory operations cannot be captured into a "
+                "conditional node's body graph (driver 580.159.03 / CUDA "
+                "13.0): capture dies at capture_end with "
+                "cudaErrorInvalidValue. Bisected in runs/meta/c3_body_bisect.py "
+                "-- device ops, pinned D2H and H2D all capture inside an IF "
+                "body; cuStreamWriteValue64 and cuStreamWaitValue64 do not, "
+                "and those are exactly the doorbell's arm, ring and wait. "
+                "Re-enabling this needs the doorbell's memops replaced by "
+                "kernels (a write kernel plus a spin kernel), which trades an "
+                "SM for the elision and has to be measured. See "
+                "SPEC-DOORBELL-TRANSPORT.md."
             )
 
         if self.kt_expert_swap_interval and self.kt_routing_margin is None:
