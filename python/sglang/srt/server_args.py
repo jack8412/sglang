@@ -2999,8 +2999,8 @@ class ServerArgs:
         NS("exec.moe"),
     ] = None
     kt_transport: A[
-        Literal["hostnode", "doorbell"],
-        "Transport for CPU expert forwards. hostnode: two cudaLaunchHostFunc nodes per layer (default, proven). doorbell: a device value-write plus a wait node served by a spinning CPU poller, removing both host-node dispatches (measured 62.4 us/layer, 77% of the per-layer residue).",
+        Literal["hostnode", "hostnode-unfused", "doorbell"],
+        "Transport for CPU expert forwards. hostnode: two cudaLaunchHostFunc nodes per layer, with activations/ids/weights packed on the main stream and staged in ONE D2H after the fork, so the dispatch reaches the CPU while the GPU expert GEMM is still running (default). hostnode-unfused: the original form, three separate D2H copies issued on the CPU stream after the fork -- kept for A/B and for batch sizes kt does not cache. doorbell: a device value-write plus a wait node served by a spinning CPU poller, removing both host-node dispatches.",
         NS("exec.moe"),
     ] = "hostnode"
     kt_transport_pollers: A[
@@ -6920,6 +6920,18 @@ class ServerArgs:
                 "30k tokens), costs 7.54 GiB/GPU, bypasses margin routing so "
                 "prefill and decode disagree, and starves expert swapping of "
                 "its statistics. Unset it."
+            )
+
+        if self.kt_transport == "hostnode" and self.kt_max_deferred_experts_per_token:
+            raise ValueError(
+                "--kt-transport hostnode packs activations, ids and weights "
+                "into ONE staging block, which carries a single ids ring. "
+                "Deferral enqueues a SECOND task over a second ids ring, so "
+                "its contribution would read the immediate ids and be lost -- "
+                "silently, since the shapes match. Use --kt-transport "
+                "hostnode-unfused with "
+                f"--kt-max-deferred-experts-per-token "
+                f"{self.kt_max_deferred_experts_per_token}, or set it to 0."
             )
 
         if self.kt_transport == "doorbell":

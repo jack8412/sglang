@@ -4595,6 +4595,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # every size but the first -- silently, since the shapes match.
         self._db_enabled = kt_config.transport == "doorbell"
         self._db_slots: Dict[int, int] = {}
+        # Packed staging on the host-node path: pack activations, ids and
+        # weights into one block on the MAIN stream before forking, then a
+        # single D2H after it. The three separate copies it replaces were all
+        # issued on the CPU stream AFTER the fork, so the dispatch reached the
+        # poller only once they landed -- measured as the staging completing
+        # after the GPU expert GEMM on 52% of layers, which exposes the whole
+        # CPU latency because no GPU work is left to hide behind.
+        self._fused_enabled = kt_config.transport == "hostnode"
         # CPU-branch elision: a CUDA conditional node skips the whole branch
         # when nothing in the batch routes to a CPU-resident expert. The flag
         # and the body stream are created in create_weights -- both addresses
@@ -5402,6 +5410,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # agree, and step 4 must know whether step 1 opened one at all.
         _db_slot = None
         _db_elide = False
+        # Whether this forward packed its inputs, carried from the dispatch
+        # (step 1) to the sync (step 4): the two must agree about which buffer
+        # the CPU wrote into, and step 4 cannot re-derive it -- the batch-size
+        # rule is evaluated once, before the pack.
+        _fused = False
         if self.tp_rank == 0 and self._cpu_stream is not None and not self._skip_cpu_path:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
@@ -5417,7 +5430,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # because there is no GPU work left to overlap with.
             if self._db_enabled:
                 _db_slot = self._kt_doorbell_slot(staging_buffer, dispatch_output)
-            if _db_slot is not None:
+            _fused = _db_slot is None and self._kt_fused_staging_ok(x)
+            if _db_slot is not None or _fused:
                 # Pack from x DIRECTLY. staging_buffer is not filled on this
                 # path, and packing from it shipped a previous layer's
                 # activations to the CPU -- caught by byte identity, invisible
@@ -5427,10 +5441,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # MAIN stream before the expert GEMM is issued: the copy is
                 # ordered ahead of anything that could modify x, which is the
                 # concern staging_buffer existed to solve.
-                self._kt_doorbell_pack(dispatch_output, x)
+                self._kt_pack_inputs(dispatch_output, x)
             else:
-                # Host-node path still stages through the shared buffer so the
-                # GPU may modify x freely.
+                # Unpacked host-node path stages through the shared buffer so
+                # the GPU may modify x freely.
                 staging_buffer.copy_(x, non_blocking=True)
 
             # SGLANG_DISABLE_KT_CPU_STREAM=1 collapses cpu_stream onto main stream.
@@ -5470,8 +5484,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         # ran on the main stream. The poller's whole decision
                         # reads these ids, so a ring visible before the flush
                         # would have it judge the PREVIOUS step's batch.
-                        self._kt_doorbell_flush(staging_buffer)
+                        self._kt_flush_inputs(staging_buffer)
                         kt_doorbell_ring(_db_slot, _db_stream)
+                elif _fused and not self._kt_ablate_hostnodes:
+                    # One D2H, then the dispatch. The pack already ran on the
+                    # main stream, so this is all that stands between the fork
+                    # and the poller learning there is work.
+                    self._kt_flush_inputs(x)
+                    self.wrapper.submit_forward_packed(
+                        x, torch.cuda.current_stream(x.device).cuda_stream
+                    )
                 elif not self._kt_ablate_hostnodes:
                     self._submit_with_staged_input(
                         layer, dispatch_output, staging_buffer
@@ -5578,6 +5600,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         _db_slot, torch.cuda.current_stream(x.device).cuda_stream
                     )
                     cpu_output = self._kt_doorbell_output(staging_buffer)
+                elif _fused and not self._kt_ablate_hostnodes:
+                    # x, not staging_buffer: the packed path never fills the
+                    # shared buffer. Both name the same [bs, hidden] shape and
+                    # sync_forward keys its rings by shape alone, so this is
+                    # the same buffer either way -- passing x keeps the packed
+                    # path's data flow readable end to end.
+                    cpu_output = self._sync_cpu_forward(x)
                 elif self._kt_ablate_hostnodes:
                     # Same shape and same merge-add, without the sync host
                     # node: isolates dispatch cost from the copies/merge.
@@ -5767,20 +5796,36 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return kt_cpu_branch.kt_conditional(self._cond_flag, self._cond_body_stream)
 
-    def _kt_doorbell_pack(self, dispatch_output, hidden_states) -> None:
+    def _kt_fused_staging_ok(self, hidden_states) -> bool:
+        """May this forward use packed staging? Both transports share the rule.
+
+        Only for batch sizes kt caches: `get_packed` keys its buffers by size
+        and caches only sizes in `capture_bs`, so any other size would allocate
+        a fresh pinned block per layer per step. Those are prefill shapes;
+        decode is what the packing is for, and they fall back to the three
+        separate copies.
+
+        Deferral is excluded at config time, not here -- it needs a second task
+        over a second ids ring that one packed block cannot carry.
+        """
+        if not self._fused_enabled or self.wrapper is None:
+            return False
+        return hidden_states.shape[0] in self.wrapper.get_capture_batch_sizes()
+
+    def _kt_pack_inputs(self, dispatch_output, hidden_states) -> None:
         """Device-side pack of THIS step's activations, on the MAIN stream.
 
         Takes the live hidden states, not the shared staging buffer: on the
-        doorbell path nothing fills that buffer, so packing from it feeds the
-        poller a previous layer's activations. Ordered before the expert GEMM
-        on the same stream, so x cannot be modified underneath it.
+        packed path nothing fills that buffer, so packing from it feeds the CPU
+        a previous layer's activations. Ordered before the expert GEMM on the
+        same stream, so x cannot be modified underneath it.
         """
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         self.wrapper.pack_forward_inputs(hidden_states, topk_ids, topk_weights)
 
-    def _kt_doorbell_flush(self, staging_buffer) -> None:
-        """The single D2H; the only thing between the fork and the ring."""
-        self.wrapper.flush_forward_inputs(staging_buffer)
+    def _kt_flush_inputs(self, hidden_states) -> None:
+        """The single D2H; the only thing between the fork and the dispatch."""
+        self.wrapper.flush_forward_inputs(hidden_states)
 
     def _kt_doorbell_stage(self, layer, dispatch_output, staging_buffer) -> None:
         """Copy this step's ids/weights into the kt ring the poller reads.
