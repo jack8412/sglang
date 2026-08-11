@@ -6,11 +6,14 @@
 # failure that actually happened and cost real time.
 #
 #   ./k3ops/k3.sh doctor      read-only: is the node sane, and if not, what fixes it
+#   ./k3ops/k3.sh bootstrap [--weights]   freshly rented node: clone repos, fetch weights
+#   ./k3ops/k3.sh provision   build the venv from scratch
 #   ./k3ops/k3.sh deploy      push local -> pull on node -> rebuild kt -> verify
 #   ./k3ops/k3.sh env         repair the venv (torch/kt/flashinfer pinning)
-#   ./k3ops/k3.sh provision   build the venv from scratch on a fresh node
 #   ./k3ops/k3.sh serve NAME [args...]   launch a server and wait for health
 #   ./k3ops/k3.sh stop        shut a server down without orphaning GPUs
+#
+# New rental, in order:  bootstrap --weights  ->  provision  ->  doctor
 #
 # HOST defaults to gpusrv; pass K3_HOST=... to override.
 #
@@ -103,9 +106,11 @@ cmd_deploy(){
   # deploys the PREVIOUS one and the run measures the wrong code.
   git -C "$SGLANG_LOCAL" push -q jack "$BRANCH_SGLANG" || die "sglang push failed"
   git -C "$KT_LOCAL" push -q origin "$BRANCH_KT" || die "kt push failed"
+  # Full shas: `--short` picks its own length per repo, so comparing a local
+  # short sha against the node's short sha reports a false mismatch.
   local s_sha k_sha
-  s_sha=$(git -C "$SGLANG_LOCAL" rev-parse --short HEAD)
-  k_sha=$(git -C "$KT_LOCAL" rev-parse --short HEAD)
+  s_sha=$(git -C "$SGLANG_LOCAL" rev-parse HEAD)
+  k_sha=$(git -C "$KT_LOCAL" rev-parse HEAD)
   say "deploying sglang=$s_sha kt=$k_sha to $HOST"
 
   rsh <<EOS
@@ -129,9 +134,9 @@ EOS
   # The node must end up on exactly what we pushed, or a measurement attributes
   # itself to the wrong commit.
   local node_sha
-  node_sha=$(ssh -n -o ConnectTimeout=45 "$HOST" "cd $REMOTE_WS/sglang && git rev-parse --short HEAD" 2>/dev/null | tail -1)
-  [ "$node_sha" = "$s_sha" ] || die "node is at $node_sha, expected $s_sha"
-  say "deployed and verified: sglang=$s_sha kt=$k_sha"
+  node_sha=$(ssh -n -o ConnectTimeout=45 "$HOST" "cd $REMOTE_WS/sglang && git rev-parse HEAD" 2>/dev/null | tail -1)
+  [ "$node_sha" = "$s_sha" ] || die "node is at ${node_sha:0:12}, expected ${s_sha:0:12}"
+  say "deployed and verified: sglang=${s_sha:0:12} kt=${k_sha:0:12}"
 }
 
 # --------------------------------------------------------------------------
@@ -165,6 +170,79 @@ python -c "import torch, flashinfer, sgl_kernel, kt_kernel, sglang; print('ENV-O
 EOS
   [ $? -eq 0 ] || die "env repair failed"
   say "env repaired"
+}
+
+# --------------------------------------------------------------------------
+# bootstrap -- a freshly rented node, from nothing.
+#
+# `provision` builds the venv but assumes the repos and the weights are already
+# there. Nothing created them: on this node they were fetched by hand in an
+# earlier session with no recorded procedure, which is precisely why a new
+# rental costs an afternoon. This is that procedure.
+#
+# Weights are 1.6 TB and are NOT pulled unless --weights is passed, so a stray
+# invocation cannot start a day-long download.
+#
+# What this CANNOT do: the expert-distribution dump that frequency placement
+# needs (margin-bench/edr/*.pt, ~333 MB) is an OUTPUT of a profiling run, not
+# an artifact to download. On a fresh node it must be regenerated --
+# /start_expert_distribution_record, a representative workload, then dump --
+# or copied from a previous node before that node is released. Copy it while
+# you still can; regenerating costs a full run.
+# --------------------------------------------------------------------------
+cmd_bootstrap(){
+  local want_weights=0
+  [ "${1:-}" = "--weights" ] && want_weights=1
+  say "bootstrapping $HOST (weights=$want_weights)"
+  rsh <<EOS
+WS=$REMOTE_WS
+want_weights=$want_weights
+
+echo "--- prerequisites"
+for t in git uv tmux numactl nvidia-smi curl; do
+  command -v \$t >/dev/null || echo "MISSING: \$t"
+done
+echo "--- disk"
+df -h \$WS | tail -1
+
+echo "--- repos"
+# Both remotes are anonymously readable over https, so no credentials are
+# needed to CLONE. Pushing is a different matter and is never done from the
+# node -- the node only ever pulls.
+if [ -d \$WS/sglang/.git ]; then echo "sglang present"; else
+  git clone -q https://github.com/jack8412/sglang.git \$WS/sglang || exit 1
+  echo "sglang cloned"
+fi
+cd \$WS/sglang && git fetch -q origin $BRANCH_SGLANG && git checkout -q -B $BRANCH_SGLANG FETCH_HEAD && echo "sglang \$(git log --oneline -1)"
+
+if [ -d \$WS/ktransformers/.git ]; then echo "ktransformers present"; else
+  git clone -q https://github.com/jack8412/ktransformers.git \$WS/ktransformers || exit 1
+  echo "ktransformers cloned"
+fi
+cd \$WS/ktransformers && git fetch -q origin $BRANCH_KT && git checkout -q -B $BRANCH_KT FETCH_HEAD && echo "kt \$(git log --oneline -1)"
+
+echo "--- weights"
+if [ -f \$WS/k3/config.json ]; then
+  echo "k3 present (\$(du -sh \$WS/k3 2>/dev/null | cut -f1))"
+elif [ \$want_weights -eq 1 ]; then
+  FREE=\$(df -BG --output=avail \$WS | tail -1 | tr -dc '0-9')
+  [ "\$FREE" -lt 1800 ] && { echo "REFUSING: \$FREE GiB free, Kimi-K3 needs ~1.6 TB"; exit 1; }
+  source \$WS/venv-k3/bin/activate 2>/dev/null || { echo "need the venv first: k3.sh provision"; exit 1; }
+  hf download moonshotai/Kimi-K3 --local-dir \$WS/k3 || exit 1
+  echo "k3 downloaded"
+else
+  echo "k3 ABSENT -- rerun with --weights (moonshotai/Kimi-K3, ~1.6 TB)"
+fi
+
+echo "--- placement profile (frequency placement needs this)"
+ls \$WS/margin-bench/edr/*.pt >/dev/null 2>&1 \
+  && echo "edr dump present: \$(ls -1 \$WS/margin-bench/edr/*.pt | head -1)" \
+  || echo "edr dump ABSENT -- it is a RUN OUTPUT, not a download. Copy it from the
+   previous node before releasing it, or regenerate with
+   /start_expert_distribution_record + a representative workload."
+EOS
+  [ $? -eq 0 ] || die "bootstrap failed"
+  say "bootstrap done; next: k3.sh provision, then k3.sh doctor"
 }
 
 # --------------------------------------------------------------------------
@@ -238,8 +316,9 @@ case "${1:-doctor}" in
   doctor)    cmd_doctor ;;
   deploy)    cmd_deploy ;;
   env)       cmd_env ;;
+  bootstrap) shift; cmd_bootstrap "${1:-}" ;;
   provision) cmd_provision ;;
   serve)     shift; cmd_serve "$@" ;;
   stop)      cmd_stop ;;
-  *) die "unknown subcommand '${1}'. One of: doctor deploy env provision serve stop" ;;
+  *) die "unknown subcommand '${1}'. One of: doctor bootstrap provision deploy env serve stop" ;;
 esac
