@@ -6167,6 +6167,18 @@ def kt_doorbell_bind_slot(method, staging_buffer, topk_ids) -> int:
         )
     _KT_DOORBELL["next_slot"] = slot + 1
     method.wrapper.register_doorbell_slot(slot, staging_buffer, topk_ids)
+    # Binding happens during warmup/capture, where Python still runs, so this
+    # is the one place the transport can prove it is live in a run with
+    # swapping off (the swap window is the only decode-time Python hook). A
+    # doorbell that bound nothing falls back to host nodes everywhere and is
+    # otherwise indistinguishable from a working one.
+    if slot < 3 or slot % 256 == 0:
+        logger.info(
+            "[kt-doorbell] bound slot %d (layer batch size %d, %d bound so far)",
+            slot,
+            staging_buffer.shape[0],
+            slot + 1,
+        )
     return slot
 
 
