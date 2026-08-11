@@ -6277,6 +6277,19 @@ class _PerLayerMover:
         self._args = (weight_path, tp_rank, tp_size)
 
     def move(self, layer, dst_row, logical_id):
+        self._for(layer)(layer, dst_row, logical_id)
+
+    def read_full_expert(self, layer, logical_id):
+        """Full unsliced expert bytes, for the cold-only CPU install.
+
+        Delegates to the same per-layer mover move() uses. Defining it only on
+        CheckpointExpertMover left this wrapper without it, and the swap
+        window swallowed the AttributeError as a failed layer -- so every
+        install silently did nothing while the run looked healthy.
+        """
+        return self._for(layer).read_full_expert(layer, logical_id)
+
+    def _for(self, layer):
         from sglang.srt.layers.moe.kt_expert_mover import CheckpointExpertMover
 
         layer_idx = getattr(layer, "layer_id", None)
@@ -6297,7 +6310,7 @@ class _PerLayerMover:
                 param_names=_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES,
             )
             self._by_layer[layer_idx] = mover
-        mover(layer, dst_row, logical_id)
+        return mover
 
 
 def _get_or_create_expert_mover(anchor):

@@ -317,6 +317,17 @@ class ExpertSwapPolicy:
 MoveWeightsFn = Callable[[object, int, int], None]
 
 
+class SwapInstallError(RuntimeError):
+    """A CPU-side expert install failed.
+
+    Distinguished from every other swap failure because it must NOT be
+    absorbed by the per-layer skip. The install runs only on the rank that
+    owns the CPU path, so skipping the layer there while the other ranks apply
+    the same swap leaves them advertising different expert placements -- far
+    worse than a failed cache-tuning operation. Raising is the lesser harm.
+    """
+
+
 class SwapWindowResult(NamedTuple):
     swaps_applied: int
     layers_touched: int
@@ -377,9 +388,20 @@ def run_swap_window(
                     # there. Under cold-only residency it holds no buffer at
                     # all until this runs, so flipping first would point the
                     # forward at null.
-                    install_cpu_expert(entry, s.promote, s.demote)
+                    try:
+                        install_cpu_expert(entry, s.promote, s.demote)
+                    except Exception as exc:
+                        raise SwapInstallError(
+                            f"CPU install failed for demote={s.demote} "
+                            f"promote={s.promote} on layer "
+                            f"{entry.get('layer_idx')}"
+                        ) from exc
             apply_swaps_to_tables(tables, swaps)
             assert_tables_consistent(tables, entry["num_gpu_experts"])
+        except SwapInstallError:
+            # Never absorbed: see SwapInstallError. Skipping here would leave
+            # this rank's placement disagreeing with every other rank's.
+            raise
         except Exception:
             # A layer that fails mid-window is left as it was found: weights
             # may have been written but the tables were not flipped, so the
