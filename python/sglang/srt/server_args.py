@@ -6952,6 +6952,18 @@ class ServerArgs:
                 )
 
         if self.kt_cold_only_cpu_experts:
+            from sglang.srt.layers.moe.kt_ep_wrapper import (
+                KT_WHEEL_SUPPORTS_COLD_ONLY,
+            )
+
+            if not KT_WHEEL_SUPPORTS_COLD_ONLY:
+                raise ValueError(
+                    "--kt-cold-only-cpu-experts needs a kt_kernel wheel whose "
+                    "KTMoEWrapper ctor accepts cold_only_cpu_experts. The "
+                    "installed one does not, so the flag would be dropped and "
+                    "every expert allocated -- which looks exactly like the "
+                    "feature not working. Rebuild kt-kernel."
+                )
             if (self.kt_method or "").upper() != "MXFP4":
                 raise ValueError(
                     f"--kt-cold-only-cpu-experts is implemented for MXFP4 only, "

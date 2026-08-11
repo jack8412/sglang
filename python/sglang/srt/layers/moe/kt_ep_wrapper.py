@@ -116,6 +116,11 @@ KTMOE_WRAPPER_BASE_CTOR_PARAMS = frozenset(
 KTMOE_WRAPPER_SITU_CTOR_PARAMS = frozenset({"situ_beta", "situ_linear_beta"})
 
 KT_WHEEL_SUPPORTS_SITU = False
+# Capability probe rather than a hard requirement: an older wheel still
+# serves, it just cannot hold the cold set only. Checked at config time so
+# the failure is a clear message instead of a TypeError deep in scheduler
+# init -- which is exactly how this first presented.
+KT_WHEEL_SUPPORTS_COLD_ONLY = False
 if KTRANSFORMERS_AVAILABLE:
     import inspect as _inspect
 
@@ -129,6 +134,7 @@ if KTRANSFORMERS_AVAILABLE:
             f"the sglang KT integration requires the >=0.6.1 wrapper contract."
         )
     KT_WHEEL_SUPPORTS_SITU = KTMOE_WRAPPER_SITU_CTOR_PARAMS <= _kt_ctor_params
+    KT_WHEEL_SUPPORTS_COLD_ONLY = "cold_only_cpu_experts" in _kt_ctor_params
 
 
 logger = logging.getLogger(__name__)
@@ -4854,7 +4860,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # Read at MOEConfig construction, before kt allocates the
                 # per-expert weight buffers -- passing it later would silently
                 # allocate all 896 and look like the feature did nothing.
-                cold_only_cpu_experts=self.kt_config.cold_only_cpu_experts,
+                **(
+                    {"cold_only_cpu_experts": True}
+                    if self.kt_config.cold_only_cpu_experts
+                    else {}
+                ),
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
