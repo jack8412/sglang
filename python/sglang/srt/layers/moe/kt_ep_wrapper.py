@@ -5331,30 +5331,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     )
                 )
                 if self._counters_enabled:
-                    _orig_safe_ids = (
-                        topk_output.topk_ids.clamp_min(0).reshape(-1).to(torch.int64)
-                    )
-                    self._margin_insist_count.scatter_add_(
-                        0, _orig_safe_ids, _insist_slots.reshape(-1).to(torch.int32)
-                    )
-                    self._margin_override_count.scatter_add_(
-                        0, _orig_safe_ids, _override_slots.reshape(-1).to(torch.int32)
-                    )
-                    # Resident hits: slots the router picked that were ALREADY
-                    # on GPU (neither insisted nor overridden).  Counted on the
-                    # original ids for symmetry with the demand counters, so
-                    # "demand for a non-resident expert" and "traffic served by
-                    # a resident expert" are on the same scale.
-                    #
-                    # ~(insist | override) rather than ~insist & ~override:
-                    # identical by De Morgan, one elementwise kernel fewer per
-                    # layer per step, and these showed up in the decode profile
-                    # at 1.5% (and) + 1.3% (not).
-                    _resident_slots = (topk_output.topk_ids >= 0) & ~(
-                        _insist_slots | _override_slots
-                    )
-                    self._resident_hit_count.scatter_add_(
-                        0, _orig_safe_ids, _resident_slots.reshape(-1).to(torch.int32)
+                    self._update_margin_counters(
+                        topk_output.topk_ids, _insist_slots, _override_slots
                     )
                 # margin == 0.0 is count-only (documented flag contract):
                 # counters record what WOULD override, routing stays exact.
@@ -5659,6 +5637,49 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             slot = kt_doorbell_bind_slot(self, staging_buffer, topk_ids)
             self._db_slots[batch_size] = slot
         return slot
+
+    def _update_margin_counters(self, topk_ids, insist_slots, override_slots) -> None:
+        """Fold one forward into the per-expert demand counters.
+
+        The swap driver cannot work without these -- promotion reads demand for
+        non-resident experts, demotion reads traffic served by resident ones --
+        so the answer to their cost is a cheaper measurement, not no
+        measurement.
+
+        The torch form below ran ~11 kernels per layer per step (clamp, two
+        dtype casts, three more casts, four bitwise ops, three scatter_add_),
+        about 920 launches per decode step across 92 layers. Profiling put that
+        at ~10% of the step. The fused kernel does the same arithmetic in one
+        launch; the counters are integers accumulated by atomicAdd, so the
+        values are bit-identical, not merely equivalent.
+        """
+        from sglang.kernels.ops.kimi_k3 import kt_margin_counters as ktmc
+
+        if ktmc.covered(topk_ids, insist_slots, override_slots):
+            ktmc.kt_margin_counters(
+                self._margin_insist_count,
+                self._margin_override_count,
+                self._resident_hit_count,
+                topk_ids,
+                insist_slots,
+                override_slots,
+            )
+            return
+
+        # Fallback for shapes/dtypes the kernel does not claim. Kept because
+        # the counters feed a serving decision: silently not counting would
+        # starve the swap policy rather than fail.
+        _orig_safe_ids = topk_ids.clamp_min(0).reshape(-1).to(torch.int64)
+        self._margin_insist_count.scatter_add_(
+            0, _orig_safe_ids, insist_slots.reshape(-1).to(torch.int32)
+        )
+        self._margin_override_count.scatter_add_(
+            0, _orig_safe_ids, override_slots.reshape(-1).to(torch.int32)
+        )
+        _resident_slots = (topk_ids >= 0) & ~(insist_slots | override_slots)
+        self._resident_hit_count.scatter_add_(
+            0, _orig_safe_ids, _resident_slots.reshape(-1).to(torch.int32)
+        )
 
     def _kt_cond_predicate(self, dispatch_output) -> None:
         """Set this layer's branch flag from the routed ids, on device.
