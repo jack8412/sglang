@@ -95,7 +95,8 @@ struct KtCpuBranchFlag {
 
     SymbolicSize kOne = {"one"};
     TensorMatcher({kOne}).with_dtype<int32_t>().with_device(device_).verify(flag);
-    RuntimeCheck(kOne.unwrap() == 1) << "kt_cpu_branch_flag: flag must hold exactly one element";
+    RuntimeCheck(kOne.unwrap() == 1, "kt_cpu_branch_flag: flag must hold exactly one element, got ",
+                 kOne.unwrap());
 
     SymbolicSize NE = {"num_experts"};
     TensorMatcher({NE}).with_dtype<bool>().with_device(device_).verify(gpu_mask);
@@ -124,6 +125,8 @@ struct KtCondNode {
   /// \param body_stream  a stream NOT already capturing; carries the body
   /// \param flag         [1] int32 device predicate, read at replay
   static void begin(int64_t main_stream, int64_t body_stream, tvm::ffi::TensorView flag) {
+    using namespace host;
+
     cudaStream_t ms = reinterpret_cast<cudaStream_t>(main_stream);
     cudaStream_t bs = reinterpret_cast<cudaStream_t>(body_stream);
 
@@ -132,24 +135,24 @@ struct KtCondNode {
     const cudaGraphNode_t* deps = nullptr;
     const cudaGraphEdgeData* edges = nullptr;
     size_t n_deps = 0;
-    RuntimeCheck(cudaStreamGetCaptureInfo(ms, &status, nullptr, &graph, &deps, &edges, &n_deps) == cudaSuccess)
-        << "kt_cond_begin: cudaStreamGetCaptureInfo failed";
+    RuntimeCheck(cudaStreamGetCaptureInfo(ms, &status, nullptr, &graph, &deps, &edges, &n_deps) == cudaSuccess,
+                 "kt_cond_begin: cudaStreamGetCaptureInfo failed");
     // Outside a capture there is no graph to splice into, and the body would
     // silently execute unconditionally -- the branch would look like it works
     // while never skipping anything.
-    RuntimeCheck(status == cudaStreamCaptureStatusActive)
-        << "kt_cond_begin requires an active capture on the main stream";
+    RuntimeCheck(status == cudaStreamCaptureStatusActive,
+                 "kt_cond_begin requires an active capture on the main stream");
 
     cudaGraphConditionalHandle handle;
-    RuntimeCheck(cudaGraphConditionalHandleCreate(&handle, graph, 0, cudaGraphCondAssignDefault) == cudaSuccess)
-        << "kt_cond_begin: cudaGraphConditionalHandleCreate failed";
+    RuntimeCheck(cudaGraphConditionalHandleCreate(&handle, graph, 0, cudaGraphCondAssignDefault) == cudaSuccess,
+                 "kt_cond_begin: cudaGraphConditionalHandleCreate failed");
 
     kt_set_conditional_kernel<<<1, 1, 0, ms>>>(handle, static_cast<const int32_t*>(flag.data_ptr()));
 
     // Re-read the dependency set: the predicate kernel just extended it, and
     // the IF must depend on that kernel or it could be evaluated first.
-    RuntimeCheck(cudaStreamGetCaptureInfo(ms, &status, nullptr, &graph, &deps, &edges, &n_deps) == cudaSuccess)
-        << "kt_cond_begin: cudaStreamGetCaptureInfo (post-predicate) failed";
+    RuntimeCheck(cudaStreamGetCaptureInfo(ms, &status, nullptr, &graph, &deps, &edges, &n_deps) == cudaSuccess,
+                 "kt_cond_begin: cudaStreamGetCaptureInfo (post-predicate) failed");
 
     cudaGraphNodeParams params = {};
     params.type = cudaGraphNodeTypeConditional;
@@ -157,22 +160,24 @@ struct KtCondNode {
     params.conditional.type = cudaGraphCondTypeIf;
     params.conditional.size = 1;
     cudaGraphNode_t node;
-    RuntimeCheck(cudaGraphAddNode(&node, graph, deps, edges, n_deps, &params) == cudaSuccess)
-        << "kt_cond_begin: cudaGraphAddNode(conditional) failed";
+    RuntimeCheck(cudaGraphAddNode(&node, graph, deps, edges, n_deps, &params) == cudaSuccess,
+                 "kt_cond_begin: cudaGraphAddNode(conditional) failed");
     RuntimeCheck(cudaStreamUpdateCaptureDependencies(ms, &node, nullptr, 1, cudaStreamSetCaptureDependencies) ==
-                 cudaSuccess)
-        << "kt_cond_begin: cudaStreamUpdateCaptureDependencies failed";
+                     cudaSuccess,
+                 "kt_cond_begin: cudaStreamUpdateCaptureDependencies failed");
 
     RuntimeCheck(cudaStreamBeginCaptureToGraph(bs, params.conditional.phGraph_out[0], nullptr, nullptr, 0,
-                                               cudaStreamCaptureModeRelaxed) == cudaSuccess)
-        << "kt_cond_begin: cudaStreamBeginCaptureToGraph(body) failed";
+                                               cudaStreamCaptureModeRelaxed) == cudaSuccess,
+                 "kt_cond_begin: cudaStreamBeginCaptureToGraph(body) failed");
   }
 
   /// \brief Close the IF body opened by begin().
   static void end(int64_t body_stream) {
+    using namespace host;
+
     cudaGraph_t body = nullptr;
-    RuntimeCheck(cudaStreamEndCapture(reinterpret_cast<cudaStream_t>(body_stream), &body) == cudaSuccess)
-        << "kt_cond_end: cudaStreamEndCapture(body) failed";
+    RuntimeCheck(cudaStreamEndCapture(reinterpret_cast<cudaStream_t>(body_stream), &body) == cudaSuccess,
+                 "kt_cond_end: cudaStreamEndCapture(body) failed");
   }
 };
 
