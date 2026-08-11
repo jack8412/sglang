@@ -5407,20 +5407,31 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
             staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
 
-            # Copy to staging buffer on main stream
-            staging_buffer.copy_(x, non_blocking=True)
+            # Slot resolution and the device-side pack happen on the MAIN
+            # stream, BEFORE forking. Per layer the expert GEMM ends ~20 us in
+            # while the layer runs ~145 us, so whatever sits on the CPU
+            # stream ahead of the ring decides whether the dispatch lands
+            # while the GEMM is still running or after it has finished.
+            # Measured: the staging copy completed AFTER the GEMM on 52% of
+            # layers, and a late dispatch exposes the whole CPU latency
+            # because there is no GPU work left to overlap with.
+            if self._db_enabled:
+                _db_slot = self._kt_doorbell_slot(staging_buffer, dispatch_output)
+            if _db_slot is not None:
+                self._kt_doorbell_pack(dispatch_output, staging_buffer)
+            else:
+                # Host-node path still stages through the shared buffer so the
+                # GPU may modify x freely.
+                staging_buffer.copy_(x, non_blocking=True)
 
             # SGLANG_DISABLE_KT_CPU_STREAM=1 collapses cpu_stream onto main stream.
             _no_cpu_stream = self._kt_no_cpu_stream
             if not _no_cpu_stream:
-                # Fork to cpu_stream (waits for staging copy to complete)
+                # Fork to cpu_stream (waits for the pack/staging copy)
                 self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
             from contextlib import nullcontext as _ctx_null
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
-                # Submit uses staging_buffer, so GPU can modify original x freely
-                if self._db_enabled:
-                    _db_slot = self._kt_doorbell_slot(staging_buffer, dispatch_output)
                 # Elide the whole branch when no slot routes off-GPU. Only
                 # under capture: a conditional node has to be spliced into a
                 # graph, and eager forwards have none -- they simply run the
@@ -5445,12 +5456,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         # sail through the wait reading the first replay's
                         # output.
                         kt_doorbell_arm(_db_slot, _db_stream)
-                        # Then stage, then ring: the poller's whole decision
-                        # reads these ids, so a ring visible before them would
-                        # have it judge the PREVIOUS step's batch.
-                        self._kt_doorbell_stage(
-                            layer, dispatch_output, staging_buffer
-                        )
+                        # Then FLUSH, then ring. Only the single D2H sits
+                        # between the fork and the ring -- the pack already
+                        # ran on the main stream. The poller's whole decision
+                        # reads these ids, so a ring visible before the flush
+                        # would have it judge the PREVIOUS step's batch.
+                        self._kt_doorbell_flush(staging_buffer)
                         kt_doorbell_ring(_db_slot, _db_stream)
                 elif not self._kt_ablate_hostnodes:
                     self._submit_with_staged_input(
@@ -5746,6 +5757,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         from sglang.kernels.ops.kimi_k3 import kt_cpu_branch
 
         return kt_cpu_branch.kt_conditional(self._cond_flag, self._cond_body_stream)
+
+    def _kt_doorbell_pack(self, dispatch_output, staging_buffer) -> None:
+        """Device-side pack, on the MAIN stream before the fork."""
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        self.wrapper.pack_forward_inputs(staging_buffer, topk_ids, topk_weights)
+
+    def _kt_doorbell_flush(self, staging_buffer) -> None:
+        """The single D2H; the only thing between the fork and the ring."""
+        self.wrapper.flush_forward_inputs(staging_buffer)
 
     def _kt_doorbell_stage(self, layer, dispatch_output, staging_buffer) -> None:
         """Copy this step's ids/weights into the kt ring the poller reads.
