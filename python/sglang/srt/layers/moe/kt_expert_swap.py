@@ -327,6 +327,7 @@ def run_swap_window(
     layers: List[dict],
     *,
     move_weights: MoveWeightsFn,
+    install_cpu_expert: Optional[Callable[[dict, int, int], None]] = None,
     quiesce: Optional[Callable[[], None]] = None,
 ) -> SwapWindowResult:
     """Apply pending swaps for every layer, at an already-paused point.
@@ -370,6 +371,13 @@ def run_swap_window(
             ]
             for s, row in zip(swaps, rows):
                 move_weights(entry["layer"], row, s.promote)
+                if install_cpu_expert is not None:
+                    # BEFORE the tables flip: the demoted expert must not be
+                    # routable on the CPU until its weights are actually
+                    # there. Under cold-only residency it holds no buffer at
+                    # all until this runs, so flipping first would point the
+                    # forward at null.
+                    install_cpu_expert(entry, s.promote, s.demote)
             apply_swaps_to_tables(tables, swaps)
             assert_tables_consistent(tables, entry["num_gpu_experts"])
         except Exception:

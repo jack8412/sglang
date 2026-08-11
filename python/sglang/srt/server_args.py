@@ -6987,17 +6987,6 @@ class ServerArgs:
                     "GPU-resident experts from their CPU buffers, which this "
                     "flag no longer allocates."
                 )
-            if self.kt_expert_swap_interval:
-                raise ValueError(
-                    "--kt-cold-only-cpu-experts cannot yet run with "
-                    "--kt-expert-swap-interval. A swap DEMOTES a GPU expert to "
-                    "the CPU, but under cold-only that expert has no weight "
-                    "buffer -- the forward would dereference null on the first "
-                    "demotion. Swaps are 1:1 so the CPU-held count is "
-                    "invariant and the memory is there; what is missing is the "
-                    "per-expert install that fills a freed buffer from the "
-                    "checkpoint. Until that lands, run one or the other."
-                )
 
         if self.kt_conditional_cpu_branch:
             raise ValueError(

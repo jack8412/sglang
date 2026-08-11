@@ -200,6 +200,31 @@ class CheckpointExpertMover:
         )
         self._swizzle_into(layer, dst_row, bytes_)
 
+    def read_full_expert(self, layer, logical_id: int):
+        """The FULL, unsliced expert, for the cold-only CPU install.
+
+        build_expert_bytes slices for this GPU rank; kt slices across its own
+        NUMA partitions internally, so handing it a GPU shard would install a
+        fraction of the expert and read plausible garbage for the rest.
+
+        Returns (gate, up, down, gate_scale, up_scale, down_scale), contiguous
+        and uint8 -- the same conversion build_expert_bytes uses on the path
+        that verify_row proved bitwise.
+        """
+        import torch
+
+        prefix = self.expert_prefix_for_layer(layer)
+        gate, gate_s, up, up_s, down, down_s = self.reader.read_expert(
+            prefix, logical_id
+        )
+        out = []
+        for t in (gate, up, down, gate_s, up_s, down_s):
+            t = t.contiguous()
+            if t.dtype != torch.uint8:
+                t = t.to(torch.uint8)
+            out.append(t)
+        return tuple(out)
+
     def verify_row(self, layer, dst_row: int, logical_id: int) -> bool:
         """Bitwise check against a row the production loader already filled.
 

@@ -6222,9 +6222,30 @@ def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
     def _move(layer, dst_row, logical_id):
         mover.move(layer, dst_row, logical_id)
 
+    def _install_cpu(entry, promote_id, demote_id):
+        """Give the demoted expert the promoted one's CPU weight buffers.
+
+        Only under cold-only residency. Without it every expert already holds
+        CPU weights, so a demotion needs nothing -- which is precisely why
+        swapping worked before and why cold-only broke it.
+
+        Blocking, and before the tables flip: serving must not resume, nor the
+        expert become routable, until its weights are present.
+        """
+        method = entry.get("method")
+        if method is None or not method.kt_config.cold_only_cpu_experts:
+            return
+        if method.wrapper is None:
+            return
+        tensors = mover.read_full_expert(entry["layer"], demote_id)
+        method.wrapper.swap_expert_slot(
+            promote_id, demote_id, *[t.data_ptr() for t in tensors]
+        )
+
     result = run_swap_window(
         entries,
         move_weights=_move,
+        install_cpu_expert=_install_cpu,
         quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
     )
     _KT_SWAP_STATE["windows"] += 1
