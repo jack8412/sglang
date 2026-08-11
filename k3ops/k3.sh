@@ -234,6 +234,13 @@ else
   echo "k3 ABSENT -- rerun with --weights (moonshotai/Kimi-K3, ~1.6 TB)"
 fi
 
+echo "--- results layout"
+# The node mirrors this repo's runs/ layout, so pulling results is one rsync
+# with an exclude list rather than a tar per category. Phase scripts write
+# here; nothing downstream needs to know where a given kind of file lives.
+mkdir -p \$WS/runs/{status,probes,logs,meta}
+echo "runs/{status,probes,logs,meta} ready at \$WS/runs"
+
 echo "--- placement profile (frequency placement needs this)"
 ls \$WS/margin-bench/edr/*.pt >/dev/null 2>&1 \
   && echo "edr dump present: \$(ls -1 \$WS/margin-bench/edr/*.pt | head -1)" \
