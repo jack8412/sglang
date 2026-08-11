@@ -198,6 +198,8 @@ class KTConfig:
     kt_enable_dynamic_expert_update: bool = False
     routing_margin: Optional[float] = None
     routing_full_override: bool = False
+    transport: str = "hostnode"
+    transport_pollers: int = 2
     expert_swap_interval: int = 0
     expert_swap_max: int = 4
     expert_swap_hysteresis: float = 2.0
@@ -3739,6 +3741,8 @@ def create_kt_config_from_server_args(
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
         routing_margin=server_args.kt_routing_margin,
         routing_full_override=server_args.kt_routing_full_override,
+        transport=server_args.kt_transport,
+        transport_pollers=server_args.kt_transport_pollers,
         expert_swap_interval=server_args.kt_expert_swap_interval,
         expert_swap_max=server_args.kt_expert_swap_max,
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
@@ -4571,6 +4575,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._kt_no_cpu_stream = envs.SGLANG_DISABLE_KT_CPU_STREAM.get()
         self._kt_bypass_gpu_moe = envs.SGLANG_DEBUG_KT_BYPASS_GPU_MOE.get()
         self._kt_ablate_hostnodes = envs.SGLANG_KT_ABLATE_HOSTNODES.get()
+        # Doorbell transport: this layer's slot, and the monotonic sequence
+        # the device writes. Both are fixed before capture -- a captured graph
+        # bakes the addresses and the write is a memop, so nothing here may be
+        # decided per batch.
+        self._db_slot: Optional[int] = None
+        self._db_seq: int = 0
         self._kt_ablate_zero: Optional[torch.Tensor] = None
         # Margin routing (SPEC-MARGIN-ROUTING P1). None = off, bit-exact.
         self._margin = kt_config.routing_margin
@@ -4836,6 +4846,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         self.gpu_experts_mask_cuda
                     )
                 )
+
+        # Doorbell slot must be fixed before capture: the graph bakes the
+        # device addresses of this slot's seq/completion words.
+        if self.kt_config.transport == "doorbell" and self.tp_rank == 0:
+            kt_doorbell_assign_slot(self)
+            self.wrapper.register_doorbell_slot(self._db_slot)
 
         # Swap driver registry: keep the layer with the method, since the
         # weight mover writes into the layer's resident parameter rows.
@@ -5357,7 +5373,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
                 # Submit uses staging_buffer, so GPU can modify original x freely
-                if not self._kt_ablate_hostnodes:
+                if self._db_slot is not None:
+                    # The staging copy above is the ids/activation D2H this
+                    # doorbell must follow; recording the write here, after
+                    # it, IS the ordering guarantee.
+                    self._kt_doorbell_stage(layer, dispatch_output, staging_buffer)
+                    kt_doorbell_ring(
+                        self, torch.cuda.current_stream(x.device).cuda_stream
+                    )
+                elif not self._kt_ablate_hostnodes:
                     self._submit_with_staged_input(
                         layer, dispatch_output, staging_buffer
                     )
@@ -5436,7 +5460,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             with _stream_ctx:
                 # Use staging_buffer for sync to get correct buffer reference
                 _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
-                if self._kt_ablate_hostnodes:
+                if self._db_slot is not None:
+                    kt_doorbell_wait(
+                        self, torch.cuda.current_stream(x.device).cuda_stream
+                    )
+                    cpu_output = self._kt_doorbell_output(staging_buffer)
+                elif self._kt_ablate_hostnodes:
                     # Same shape and same merge-add, without the sync host
                     # node: isolates dispatch cost from the copies/merge.
                     # Grow-on-demand: the staging slice is batch-sized, so a
@@ -5506,6 +5535,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
                 )
         return StandardCombineInput(hidden_states=output)
+
+    def _kt_doorbell_stage(self, layer, dispatch_output, staging_buffer) -> None:
+        """Copy this step's ids/weights into the kt ring the poller reads.
+
+        The host-node path did this inside submit_forward; with the doorbell
+        the copies must still happen (the poller reads the same rings) but
+        without the enqueue, so this mirrors submit_forward's staging half
+        and stops there.
+        """
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        self.wrapper.stage_forward_inputs(staging_buffer, topk_ids, topk_weights)
+
+    def _kt_doorbell_output(self, staging_buffer) -> torch.Tensor:
+        """Result tensor for the merge; the wait node already ordered it."""
+        return self.wrapper.doorbell_output(staging_buffer)
 
     def _maybe_verify_expert_mover(self, layer) -> None:
         """SGLANG_KT_VERIFY_EXPERT_MOVER=1: prove the swap mover, once.
@@ -5998,3 +6042,75 @@ def _get_or_create_expert_mover(anchor):
             logger.exception("[kt-swap] could not build the expert mover")
             return None
     return mover
+
+
+# ---------------------------------------------------------------------------
+# Doorbell transport (--kt-transport doorbell)
+# ---------------------------------------------------------------------------
+# Replaces the two cudaLaunchHostFunc nodes per layer with a device value
+# write plus a wait node, served by a spinning CPU poller in kt-kernel.
+# Measured target: 62.4 us/layer, 77% of the residue left after 7004e15.
+
+_KT_DOORBELL = {"inited": False, "next_slot": 0}
+
+
+def _kt_doorbell_ext():
+    import kt_kernel_ext
+
+    return kt_kernel_ext.doorbell
+
+
+def kt_doorbell_assign_slot(method) -> int:
+    """Give a layer its slot and register the poller-side work closure.
+
+    Called once, before any capture: the slot's device addresses are baked
+    into captured graphs and the work closure captures ring-buffer pointers
+    that are stable for the process, so neither may be decided per batch.
+    """
+    db = _kt_doorbell_ext()
+    if not _KT_DOORBELL["inited"]:
+        # One slot per wrapped layer is enough: a layer's forward is complete
+        # before the next layer's doorbell rings, and graph families reuse the
+        # same layer slots in the same order.
+        db.init(1024, method.kt_config.transport_pollers)
+        db.start()
+        _KT_DOORBELL["inited"] = True
+    slot = _KT_DOORBELL["next_slot"]
+    _KT_DOORBELL["next_slot"] += 1
+    method._db_slot = slot
+    return slot
+
+
+def kt_doorbell_ring(method, stream) -> None:
+    """Record the device-side value write for this layer's doorbell.
+
+    MUST be recorded AFTER the ids/activation D2H copies. The poller's whole
+    decision reads those ids; if the doorbell became visible first it would
+    read the PREVIOUS step's batch and could declare a batch empty that is
+    not -- wrong numbers, silently. Ordering here is by stream position, and
+    the assertion that it holds lives at the call site.
+    """
+    from cuda.bindings import driver
+
+    db = _kt_doorbell_ext()
+    method._db_seq += 1
+    err, = driver.cuStreamWriteValue64(
+        stream, driver.CUdeviceptr(db.seq_dev_addr(method._db_slot)),
+        method._db_seq, 0,
+    )
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"doorbell write failed: {err}")
+
+
+def kt_doorbell_wait(method, stream) -> None:
+    """Record the wait: block the stream until the poller publishes seq."""
+    from cuda.bindings import driver
+
+    db = _kt_doorbell_ext()
+    err, = driver.cuStreamWaitValue64(
+        stream, driver.CUdeviceptr(db.completion_dev_addr(method._db_slot)),
+        method._db_seq,
+        driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ,
+    )
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"doorbell wait failed: {err}")

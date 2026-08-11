@@ -2998,6 +2998,16 @@ class ServerArgs:
         "Margin routing over KT-wrapped MoE layers: a routed expert that is CPU-resident is replaced by the token's best not-yet-selected GPU-resident expert when its router-logit lead over that alternative is below this margin (an 'override'); larger leads keep the CPU expert (an 'insist'). Unit: router-logit gap. 0.0 counts insists/overrides without substituting; unset disables the feature entirely (bit-exact routing).",
         NS("exec.moe"),
     ] = None
+    kt_transport: A[
+        Literal["hostnode", "doorbell"],
+        "Transport for CPU expert forwards. hostnode: two cudaLaunchHostFunc nodes per layer (default, proven). doorbell: a device value-write plus a wait node served by a spinning CPU poller, removing both host-node dispatches (measured 62.4 us/layer, 77% of the per-layer residue).",
+        NS("exec.moe"),
+    ] = "hostnode"
+    kt_transport_pollers: A[
+        int,
+        "Poller threads for --kt-transport doorbell (one per socket is the intent).",
+        NS("exec.moe"),
+    ] = 2
     kt_expert_swap_interval: A[
         int,
         "Run an expert-swap window every N eager forwards (0 disables). At the window the pipeline is briefly quiesced, high-demand offloaded experts are promoted into the GPU rows of low-use resident experts, and both sides of each pair are re-sourced from the checkpoint. Requires --kt-routing-margin.",
@@ -6900,6 +6910,12 @@ class ServerArgs:
                 "30k tokens), costs 7.54 GiB/GPU, bypasses margin routing so "
                 "prefill and decode disagree, and starves expert swapping of "
                 "its statistics. Unset it."
+            )
+
+        if self.kt_transport == "doorbell" and (self.kt_method or "").upper() != "MXFP4":
+            raise ValueError(
+                f"--kt-transport doorbell is implemented for MXFP4 only, got "
+                f"--kt-method {self.kt_method}."
             )
 
         if self.kt_expert_swap_interval and self.kt_routing_margin is None:
