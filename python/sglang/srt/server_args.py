@@ -6918,6 +6918,18 @@ class ServerArgs:
                     f"--kt-transport doorbell is implemented for MXFP4 only, got "
                     f"--kt-method {self.kt_method}."
                 )
+            if self.enable_pdmux:
+                raise ValueError(
+                    "--kt-transport doorbell is incompatible with "
+                    "--enable-pdmux. The transport uses ONE global ring word "
+                    "carrying the slot index, which is only safe while at "
+                    "most one doorbell is outstanding -- true today because "
+                    "every KT layer shares one CPU-side stream and replays "
+                    "are serialized. pdmux runs prefill and decode "
+                    "concurrently, so two rings could land before the poller "
+                    "consumes either; the overwritten one is never served and "
+                    "its wait never completes. Use --kt-transport hostnode."
+                )
             if self.kt_max_deferred_experts_per_token:
                 raise ValueError(
                     "--kt-transport doorbell requires "
