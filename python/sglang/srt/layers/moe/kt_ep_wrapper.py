@@ -5418,7 +5418,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if self._db_enabled:
                 _db_slot = self._kt_doorbell_slot(staging_buffer, dispatch_output)
             if _db_slot is not None:
-                self._kt_doorbell_pack(dispatch_output, staging_buffer)
+                # Pack from x DIRECTLY. staging_buffer is not filled on this
+                # path, and packing from it shipped a previous layer's
+                # activations to the CPU -- caught by byte identity, invisible
+                # to nats and gsm8k.
+                #
+                # Reading x here is safe precisely because this runs on the
+                # MAIN stream before the expert GEMM is issued: the copy is
+                # ordered ahead of anything that could modify x, which is the
+                # concern staging_buffer existed to solve.
+                self._kt_doorbell_pack(dispatch_output, x)
             else:
                 # Host-node path still stages through the shared buffer so the
                 # GPU may modify x freely.
@@ -5758,10 +5767,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return kt_cpu_branch.kt_conditional(self._cond_flag, self._cond_body_stream)
 
-    def _kt_doorbell_pack(self, dispatch_output, staging_buffer) -> None:
-        """Device-side pack, on the MAIN stream before the fork."""
+    def _kt_doorbell_pack(self, dispatch_output, hidden_states) -> None:
+        """Device-side pack of THIS step's activations, on the MAIN stream.
+
+        Takes the live hidden states, not the shared staging buffer: on the
+        doorbell path nothing fills that buffer, so packing from it feeds the
+        poller a previous layer's activations. Ordered before the expert GEMM
+        on the same stream, so x cannot be modified underneath it.
+        """
         topk_weights, topk_ids, _ = dispatch_output.topk_output
-        self.wrapper.pack_forward_inputs(staging_buffer, topk_ids, topk_weights)
+        self.wrapper.pack_forward_inputs(hidden_states, topk_ids, topk_weights)
 
     def _kt_doorbell_flush(self, staging_buffer) -> None:
         """The single D2H; the only thing between the fork and the ring."""
