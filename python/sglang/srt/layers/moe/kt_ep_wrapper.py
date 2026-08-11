@@ -6222,6 +6222,56 @@ def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
     def _move(layer, dst_row, logical_id):
         mover.move(layer, dst_row, logical_id)
 
+    def _verify_install_once(entry):
+        """SGLANG_KT_VERIFY_CPU_INSTALL=1: prove the demotion install bitwise.
+
+        Re-runs the install's own fill against an expert that is ALREADY
+        CPU-resident and compares the AMX buffers byte for byte with what the
+        bulk load produced. Shares fill_expert_buffers with the real install,
+        deliberately -- a check that reimplements the thing it checks verifies
+        nothing.
+
+        This is the gate the demotion path actually needs. End-to-end quality
+        can only say "something is worse"; a wrong NUMA slice writes a
+        valid-looking expert and fails nothing downstream.
+        """
+        import os
+
+        if os.environ.get("SGLANG_KT_VERIFY_CPU_INSTALL") != "1":
+            return
+        if _KT_SWAP_STATE.get("install_verified"):
+            return
+        _KT_SWAP_STATE["install_verified"] = True
+        method = entry.get("method")
+        if method is None or method.wrapper is None:
+            return
+        mask = method.gpu_experts_mask
+        resident = [i for i in range(mask.numel()) if not bool(mask[i])]
+        if not resident:
+            logger.warning("[kt-install-verify] no CPU-resident expert to check")
+            return
+        eid = resident[len(resident) // 2]
+        try:
+            tensors = mover.read_full_expert(entry["layer"], eid)
+            ok = method.wrapper.verify_install_against_loaded(
+                eid, *[t.data_ptr() for t in tensors]
+            )
+        except Exception:
+            logger.exception("[kt-install-verify] check itself failed")
+            return
+        if ok:
+            logger.info(
+                "[kt-install-verify] expert %d: install BITWISE-MATCHES the "
+                "bulk load on every NUMA partition",
+                eid,
+            )
+        else:
+            logger.error(
+                "[kt-install-verify] expert %d: install DIFFERS from the bulk "
+                "load -- demoted experts are being given wrong weights",
+                eid,
+            )
+
     def _install_cpu(entry, promote_id, demote_id):
         """Give the demoted expert the promoted one's CPU weight buffers.
 
@@ -6237,6 +6287,7 @@ def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
             return
         if method.wrapper is None:
             return
+        _verify_install_once(entry)
         tensors = mover.read_full_expert(entry["layer"], demote_id)
         method.wrapper.swap_expert_slot(
             promote_id, demote_id, *[t.data_ptr() for t in tensors]
