@@ -34,7 +34,7 @@ def _jit_kt_cpu_branch_module() -> Module:
             ("flag", "KtCpuBranchFlag::run"),
             ("cond_begin", "KtCondNode::begin"),
             ("cond_end", "KtCondNode::end"),
-            ("noop_host_func", "KtCondNode::noop_host_func"),
+            ("probe_host_func", "KtCondNode::probe_host_func"),
         ],
         extra_cuda_cflags=["-O3"],
     )

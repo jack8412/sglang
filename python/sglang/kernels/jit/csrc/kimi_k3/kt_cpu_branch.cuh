@@ -118,8 +118,16 @@ struct KtCpuBranchFlag {
   }
 };
 
-/// No-op host callback for the capture probe above.
-static void CUDART_CB kt_noop_host_cb(void*) {}
+/// Counting host callback for the probe below: bumps an int64 the caller owns.
+///
+/// Counts rather than no-ops because "captured" is not the question that
+/// matters. A host node that is recorded but fires on every replay regardless
+/// of the predicate would silently submit CPU work for batches with none --
+/// the exact bug the branch exists to remove, and invisible from the device
+/// side. The counter makes the callback's own execution observable.
+static void CUDART_CB kt_count_host_cb(void* counter) {
+  ++*static_cast<int64_t*>(counter);
+}
 
 struct KtCondNode {
   /// \brief Splice an IF node into the capture in progress and open its body.
@@ -177,16 +185,22 @@ struct KtCondNode {
                  "kt_cond_begin: cudaStreamBeginCaptureToGraph(body) failed");
   }
 
-  /// \brief Test-only: enqueue a no-op host callback on `stream`.
+  /// \brief Test-only: enqueue a host callback that increments `*counter`.
   ///
   /// The doorbell's stream memops cannot be captured into a conditional
   /// body (measured: cudaErrorInvalidValue at capture_end). The host-node
-  /// transport signals with cudaLaunchHostFunc instead, and whether THAT can
-  /// live in an IF body decides whether dropping the doorbell unblocks
-  /// branch elision or leaves it blocked for both transports.
-  static void noop_host_func(int64_t stream) {
+  /// transport signals with cudaLaunchHostFunc instead -- kt's
+  /// submit_with_cuda_stream and sync_with_cuda_stream are exactly that call
+  /// -- and whether THAT can live in an IF body decides whether dropping the
+  /// doorbell unblocks branch elision or leaves it blocked for both
+  /// transports.
+  ///
+  /// \param stream   raw cudaStream_t to enqueue on
+  /// \param counter  host address of an int64 the callback increments
+  static void probe_host_func(int64_t stream, int64_t counter) {
     using namespace host;
-    RuntimeCheck(cudaLaunchHostFunc((cudaStream_t)stream, kt_noop_host_cb, nullptr) == cudaSuccess,
+    RuntimeCheck(cudaLaunchHostFunc((cudaStream_t)stream, kt_count_host_cb,
+                                    reinterpret_cast<void*>(counter)) == cudaSuccess,
                  "cudaLaunchHostFunc failed");
   }
 
