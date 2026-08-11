@@ -200,6 +200,7 @@ class KTConfig:
     routing_full_override: bool = False
     transport: str = "hostnode"
     transport_pollers: int = 2
+    conditional_cpu_branch: bool = False
     expert_swap_interval: int = 0
     expert_swap_max: int = 4
     expert_swap_hysteresis: float = 2.0
@@ -3743,6 +3744,7 @@ def create_kt_config_from_server_args(
         routing_full_override=server_args.kt_routing_full_override,
         transport=server_args.kt_transport,
         transport_pollers=server_args.kt_transport_pollers,
+        conditional_cpu_branch=server_args.kt_conditional_cpu_branch,
         expert_swap_interval=server_args.kt_expert_swap_interval,
         expert_swap_max=server_args.kt_expert_swap_max,
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
@@ -4582,6 +4584,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # every size but the first -- silently, since the shapes match.
         self._db_enabled = kt_config.transport == "doorbell"
         self._db_slots: Dict[int, int] = {}
+        # CPU-branch elision: a CUDA conditional node skips the whole branch
+        # when nothing in the batch routes to a CPU-resident expert. The flag
+        # and the body stream are created in create_weights -- both addresses
+        # are baked into the captured graph, so neither may be allocated
+        # during capture or move afterwards.
+        self._cond_enabled = kt_config.conditional_cpu_branch
+        self._cond_flag: Optional[torch.Tensor] = None
+        self._cond_body_stream: Optional[torch.cuda.Stream] = None
         self._kt_ablate_zero: Optional[torch.Tensor] = None
         # Margin routing (SPEC-MARGIN-ROUTING P1). None = off, bit-exact.
         self._margin = kt_config.routing_margin
@@ -4854,6 +4864,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # binding allocates no device memory, so it is capture-safe.
         if self.kt_config.transport == "doorbell" and self.tp_rank == 0:
             kt_doorbell_init(self.kt_config.transport_pollers)
+            if self._cond_enabled:
+                # Allocated here, before any capture: the predicate kernel
+                # bakes this flag's address into the graph, so it must outlive
+                # every replay and never be reallocated. The body stream is
+                # shared by every layer -- bodies are captured one at a time
+                # and replayed serially, the same reason one doorbell ring
+                # word suffices.
+                self._cond_flag = torch.zeros(
+                    1, dtype=torch.int32, device=self.gpu_experts_mask_cuda.device
+                )
+                self._cond_body_stream = get_stream("kt_cond_body")
 
         # Swap driver registry: keep the layer with the method, since the
         # weight mover writes into the layer's resident parameter rows.
@@ -5360,7 +5381,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         staging_buffer = None
         # Slot this forward rang, carried from the ring (step 1) to the wait
         # (step 4) so the two cannot drift onto different batch-size tiers.
+        # _db_elide travels with it: both of a layer's conditional regions must
+        # agree, and step 4 must know whether step 1 opened one at all.
         _db_slot = None
+        _db_elide = False
         if self.tp_rank == 0 and self._cpu_stream is not None and not self._skip_cpu_path:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
@@ -5380,19 +5404,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # Submit uses staging_buffer, so GPU can modify original x freely
                 if self._db_enabled:
                     _db_slot = self._kt_doorbell_slot(staging_buffer, dispatch_output)
+                # Elide the whole branch when no slot routes off-GPU. Only
+                # under capture: a conditional node has to be spliced into a
+                # graph, and eager forwards have none -- they simply run the
+                # branch, which is what they already did.
+                _db_elide = (
+                    _db_slot is not None
+                    and self._cond_enabled
+                    and torch.cuda.is_current_stream_capturing()
+                )
+                if _db_elide:
+                    self._kt_cond_predicate(dispatch_output)
                 if _db_slot is not None:
-                    _db_stream = torch.cuda.current_stream(x.device).cuda_stream
-                    # Arm BEFORE the ring: retract the previous replay's
-                    # completion so this replay's wait cannot be satisfied by a
-                    # stale value. A captured node writes a constant, so
-                    # without the arm every replay after the first would sail
-                    # through the wait reading the first replay's output.
-                    kt_doorbell_arm(_db_slot, _db_stream)
-                    # Then stage, then ring: the poller's whole decision reads
-                    # these ids, so a ring visible before them would have it
-                    # judge the PREVIOUS step's batch.
-                    self._kt_doorbell_stage(layer, dispatch_output, staging_buffer)
-                    kt_doorbell_ring(_db_slot, _db_stream)
+                    with self._kt_cond_region(_db_elide):
+                        # Inside the IF body the recording stream is the body
+                        # stream, so the memops must be read off the CURRENT
+                        # stream rather than captured before the region.
+                        _db_stream = torch.cuda.current_stream(x.device).cuda_stream
+                        # Arm BEFORE the ring: retract the previous replay's
+                        # completion so this replay's wait cannot be satisfied
+                        # by a stale value. A captured node writes a constant,
+                        # so without the arm every replay after the first would
+                        # sail through the wait reading the first replay's
+                        # output.
+                        kt_doorbell_arm(_db_slot, _db_stream)
+                        # Then stage, then ring: the poller's whole decision
+                        # reads these ids, so a ring visible before them would
+                        # have it judge the PREVIOUS step's batch.
+                        self._kt_doorbell_stage(
+                            layer, dispatch_output, staging_buffer
+                        )
+                        kt_doorbell_ring(_db_slot, _db_stream)
                 elif not self._kt_ablate_hostnodes:
                     self._submit_with_staged_input(
                         layer, dispatch_output, staging_buffer
@@ -5468,11 +5510,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0 and self._cpu_stream is not None and not self._skip_cpu_path:
             _no_cpu_stream = self._kt_no_cpu_stream
             from contextlib import nullcontext as _ctx_null
+            if _db_elide and not _no_cpu_stream:
+                # The merge moves INSIDE the IF body (a skipped body must
+                # leave `output` untouched), so the CPU stream now has to see
+                # the finished GPU result. It did not before, because the
+                # merge ran on the main stream. This does not undo the
+                # overlap: the ring went out in step 1, so the poller has been
+                # working throughout the GPU compute -- only the WAIT is
+                # ordered after it, which is exactly where it belongs.
+                self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
                 # Use staging_buffer for sync to get correct buffer reference
                 _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
-                if _db_slot is not None:
+                if _db_elide:
+                    with self._kt_cond_region(True):
+                        kt_doorbell_wait(
+                            _db_slot,
+                            torch.cuda.current_stream(x.device).cuda_stream,
+                        )
+                        # Merged in place, inside the body. `output + cpu` is
+                        # the same arithmetic, but it would produce a NEW
+                        # tensor the skipped path never writes, leaving the
+                        # caller holding whichever one the branch happened to
+                        # take.
+                        output.add_(self._kt_doorbell_output(staging_buffer))
+                    cpu_output = None
+                elif _db_slot is not None:
                     kt_doorbell_wait(
                         _db_slot, torch.cuda.current_stream(x.device).cuda_stream
                     )
@@ -5502,7 +5566,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # Main stream waits for cpu_stream to complete before merging results
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
-            output = output + cpu_output
+            # cpu_output is None only when the merge already happened inside
+            # the conditional body, where it had to be in-place.
+            if cpu_output is not None:
+                output = output + cpu_output
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU
@@ -5572,6 +5639,40 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             slot = kt_doorbell_bind_slot(self, staging_buffer, topk_ids)
             self._db_slots[batch_size] = slot
         return slot
+
+    def _kt_cond_predicate(self, dispatch_output) -> None:
+        """Set this layer's branch flag from the routed ids, on device.
+
+        Must read the FINAL ids: margin routing rewrites topk_ids before this
+        point, and a predicate over the pre-override ids would elide a branch
+        the rewritten routing still needs (or keep one it does not).
+
+        Device memory, not a Python bool: a node captured in a graph writes
+        whatever was recorded, so a host-side predicate would freeze the
+        branch at capture time and every replay would take the same path.
+        """
+        from sglang.kernels.ops.kimi_k3 import kt_cpu_branch
+
+        _, topk_ids, _ = dispatch_output.topk_output
+        kt_cpu_branch.kt_cpu_branch_flag(
+            self._cond_flag, topk_ids, self.gpu_experts_mask_cuda
+        )
+
+    def _kt_cond_region(self, elide: bool):
+        """The CPU branch, gated on this layer's flag -- or run unconditionally.
+
+        Both of a layer's regions read the same flag, and nothing rewrites it
+        between them, so they cannot disagree about whether this step has CPU
+        work. If the branch is skipped nothing rings, so the poller is never
+        invoked and the skipped wait has nothing to wait for.
+        """
+        if not elide:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        from sglang.kernels.ops.kimi_k3 import kt_cpu_branch
+
+        return kt_cpu_branch.kt_conditional(self._cond_flag, self._cond_body_stream)
 
     def _kt_doorbell_stage(self, layer, dispatch_output, staging_buffer) -> None:
         """Copy this step's ids/weights into the kt ring the poller reads.

@@ -3008,6 +3008,11 @@ class ServerArgs:
         "Poller threads for --kt-transport doorbell (one per socket is the intent).",
         NS("exec.moe"),
     ] = 2
+    kt_conditional_cpu_branch: A[
+        bool,
+        "Skip a layer's CPU-expert branch device-side, via a CUDA conditional node, when no routed slot in the batch names a CPU-resident expert. Under margin routing a large share of layer-steps route entirely to GPU-resident experts; kt's inline-empty check already makes the poller cheap for those, but the GPU still pays the staging D2H, the round trip, the result H2D and the merge. Applies to captured decode graphs only -- an eager forward has no graph to splice a conditional into and runs the branch as before. Requires --kt-transport doorbell.",
+        NS("exec.moe"),
+    ] = False
     kt_expert_swap_interval: A[
         int,
         "Run an expert-swap window every N eager forwards (0 disables). At the window the pipeline is briefly quiesced, high-demand offloaded experts are promoted into the GPU rows of low-use resident experts, and both sides of each pair are re-sourced from the checkpoint. Requires --kt-routing-margin.",
@@ -6940,6 +6945,15 @@ class ServerArgs:
                     "and never enqueues a second task, so the deferred half "
                     "would be silently dropped."
                 )
+
+        if self.kt_conditional_cpu_branch and self.kt_transport != "doorbell":
+            raise ValueError(
+                "--kt-conditional-cpu-branch requires --kt-transport doorbell. "
+                "The elided region is written against the doorbell's "
+                "arm/ring/wait ordering; the host-node path completes through "
+                "callbacks whose skipping has not been reasoned about, let "
+                "alone measured."
+            )
 
         if self.kt_expert_swap_interval and self.kt_routing_margin is None:
             raise ValueError(
