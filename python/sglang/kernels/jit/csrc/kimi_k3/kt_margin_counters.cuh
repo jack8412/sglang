@@ -50,12 +50,19 @@ __global__ void kt_margin_counters_kernel(
     uint32_t n_experts) {
   const uint32_t stride = gridDim.x * blockDim.x;
   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_slots; i += stride) {
-    const int64_t e = topk_ids[i];
-    // A negative id is a masked-out slot naming no expert: the torch form
-    // clamped it to 0 for indexing and then multiplied its contribution by
-    // routed=false, so it contributed nothing anywhere. Skipping is the same
-    // thing without the clamp.
-    if (e < 0 || static_cast<uint64_t>(e) >= n_experts) continue;
+    int64_t e = topk_ids[i];
+    const bool routed = e >= 0;
+    // clamp_min(0), matching the torch form exactly -- INCLUDING its latent
+    // bug. That form clamped the INDEX to 0 but applied the routed mask only
+    // to the resident counter, so a masked (-1) slot credits expert 0 in
+    // insist/override and is excluded only from resident. That is phantom
+    // demand and could promote the wrong expert, but fixing it here would
+    // smuggle a behaviour change into a performance change; the point of this
+    // kernel is to be provably inert. Filed separately.
+    if (!routed) e = 0;
+    // Out of range would have faulted the torch scatter_add_. Refuse rather
+    // than corrupt a neighbouring counter.
+    if (static_cast<uint64_t>(e) >= n_experts) continue;
     const bool ins = insist[i] != 0;
     const bool ovr = overridden[i] != 0;
     // Independent adds, deliberately not if/else: the torch form scattered
@@ -64,7 +71,7 @@ __global__ void kt_margin_counters_kernel(
     // equivalent under an assumption about the override kernel.
     if (ins) atomicAdd(&insist_count[e], 1);
     if (ovr) atomicAdd(&override_count[e], 1);
-    if (!ins && !ovr) atomicAdd(&resident_count[e], 1);
+    if (routed && !ins && !ovr) atomicAdd(&resident_count[e], 1);
   }
 }
 
