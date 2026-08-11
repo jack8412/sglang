@@ -4589,6 +4589,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # and the body stream are created in create_weights -- both addresses
         # are baked into the captured graph, so neither may be allocated
         # during capture or move afterwards.
+        # Per-expert demand counters are maintained only where something reads
+        # them: the swap policy, and the full-override falsification check
+        # (which needs to see an insist survive a routing that claims none can).
+        # Profiling put them at ~5.2% of decode GPU time, so "always on" is a
+        # real price, not bookkeeping noise.
+        self._counters_enabled = bool(
+            kt_config.expert_swap_interval > 0 or kt_config.routing_full_override
+        )
         self._cond_enabled = kt_config.conditional_cpu_branch
         self._cond_flag: Optional[torch.Tensor] = None
         self._cond_body_stream: Optional[torch.cuda.Stream] = None
@@ -4743,7 +4751,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # inverse picks demotion victims).  Together they are the whole input
         # to the swap policy, so both sides of a swap decision come from the
         # same forward passes and need no extra instrumentation.
-        if self._margin is not None:
+        #
+        # They are NOT free. Profiling decode (runs/meta/phaseP.sh) put this
+        # bookkeeping at ~5.2% of GPU time: three scatter_add_ and four
+        # bitwise kernels per layer per step, 11040 and 7360 launches over 40
+        # steps -- exactly 92 layers x 3 and 92 x 2. Baked into the captured
+        # graph, so they run every step forever whether or not anything reads
+        # them. Maintained only where something does.
+        if self._margin is not None and self._counters_enabled:
             self._margin_insist_count = torch.zeros(
                 num_experts, dtype=torch.int32, device=target_device
             )
@@ -5315,27 +5330,32 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         self._full_override,
                     )
                 )
-                _orig_safe_ids = (
-                    topk_output.topk_ids.clamp_min(0).reshape(-1).to(torch.int64)
-                )
-                self._margin_insist_count.scatter_add_(
-                    0, _orig_safe_ids, _insist_slots.reshape(-1).to(torch.int32)
-                )
-                self._margin_override_count.scatter_add_(
-                    0, _orig_safe_ids, _override_slots.reshape(-1).to(torch.int32)
-                )
-                # Resident hits: slots the router picked that were ALREADY on
-                # GPU (neither insisted nor overridden).  Counted on the
-                # original ids for symmetry with the demand counters, so
-                # "demand for a non-resident expert" and "traffic served by a
-                # resident expert" are on the same scale.
-                _routed = topk_output.topk_ids >= 0
-                _resident_slots = (
-                    _routed & ~_insist_slots & ~_override_slots
-                )
-                self._resident_hit_count.scatter_add_(
-                    0, _orig_safe_ids, _resident_slots.reshape(-1).to(torch.int32)
-                )
+                if self._counters_enabled:
+                    _orig_safe_ids = (
+                        topk_output.topk_ids.clamp_min(0).reshape(-1).to(torch.int64)
+                    )
+                    self._margin_insist_count.scatter_add_(
+                        0, _orig_safe_ids, _insist_slots.reshape(-1).to(torch.int32)
+                    )
+                    self._margin_override_count.scatter_add_(
+                        0, _orig_safe_ids, _override_slots.reshape(-1).to(torch.int32)
+                    )
+                    # Resident hits: slots the router picked that were ALREADY
+                    # on GPU (neither insisted nor overridden).  Counted on the
+                    # original ids for symmetry with the demand counters, so
+                    # "demand for a non-resident expert" and "traffic served by
+                    # a resident expert" are on the same scale.
+                    #
+                    # ~(insist | override) rather than ~insist & ~override:
+                    # identical by De Morgan, one elementwise kernel fewer per
+                    # layer per step, and these showed up in the decode profile
+                    # at 1.5% (and) + 1.3% (not).
+                    _resident_slots = (topk_output.topk_ids >= 0) & ~(
+                        _insist_slots | _override_slots
+                    )
+                    self._resident_hit_count.scatter_add_(
+                        0, _orig_safe_ids, _resident_slots.reshape(-1).to(torch.int32)
+                    )
                 # margin == 0.0 is count-only (documented flag contract):
                 # counters record what WOULD override, routing stays exact.
                 if self._full_override or self._margin > 0.0:
@@ -5752,6 +5772,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _cls = type(self)
         if not hasattr(_cls, "_kt_margin_step"):
             _cls._kt_margin_step = {}
+        if self._margin_insist_count is None:
+            # Counters are off (no swap driver, no full override), so there is
+            # nothing to report. The doorbell line below still matters and is
+            # emitted before the return.
+            if _KT_DOORBELL["inited"]:
+                _cls._kt_db_log_step = getattr(_cls, "_kt_db_log_step", 0) + 1
+                if _cls._kt_db_log_step % 256 == 1:
+                    logger.info("[kt-doorbell] %s", kt_doorbell_stats())
+            return
         _li = self.kt_config.layer_idx
         _cls._kt_margin_step[_li] = _cls._kt_margin_step.get(_li, 0) + 1
         _step = _cls._kt_margin_step[_li]
