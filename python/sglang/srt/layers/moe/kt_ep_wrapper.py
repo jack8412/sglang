@@ -5787,6 +5787,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             total_override,
             top,
         )
+        if _KT_DOORBELL["inited"]:
+            # Emitted here as well as from the swap window because these
+            # counters are cumulative and process-wide: this runs on EAGER
+            # steps (prefill), so the line printed for one request already
+            # includes the previous request's DECODE traffic. That makes
+            # `served` readable in runs with swapping disabled -- which is
+            # every run that has to be byte-comparable, since a swap window
+            # moves experts at different moments in each arm.
+            logger.info("[kt-doorbell] %s", kt_doorbell_stats())
 
     def _mxfp4_dyn_update_plan_for(
         self, *, ctx: "SharedFullContext", layer: torch.nn.Module
