@@ -4514,6 +4514,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         method = KTEPWrapperMethod(gpu_method, kt_config)
     """
 
+    # Warn once per process, not once per layer per step.
+    _kt_counter_fallback_warned: bool = False
+
     # Tag for quant_method_registry.is_wrapped_method() — set as a class
     # attribute so isinstance-style checks in deepseek_v2 / glm4_moe work
     # without importing this module.
@@ -5666,6 +5669,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
             return
 
+        # Say so, once. The fallback produces identical numbers, so taking it
+        # costs only speed -- which means a mismatch presents as an
+        # optimisation that mysteriously did nothing rather than as a failure.
+        # That is exactly what happened: the router emits int32 ids, the first
+        # covered() demanded int64, and a full measurement round reported "the
+        # fused kernel recovered -6%" before the cause was found.
+        if not type(self)._kt_counter_fallback_warned:
+            type(self)._kt_counter_fallback_warned = True
+            logger.warning(
+                "[kt-margin] fused demand counters unavailable (%s); using the "
+                "torch fallback. Numbers are identical; decode is ~10%% slower.",
+                ktmc.why_not_covered(topk_ids, insist_slots, override_slots),
+            )
         # Fallback for shapes/dtypes the kernel does not claim. Kept because
         # the counters feed a serving decision: silently not counting would
         # starve the swap policy rather than fail.

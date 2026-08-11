@@ -7,6 +7,7 @@ does not need is eleven kernel launches per layer to collect them.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,13 +17,23 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+logger = logging.getLogger(__name__)
+
+# The router emits int32 ids; the torch form only widened them because
+# scatter_add_ demands an int64 index. Both are instantiated so the kernel
+# takes whichever arrives rather than silently declining the common one.
+_ID_DTYPES = {torch.int32: "count_i32", torch.int64: "count_i64"}
+
 
 @cache_once
 def _jit_kt_margin_counters_module() -> Module:
     return load_jit(
         "kimi_k3_kt_margin_counters",
         cuda_files=["kimi_k3/kt_margin_counters.cuh"],
-        cuda_wrappers=[("count", "KtMarginCounters::run")],
+        cuda_wrappers=[
+            ("count_i32", "KtMarginCounters<int32_t>::run"),
+            ("count_i64", "KtMarginCounters<int64_t>::run"),
+        ],
         extra_cuda_cflags=["-O3"],
     )
 
@@ -30,7 +41,7 @@ def _jit_kt_margin_counters_module() -> Module:
 def covered(topk_ids: torch.Tensor, insist: torch.Tensor, overridden: torch.Tensor) -> bool:
     return (
         topk_ids.is_cuda
-        and topk_ids.dtype == torch.int64
+        and topk_ids.dtype in _ID_DTYPES
         and insist.dtype == torch.bool
         and overridden.dtype == torch.bool
         and topk_ids.is_contiguous()
@@ -40,6 +51,30 @@ def covered(topk_ids: torch.Tensor, insist: torch.Tensor, overridden: torch.Tens
         and overridden.shape == topk_ids.shape
         and topk_ids.numel() > 0
     )
+
+
+def why_not_covered(topk_ids, insist, overridden) -> str:
+    """Why covered() declined, for the caller's fallback warning.
+
+    A silent fallback is the failure mode that matters here: the torch path
+    produces identical numbers, so declining the kernel costs only speed and
+    shows up as a change that mysteriously did nothing. It cost one full
+    measurement round (phase PS) before the dtype mismatch was found.
+    """
+    if not topk_ids.is_cuda:
+        return "topk_ids not on CUDA"
+    if topk_ids.dtype not in _ID_DTYPES:
+        return f"topk_ids dtype {topk_ids.dtype} not in {sorted(map(str, _ID_DTYPES))}"
+    for name, t in (("insist", insist), ("overridden", overridden)):
+        if t.dtype != torch.bool:
+            return f"{name} dtype {t.dtype}, expected bool"
+        if t.shape != topk_ids.shape:
+            return f"{name} shape {tuple(t.shape)} != topk_ids {tuple(topk_ids.shape)}"
+    if not (topk_ids.is_contiguous() and insist.is_contiguous() and overridden.is_contiguous()):
+        return "a tensor is not contiguous"
+    if topk_ids.numel() == 0:
+        return "empty batch"
+    return "unknown"
 
 
 def kt_margin_counters(
@@ -59,9 +94,10 @@ def kt_margin_counters(
     where the counters' addresses are baked into the captured kernel and must
     not move between replays.
     """
+    fn = getattr(_jit_kt_margin_counters_module(), _ID_DTYPES[topk_ids.dtype])
     # .view(torch.uint8) reinterprets rather than copies -- torch bool is one
     # byte, and the tensor matcher maps C++ bool to uint8.
-    _jit_kt_margin_counters_module().count(
+    fn(
         insist_count,
         override_count,
         resident_count,

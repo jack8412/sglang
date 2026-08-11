@@ -36,21 +36,25 @@ constexpr int kMarginCounterThreads = 128;
 /// \param insist_count    [E] int32, accumulated in place
 /// \param override_count  [E] int32, accumulated in place
 /// \param resident_count  [E] int32, accumulated in place
-/// \param topk_ids        [n_slots] int64, ORIGINAL router ids (pre-override)
+/// \param topk_ids        [n_slots] int32 or int64, ORIGINAL router ids
+///                        (pre-override). Both, because the router emits int32
+///                        and only scatter_add_'s index requirement forced the
+///                        torch form to widen it.
 /// \param insist          [n_slots] uint8, slot kept its CPU-resident expert
 /// \param overridden      [n_slots] uint8, slot was substituted
+template <typename IdT>
 __global__ void kt_margin_counters_kernel(
     int32_t* __restrict__ insist_count,
     int32_t* __restrict__ override_count,
     int32_t* __restrict__ resident_count,
-    const int64_t* __restrict__ topk_ids,
+    const IdT* __restrict__ topk_ids,
     const uint8_t* __restrict__ insist,
     const uint8_t* __restrict__ overridden,
     uint32_t n_slots,
     uint32_t n_experts) {
   const uint32_t stride = gridDim.x * blockDim.x;
   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_slots; i += stride) {
-    int64_t e = topk_ids[i];
+    int64_t e = static_cast<int64_t>(topk_ids[i]);
     const bool routed = e >= 0;
     // clamp_min(0), matching the torch form exactly -- INCLUDING its latent
     // bug. That form clamped the INDEX to 0 but applied the routed mask only
@@ -75,6 +79,7 @@ __global__ void kt_margin_counters_kernel(
   }
 }
 
+template <typename IdT>
 struct KtMarginCounters {
   static void run(tvm::ffi::TensorView insist_count, tvm::ffi::TensorView override_count,
                   tvm::ffi::TensorView resident_count, tvm::ffi::TensorView topk_ids,
@@ -93,7 +98,7 @@ struct KtMarginCounters {
         .verify(resident_count);
 
     SymbolicSize NS = {"num_slots"};
-    TensorMatcher({NS}).with_dtype<int64_t>().with_device(device_).verify(topk_ids);
+    TensorMatcher({NS}).with_dtype<IdT>().with_device(device_).verify(topk_ids);
     // uint8 rather than bool: the matcher maps C++ bool to uint8 while torch
     // reports dtype bool, so the caller passes a free .view(torch.uint8).
     TensorMatcher({NS}).with_dtype<uint8_t>().with_device(device_).verify(insist).verify(overridden);
@@ -106,11 +111,11 @@ struct KtMarginCounters {
     const DLDevice device = device_.unwrap();
 
     LaunchKernel(grid, kMarginCounterThreads, device)(
-        kt_margin_counters_kernel,
+        kt_margin_counters_kernel<IdT>,
         static_cast<int32_t*>(insist_count.data_ptr()),
         static_cast<int32_t*>(override_count.data_ptr()),
         static_cast<int32_t*>(resident_count.data_ptr()),
-        static_cast<const int64_t*>(topk_ids.data_ptr()),
+        static_cast<const IdT*>(topk_ids.data_ptr()),
         static_cast<const uint8_t*>(insist.data_ptr()),
         static_cast<const uint8_t*>(overridden.data_ptr()),
         n_slots,
