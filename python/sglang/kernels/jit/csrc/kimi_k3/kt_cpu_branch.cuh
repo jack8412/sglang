@@ -118,6 +118,9 @@ struct KtCpuBranchFlag {
   }
 };
 
+/// No-op host callback for the capture probe above.
+static void CUDART_CB kt_noop_host_cb(void*) {}
+
 struct KtCondNode {
   /// \brief Splice an IF node into the capture in progress and open its body.
   ///
@@ -172,6 +175,19 @@ struct KtCondNode {
     RuntimeCheck(cudaStreamBeginCaptureToGraph(bs, params.conditional.phGraph_out[0], nullptr, nullptr, 0,
                                                cudaStreamCaptureModeRelaxed) == cudaSuccess,
                  "kt_cond_begin: cudaStreamBeginCaptureToGraph(body) failed");
+  }
+
+  /// \brief Test-only: enqueue a no-op host callback on `stream`.
+  ///
+  /// The doorbell's stream memops cannot be captured into a conditional
+  /// body (measured: cudaErrorInvalidValue at capture_end). The host-node
+  /// transport signals with cudaLaunchHostFunc instead, and whether THAT can
+  /// live in an IF body decides whether dropping the doorbell unblocks
+  /// branch elision or leaves it blocked for both transports.
+  static void noop_host_func(int64_t stream) {
+    using namespace host;
+    RuntimeCheck(cudaLaunchHostFunc((cudaStream_t)stream, kt_noop_host_cb, nullptr) == cudaSuccess,
+                 "cudaLaunchHostFunc failed");
   }
 
   /// \brief Close the IF body opened by begin().
