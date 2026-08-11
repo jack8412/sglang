@@ -48,7 +48,7 @@ constexpr int kBranchFlagThreads = 128;
 __global__ void kt_cpu_branch_flag_kernel(
     int32_t* __restrict__ flag,
     const int64_t* __restrict__ topk_ids,
-    const bool* __restrict__ gpu_mask,
+    const uint8_t* __restrict__ gpu_mask,
     uint32_t n_slots,
     uint32_t n_experts) {
   __shared__ int32_t s_any;
@@ -62,7 +62,7 @@ __global__ void kt_cpu_branch_flag_kernel(
     // id cannot be proven resident, so it takes the CPU branch rather than
     // reading past the mask.
     if (e < 0) continue;
-    if (static_cast<uint64_t>(e) >= n_experts || !gpu_mask[e]) {
+    if (static_cast<uint64_t>(e) >= n_experts || gpu_mask[e] == 0) {
       local = 1;
       break;
     }
@@ -86,7 +86,10 @@ __global__ void kt_set_conditional_kernel(cudaGraphConditionalHandle handle,
 struct KtCpuBranchFlag {
   /// \param flag      [1] int32, device -- receives 0 or 1
   /// \param topk_ids  [qlen, k] int64, device -- routed expert ids
-  /// \param gpu_mask  [num_experts] bool, device -- true if GPU-resident here
+  /// \param gpu_mask  [num_experts] uint8 view of a bool tensor -- nonzero if
+  ///                  GPU-resident here. uint8 because the matcher maps C++ bool
+  ///                  to uint8 while torch reports dtype bool; the caller passes a
+  ///                  free .view(torch.uint8) rather than a copy.
   static void run(tvm::ffi::TensorView flag, tvm::ffi::TensorView topk_ids, tvm::ffi::TensorView gpu_mask) {
     using namespace host;
 
@@ -99,7 +102,7 @@ struct KtCpuBranchFlag {
                  kOne.unwrap());
 
     SymbolicSize NE = {"num_experts"};
-    TensorMatcher({NE}).with_dtype<bool>().with_device(device_).verify(gpu_mask);
+    TensorMatcher({NE}).with_dtype<uint8_t>().with_device(device_).verify(gpu_mask);
 
     const uint32_t n_slots = static_cast<uint32_t>(topk_ids.numel());
     const uint32_t n_experts = static_cast<uint32_t>(NE.unwrap());
@@ -109,7 +112,7 @@ struct KtCpuBranchFlag {
         kt_cpu_branch_flag_kernel,
         static_cast<int32_t*>(flag.data_ptr()),
         static_cast<const int64_t*>(topk_ids.data_ptr()),
-        static_cast<const bool*>(gpu_mask.data_ptr()),
+        static_cast<const uint8_t*>(gpu_mask.data_ptr()),
         n_slots,
         n_experts);
   }

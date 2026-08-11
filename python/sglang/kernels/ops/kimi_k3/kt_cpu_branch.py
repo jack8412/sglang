@@ -60,7 +60,11 @@ def kt_cpu_branch_flag(
     graph capture, where the flag's address is baked into the captured
     predicate kernel and must not move between replays.
     """
-    _jit_kt_cpu_branch_module().flag(flag, topk_ids.view(-1), gpu_mask)
+    # .view(torch.uint8) is a reinterpretation, not a copy: torch bool is one
+    # byte. The matcher maps C++ bool to uint8, so a bool tensor is rejected.
+    _jit_kt_cpu_branch_module().flag(
+        flag, topk_ids.view(-1), gpu_mask.view(torch.uint8)
+    )
 
 
 @contextlib.contextmanager
