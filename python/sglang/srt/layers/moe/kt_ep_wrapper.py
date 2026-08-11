@@ -201,6 +201,7 @@ class KTConfig:
     transport: str = "hostnode"
     transport_pollers: int = 2
     conditional_cpu_branch: bool = False
+    cold_only_cpu_experts: bool = False
     expert_swap_interval: int = 0
     expert_swap_max: int = 4
     expert_swap_hysteresis: float = 2.0
@@ -3745,6 +3746,7 @@ def create_kt_config_from_server_args(
         transport=server_args.kt_transport,
         transport_pollers=server_args.kt_transport_pollers,
         conditional_cpu_branch=server_args.kt_conditional_cpu_branch,
+        cold_only_cpu_experts=server_args.kt_cold_only_cpu_experts,
         expert_swap_interval=server_args.kt_expert_swap_interval,
         expert_swap_max=server_args.kt_expert_swap_max,
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
@@ -4849,6 +4851,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
+                # Read at MOEConfig construction, before kt allocates the
+                # per-expert weight buffers -- passing it later would silently
+                # allocate all 896 and look like the feature did nothing.
+                cold_only_cpu_experts=self.kt_config.cold_only_cpu_experts,
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,

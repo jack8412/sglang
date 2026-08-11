@@ -3008,6 +3008,11 @@ class ServerArgs:
         "Poller threads for --kt-transport doorbell (one per socket is the intent).",
         NS("exec.moe"),
     ] = 2
+    kt_cold_only_cpu_experts: A[
+        bool,
+        "Hold CPU expert weights only for experts this rank does NOT keep on the GPU. kt-kernel otherwise allocates an AMX weight buffer for every expert of every wrapped layer and masks GPU-resident ones out at forward time -- 896 experts x 92 layers x ~17.55 MB = ~1.45 TB on Kimi-K3, against ~447 GB actually served at 620/896 resident. Frees ~1 TB for HiCache and cuts the weight load, which is 75% of startup. Requires --kt-routing-margin: the buffers a GPU-resident expert never computes are still READ by the full-GPU prefill fallback and the layerwise prefill manager, both of which margin routing refuses.",
+        NS("exec.moe"),
+    ] = False
     kt_conditional_cpu_branch: A[
         bool,
         "Skip a layer's CPU-expert branch device-side, via a CUDA conditional node, when no routed slot in the batch names a CPU-resident expert. Under margin routing a large share of layer-steps route entirely to GPU-resident experts; kt's inline-empty check already makes the poller cheap for those, but the GPU still pays the staging D2H, the round trip, the result H2D and the merge. Applies to captured decode graphs only -- an eager forward has no graph to splice a conditional into and runs the branch as before. Requires --kt-transport doorbell.",
@@ -6944,6 +6949,31 @@ class ServerArgs:
                     "closure per (layer, batch size) with `incremental=False` "
                     "and never enqueues a second task, so the deferred half "
                     "would be silently dropped."
+                )
+
+        if self.kt_cold_only_cpu_experts:
+            if (self.kt_method or "").upper() != "MXFP4":
+                raise ValueError(
+                    f"--kt-cold-only-cpu-experts is implemented for MXFP4 only, "
+                    f"got --kt-method {self.kt_method}. The other methods' load "
+                    f"paths still fill every expert's buffer unconditionally and "
+                    f"would dereference the ones that are no longer allocated."
+                )
+            if self.kt_routing_margin is None:
+                raise ValueError(
+                    "--kt-cold-only-cpu-experts requires --kt-routing-margin. "
+                    "Without margin routing the full-GPU prefill fallback and "
+                    "the layerwise prefill manager are reachable, and both READ "
+                    "the CPU-side weights of GPU-resident experts to export them "
+                    "to the device -- exactly the buffers this flag stops "
+                    "allocating. Margin routing refuses both."
+                )
+            if self.kt_gpu_prefill_token_threshold:
+                raise ValueError(
+                    "--kt-cold-only-cpu-experts is incompatible with "
+                    "--kt-gpu-prefill-token-threshold: the sweep exports "
+                    "GPU-resident experts from their CPU buffers, which this "
+                    "flag no longer allocates."
                 )
 
         if self.kt_conditional_cpu_branch:
