@@ -6912,11 +6912,22 @@ class ServerArgs:
                 "its statistics. Unset it."
             )
 
-        if self.kt_transport == "doorbell" and (self.kt_method or "").upper() != "MXFP4":
-            raise ValueError(
-                f"--kt-transport doorbell is implemented for MXFP4 only, got "
-                f"--kt-method {self.kt_method}."
-            )
+        if self.kt_transport == "doorbell":
+            if (self.kt_method or "").upper() != "MXFP4":
+                raise ValueError(
+                    f"--kt-transport doorbell is implemented for MXFP4 only, got "
+                    f"--kt-method {self.kt_method}."
+                )
+            if self.kt_max_deferred_experts_per_token:
+                raise ValueError(
+                    "--kt-transport doorbell requires "
+                    "--kt-max-deferred-experts-per-token 0: a deferred "
+                    "contribution lands in the SUCCESSOR layer's output ring "
+                    "and is collected by its sync, but the doorbell binds one "
+                    "closure per (layer, batch size) with `incremental=False` "
+                    "and never enqueues a second task, so the deferred half "
+                    "would be silently dropped."
+                )
 
         if self.kt_expert_swap_interval and self.kt_routing_margin is None:
             raise ValueError(

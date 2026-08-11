@@ -4575,12 +4575,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._kt_no_cpu_stream = envs.SGLANG_DISABLE_KT_CPU_STREAM.get()
         self._kt_bypass_gpu_moe = envs.SGLANG_DEBUG_KT_BYPASS_GPU_MOE.get()
         self._kt_ablate_hostnodes = envs.SGLANG_KT_ABLATE_HOSTNODES.get()
-        # Doorbell transport: this layer's slot, and the monotonic sequence
-        # the device writes. Both are fixed before capture -- a captured graph
-        # bakes the addresses and the write is a memop, so nothing here may be
-        # decided per batch.
-        self._db_slot: Optional[int] = None
-        self._db_seq: int = 0
+        # Doorbell transport: one slot per (layer, BATCH SIZE), assigned on
+        # this layer's first forward at each size. Not one per layer:
+        # KExpertsCPUBuffer keys its rings by batch size, so a single
+        # per-layer slot would point the poller at another tier's buffers for
+        # every size but the first -- silently, since the shapes match.
+        self._db_enabled = kt_config.transport == "doorbell"
+        self._db_slots: Dict[int, int] = {}
         self._kt_ablate_zero: Optional[torch.Tensor] = None
         # Margin routing (SPEC-MARGIN-ROUTING P1). None = off, bit-exact.
         self._margin = kt_config.routing_margin
@@ -4847,11 +4848,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     )
                 )
 
-        # Doorbell slot must be fixed before capture: the graph bakes the
-        # device addresses of this slot's seq/completion words.
+        # The doorbell page must be allocated and the poller running before any
+        # capture: cudaHostAlloc is illegal during capture, and the graph bakes
+        # the page's device addresses. Slots are bound later, per batch size --
+        # binding allocates no device memory, so it is capture-safe.
         if self.kt_config.transport == "doorbell" and self.tp_rank == 0:
-            kt_doorbell_assign_slot(self)
-            self.wrapper.register_doorbell_slot(self._db_slot)
+            kt_doorbell_init(self.kt_config.transport_pollers)
 
         # Swap driver registry: keep the layer with the method, since the
         # weight mover writes into the layer's resident parameter rows.
@@ -5356,6 +5358,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # same shape it replays — the same static-branch contract the
         # num_gpu_experts == 0 and tp_rank != 0 paths already rely on.
         staging_buffer = None
+        # Slot this forward rang, carried from the ring (step 1) to the wait
+        # (step 4) so the two cannot drift onto different batch-size tiers.
+        _db_slot = None
         if self.tp_rank == 0 and self._cpu_stream is not None and not self._skip_cpu_path:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
@@ -5373,14 +5378,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
                 # Submit uses staging_buffer, so GPU can modify original x freely
-                if self._db_slot is not None:
-                    # The staging copy above is the ids/activation D2H this
-                    # doorbell must follow; recording the write here, after
-                    # it, IS the ordering guarantee.
+                if self._db_enabled:
+                    _db_slot = self._kt_doorbell_slot(staging_buffer, dispatch_output)
+                if _db_slot is not None:
+                    _db_stream = torch.cuda.current_stream(x.device).cuda_stream
+                    # Arm BEFORE the ring: retract the previous replay's
+                    # completion so this replay's wait cannot be satisfied by a
+                    # stale value. A captured node writes a constant, so
+                    # without the arm every replay after the first would sail
+                    # through the wait reading the first replay's output.
+                    kt_doorbell_arm(_db_slot, _db_stream)
+                    # Then stage, then ring: the poller's whole decision reads
+                    # these ids, so a ring visible before them would have it
+                    # judge the PREVIOUS step's batch.
                     self._kt_doorbell_stage(layer, dispatch_output, staging_buffer)
-                    kt_doorbell_ring(
-                        self, torch.cuda.current_stream(x.device).cuda_stream
-                    )
+                    kt_doorbell_ring(_db_slot, _db_stream)
                 elif not self._kt_ablate_hostnodes:
                     self._submit_with_staged_input(
                         layer, dispatch_output, staging_buffer
@@ -5460,9 +5472,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             with _stream_ctx:
                 # Use staging_buffer for sync to get correct buffer reference
                 _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
-                if self._db_slot is not None:
+                if _db_slot is not None:
                     kt_doorbell_wait(
-                        self, torch.cuda.current_stream(x.device).cuda_stream
+                        _db_slot, torch.cuda.current_stream(x.device).cuda_stream
                     )
                     cpu_output = self._kt_doorbell_output(staging_buffer)
                 elif self._kt_ablate_hostnodes:
@@ -5535,6 +5547,31 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
                 )
         return StandardCombineInput(hidden_states=output)
+
+    def _kt_doorbell_slot(self, staging_buffer, dispatch_output) -> Optional[int]:
+        """This layer's doorbell slot for the batch size in flight, or None.
+
+        Bound on first sight of each size, which is the first forward of that
+        tier -- ahead of the ring recorded a few lines later, so the poller can
+        never be rung at a slot it has no closure for.
+
+        None for any batch size kt-kernel does not cache: the poller holds RAW
+        POINTERS into that size's rings for the life of the process, and
+        KExpertsCPUBuffer only keeps a tuple alive when the size is in
+        `capture_bs`. Every other size shares one `temp_buffer` that the next
+        differently-sized forward replaces, which would leave the closure
+        reading freed memory. Those sizes take the host-node path instead --
+        they are prefill shapes, and decode is what this transport is for.
+        """
+        batch_size = staging_buffer.shape[0]
+        slot = self._db_slots.get(batch_size)
+        if slot is None:
+            if batch_size not in self.wrapper.get_capture_batch_sizes():
+                return None
+            _, topk_ids, _ = dispatch_output.topk_output
+            slot = kt_doorbell_bind_slot(self, staging_buffer, topk_ids)
+            self._db_slots[batch_size] = slot
+        return slot
 
     def _kt_doorbell_stage(self, layer, dispatch_output, staging_buffer) -> None:
         """Copy this step's ids/weights into the kt ring the poller reads.
@@ -5996,6 +6033,13 @@ def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
     )
     _KT_SWAP_STATE["windows"] += 1
     _KT_SWAP_STATE["swaps"] += result.swaps_applied
+    if _KT_DOORBELL["inited"]:
+        # Decode replays a graph that runs no Python, so this periodic window
+        # is the only place decode-time transport counters can be observed.
+        # Without it a doorbell that silently never bound a slot -- and so fell
+        # back to host nodes everywhere -- would look exactly like a working
+        # one: identical output, identical speed, and no way to tell which.
+        logger.info("[kt-doorbell] %s", kt_doorbell_stats())
     if result.swaps_applied or result.skipped_layers:
         logger.info(
             "[kt-swap] window %d: %d swap(s) across %d layer(s), %d skipped "
@@ -6058,70 +6102,133 @@ def _get_or_create_expert_mover(anchor):
 # ---------------------------------------------------------------------------
 # Doorbell transport (--kt-transport doorbell)
 # ---------------------------------------------------------------------------
-# Replaces the two cudaLaunchHostFunc nodes per layer with a device value
-# write plus a wait node, served by a spinning CPU poller in kt-kernel.
+# Replaces the two cudaLaunchHostFunc nodes per layer with device value
+# writes plus a wait node, served by a spinning CPU poller in kt-kernel.
 # Measured target: 62.4 us/layer, 77% of the residue left after 7004e15.
+#
+# PROTOCOL. A captured graph node writes a CONSTANT -- whatever value is
+# recorded is what every replay writes. A monotonic sequence therefore cannot
+# work: it advances once at capture, after which the poller's "changed?" test
+# is false forever and the GPU's wait is already satisfied by the stale value,
+# so the CPU experts stop computing while the merge keeps reading the first
+# replay's output. Silently wrong, and invisible to a smoke test. The protocol
+# is instead built from constants that stay correct under unlimited replay:
+#
+#     arm    write completion[slot] = 0
+#     stage  D2H of activations + ids
+#     ring   write ring = slot + 1
+#     wait   completion[slot] == slot + 1
+#
+# See kt-kernel cpu_backend/doorbell.h for the poller half and for why the
+# ring is a single global word rather than a per-slot flag.
+
+# Slots are (layer, batch size) pairs. 92 MoE layers x ~52 captured decode
+# tiers is ~4.8k; the page is 128 B/slot, so sizing generously costs ~1 MB of
+# pinned memory and removes a hard failure at the tail of the tier list.
+_KT_DOORBELL_MAX_SLOTS = 8192
 
 _KT_DOORBELL = {"inited": False, "next_slot": 0}
 
 
 def _kt_doorbell_ext():
-    import kt_kernel_ext
+    # The extension is a submodule of the kt_kernel package, not a top-level
+    # module: `import kt_kernel_ext` raises ModuleNotFoundError.
+    from kt_kernel import kt_kernel_ext
 
     return kt_kernel_ext.doorbell
 
 
-def kt_doorbell_assign_slot(method) -> int:
-    """Give a layer its slot and register the poller-side work closure.
+def kt_doorbell_init(num_pollers: int) -> None:
+    """Allocate the doorbell page and start the poller. Idempotent.
 
-    Called once, before any capture: the slot's device addresses are baked
-    into captured graphs and the work closure captures ring-buffer pointers
-    that are stable for the process, so neither may be decided per batch.
+    Must run before any graph capture: cudaHostAlloc is illegal during
+    capture, and the captured nodes bake this page's device addresses.
     """
+    if _KT_DOORBELL["inited"]:
+        return
     db = _kt_doorbell_ext()
-    if not _KT_DOORBELL["inited"]:
-        # One slot per wrapped layer is enough: a layer's forward is complete
-        # before the next layer's doorbell rings, and graph families reuse the
-        # same layer slots in the same order.
-        db.init(1024, method.kt_config.transport_pollers)
-        db.start()
-        _KT_DOORBELL["inited"] = True
+    db.init(_KT_DOORBELL_MAX_SLOTS, num_pollers)
+    db.start()
+    _KT_DOORBELL["inited"] = True
+
+
+def kt_doorbell_bind_slot(method, staging_buffer, topk_ids) -> int:
+    """Allocate and bind this (layer, batch size) pair's slot.
+
+    Binding is host-only -- it hands kt-kernel the ring pointers for this
+    batch size and stores a closure -- so it is safe on a tier's first forward
+    even inside that tier's graph capture.
+    """
     slot = _KT_DOORBELL["next_slot"]
-    _KT_DOORBELL["next_slot"] += 1
-    method._db_slot = slot
+    if slot >= _KT_DOORBELL_MAX_SLOTS:
+        raise RuntimeError(
+            f"doorbell: out of slots ({_KT_DOORBELL_MAX_SLOTS}); raise "
+            "_KT_DOORBELL_MAX_SLOTS"
+        )
+    _KT_DOORBELL["next_slot"] = slot + 1
+    method.wrapper.register_doorbell_slot(slot, staging_buffer, topk_ids)
     return slot
 
 
-def kt_doorbell_ring(method, stream) -> None:
-    """Record the device-side value write for this layer's doorbell.
+def kt_doorbell_arm(slot: int, stream) -> None:
+    """Retract the previous replay's completion for this slot.
 
-    MUST be recorded AFTER the ids/activation D2H copies. The poller's whole
-    decision reads those ids; if the doorbell became visible first it would
-    read the PREVIOUS step's batch and could declare a batch empty that is
-    not -- wrong numbers, silently. Ordering here is by stream position, and
-    the assertion that it holds lives at the call site.
+    Without this a replay's wait is satisfied the instant it is reached, by
+    the value the poller wrote last time -- the CPU path would appear to work
+    while contributing nothing but stale data.
     """
     from cuda.bindings import driver
 
     db = _kt_doorbell_ext()
-    method._db_seq += 1
-    err, = driver.cuStreamWriteValue64(
-        stream, driver.CUdeviceptr(db.seq_dev_addr(method._db_slot)),
-        method._db_seq, 0,
+    (err,) = driver.cuStreamWriteValue64(
+        stream, driver.CUdeviceptr(db.completion_dev_addr(slot)), 0, 0
     )
     if err != driver.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"doorbell write failed: {err}")
+        raise RuntimeError(f"doorbell arm failed: {err}")
 
 
-def kt_doorbell_wait(method, stream) -> None:
-    """Record the wait: block the stream until the poller publishes seq."""
+def kt_doorbell_ring(slot: int, stream) -> None:
+    """Record the device-side ring for this slot.
+
+    MUST be recorded AFTER the ids/activation D2H copies. The poller's whole
+    decision reads those ids; if the ring became visible first it would read
+    the PREVIOUS step's batch and could declare a batch empty that is not --
+    wrong numbers, silently. Ordering here is by stream position.
+    """
     from cuda.bindings import driver
 
     db = _kt_doorbell_ext()
-    err, = driver.cuStreamWaitValue64(
-        stream, driver.CUdeviceptr(db.completion_dev_addr(method._db_slot)),
-        method._db_seq,
-        driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ,
+    (err,) = driver.cuStreamWriteValue64(
+        stream, driver.CUdeviceptr(db.ring_dev_addr()), slot + 1, 0
+    )
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"doorbell ring failed: {err}")
+
+
+def kt_doorbell_wait(slot: int, stream) -> None:
+    """Block the stream until the poller publishes this slot's completion."""
+    from cuda.bindings import driver
+
+    db = _kt_doorbell_ext()
+    (err,) = driver.cuStreamWaitValue64(
+        stream,
+        driver.CUdeviceptr(db.completion_dev_addr(slot)),
+        slot + 1,
+        driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ,
     )
     if err != driver.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"doorbell wait failed: {err}")
+
+
+def kt_doorbell_stats() -> dict:
+    """Poller counters, for the transport gates."""
+    db = _kt_doorbell_ext()
+    served = db.served()
+    return {
+        "served": served,
+        "spins": db.spins(),
+        "unbound": db.unbound(),
+        "slots_bound": _KT_DOORBELL["next_slot"],
+        "work_us_mean": (db.work_ns_total() / served / 1000.0) if served else 0.0,
+        "work_us_max": db.work_ns_max() / 1000.0,
+    }
