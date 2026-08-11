@@ -5940,8 +5940,18 @@ def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
 
     cfg = anchor.kt_config
     _KT_SWAP_STATE["eager_forwards"] += 1
-    if _KT_SWAP_STATE["eager_forwards"] % cfg.expert_swap_interval:
+    n = _KT_SWAP_STATE["eager_forwards"]
+    # Observe more often than we act. The policy's first observation is
+    # baseline-only by construction (a cumulative counter's first "delta" is
+    # the whole launch history), so welding observation to action wasted an
+    # entire interval AND left the first real decision resting on a single
+    # sample. Sampling at interval/5 means the EMA already has history when
+    # the first window acts -- and a short run still swaps instead of doing
+    # nothing at all, which is how three separate runs came back empty.
+    sample_every = max(1, cfg.expert_swap_interval // 5)
+    if n % sample_every:
         return
+    act = (n % cfg.expert_swap_interval) == 0
 
     entries = []
     for method in _KT_EP_METHODS:
@@ -5968,7 +5978,8 @@ def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
                 "method": method,
             }
         )
-    if not entries:
+    if not entries or not act:
+        # Sampling-only pass: counters folded into the EMAs, nothing moved.
         return
 
     mover = _get_or_create_expert_mover(anchor)
