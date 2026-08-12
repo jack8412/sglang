@@ -4,11 +4,31 @@
 # (k3.sh serve runs it from the node's sglang checkout); the previous copy
 # lived only on the node and evaporated with the rental.
 #
-# Env: only what sglang itself requires for K3 MXFP4 on Blackwell.
-# NOTE: --kt-gpu-prefill-token-threshold is deliberately absent (and now
-# defaults to unset): the full-GPU sweep is 5.2x slower than margin-routed
-# prefill, costs 7.54 GiB/GPU, and is refused at config time when
-# --kt-routing-margin is set.
+# Baked-in defaults = the best-known parameter set, extracted 2026-08-12 from
+# every archived server log of the 2026-08-10/11 campaign (runs/logs). The
+# PRODUCTION recipe on top of these defaults (phases CO/CS, HANDOFF):
+#
+#   --kt-routing-margin 0.5 --kt-cold-only-cpu-experts \
+#   --kt-expert-swap-interval 50 --kt-expert-swap-max 8
+#
+# Evidence for the non-obvious defaults:
+# - kt-transport doorbell: RB2 (margin 10) doorbell 75.3 tok/s vs packed
+#   hostnode 57.5; DB (margin 0.5) 43.6 vs 39.0. The server default is still
+#   hostnode, so the launcher sets doorbell explicitly. Full-override ceiling
+#   rows ran hostnode (transport absent from their graph) -- pass
+#   --kt-transport hostnode to reproduce those.
+# - cold-only is NOT a default only because it requires --kt-routing-margin;
+#   use it with every margin run (CO1: outputs byte-identical, -0.0215 nats
+#   unchanged, ~1 TB host RAM freed, weight load 110 s).
+# - attention backends: leave UNSET -- the KimiK3 override resolves all three
+#   to trtllm_mla on SM100/SM103 (verified in every old log). The fa2
+#   UserWarning from the flashinfer prefill wrapper appeared in every old
+#   campaign log too; it is noise, not a config error.
+# - --expert-distribution-recorder-mode stat only on recording runs (F1
+#   pattern) -- no old measurement row ran with the recorder armed.
+# - --kt-gpu-prefill-token-threshold deliberately absent (defaults unset):
+#   the full-GPU sweep is 5.2x slower than margin-routed prefill, costs
+#   7.54 GiB/GPU, and is refused at config time when margin is set.
 NAME=${1:?usage: launch.sh <name> [extra server args...]}; shift
 WS=/workspace
 mkdir -p $WS/runs/{status,probes,logs,meta} $WS/runs/edr
@@ -64,8 +84,8 @@ exec python -m sglang.launch_server \
   --kt-method MXFP4 --kt-weight-path $WS/k3 \
   --kt-num-gpu-experts 620 \
   --kt-threadpool-count $NUMAN --kt-cpuinfer $((PHYS * 85 / 100)) \
+  --kt-transport doorbell \
   --kt-expert-placement-strategy uniform $PLACE \
-  --expert-distribution-recorder-mode stat \
   --moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4 \
   --mem-fraction-static 0.90 --context-length 32768 \
   --chunked-prefill-size 16384 \
