@@ -111,6 +111,9 @@ if [ -d \$WS/ktransformers/.git ]; then
   (cd \$WS/ktransformers && echo "kt      \$(git log --oneline -1)  [\$(git rev-parse --abbrev-ref HEAD)]")
 else echo "kt MISSING -> run: k3.sh bootstrap"; fi
 [ -d \$WS/runs/status ] || echo "runs/ tree MISSING -> run: k3.sh bootstrap"
+POOL_VER=trtllm_gen_moe_cubin_pool_20260617_v0613rc1
+[ -d /opt/trtllm_gen_moe_cubin_pool/\$POOL_VER ] || [ -d \$WS/trtllm_gen_moe_cubin_pool/\$POOL_VER ] \
+  || echo "cubin pool MISSING (K3 mxfp4 on SM100 cannot start) -> run: k3.sh bootstrap"
 echo "--- weights"
 if [ -f \$WS/k3/.download-complete ]; then
   echo "k3 complete (\$(du -sh \$WS/k3 2>/dev/null | cut -f1))"
@@ -315,6 +318,26 @@ else
   echo "k3 ABSENT -- pass --weights to download (moonshotai/Kimi-K3, ~1.6 TB)"
 fi
 
+echo "--- trtllm-gen MoE cubin pool (K3 mxfp4 on SM100 REFUSES to start without it)"
+# The old image shipped it under /opt; a fresh image does not, and there is
+# no pool-less JIT path for flashinfer_mxfp4 on SM100 (overrides.py raises).
+POOL_VER=trtllm_gen_moe_cubin_pool_20260617_v0613rc1
+if [ -d /opt/trtllm_gen_moe_cubin_pool/\$POOL_VER ] || [ -d \$WS/trtllm_gen_moe_cubin_pool/\$POOL_VER ]; then
+  echo "cubin pool present"
+else
+  echo "cubin pool ABSENT -- fetching from the sgl-project/whl release"
+  mkdir -p \$WS/trtllm_gen_moe_cubin_pool
+  curl -fsSL -o \$WS/trtllm_gen_moe_cubin_pool/\$POOL_VER.zip \
+    https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/\$POOL_VER.zip \
+    || { echo "cubin pool download FAILED"; exit 1; }
+  python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
+    \$WS/trtllm_gen_moe_cubin_pool/\$POOL_VER.zip \$WS/trtllm_gen_moe_cubin_pool \
+    || { echo "cubin pool unzip FAILED"; exit 1; }
+  rm -f \$WS/trtllm_gen_moe_cubin_pool/\$POOL_VER.zip
+  [ -d \$WS/trtllm_gen_moe_cubin_pool/\$POOL_VER ] && echo "cubin pool installed at \$WS/trtllm_gen_moe_cubin_pool/\$POOL_VER" \
+    || { echo "cubin pool layout unexpected after unzip"; exit 1; }
+fi
+
 echo "--- placement profile (frequency placement needs this)"
 ls \$WS/runs/edr/*.pt >/dev/null 2>&1 \
   && echo "edr dump present: \$(ls -1 \$WS/runs/edr/*.pt | head -1)" \
@@ -441,6 +464,9 @@ pkill -INT -f "launch_serve[r]" 2>/dev/null; sleep 15
 pkill -9 -f "sglang::sched[u]ler" 2>/dev/null; sleep 5
 tmux new-session -d -s bench -n "$NAME" "bash $LAUNCHER $NAME $*"
 echo "launched; waiting for /health_generate (log: $LOG)"
+# Grace period: the first pgrep can beat launch.sh's exec of the server, and
+# a false DIED here cost a full campaign (phase V rows all "died" at t+0.2s).
+sleep 15
 n=0
 while [ $n -lt 120 ]; do
   c=$(curl -s -o /dev/null -w "%{http_code}" -m 5 http://127.0.0.1:31000/health_generate 2>/dev/null)

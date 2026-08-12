@@ -18,14 +18,17 @@ export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=$WS/runs/edr
 # Prebuilt trtllm-gen MoE cubins. NOT optional for this config: with
 # --moe-runner-backend flashinfer_mxfp4 on SM100 the server REFUSES to start
 # without a valid pool (overrides.py raises; there is no pool-less JIT path).
-# The guard exists so a missing pool fails with THIS line in the log instead
-# of only the RuntimeError.
-CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool/trtllm_gen_moe_cubin_pool_20260617_v0613rc1
-if [ -d "$CUBIN_POOL" ]; then
-  export SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=$CUBIN_POOL
-else
-  echo "WARNING: cubin pool missing at $CUBIN_POOL -- flashinfer_mxfp4 on SM100 will refuse to start" >> $LOG
-fi
+# /opt is where the old image baked it in; /workspace is where k3.sh
+# bootstrap installs it on images that ship without one.
+POOL_VER=trtllm_gen_moe_cubin_pool_20260617_v0613rc1
+for base in /opt/trtllm_gen_moe_cubin_pool /workspace/trtllm_gen_moe_cubin_pool; do
+  if [ -d "$base/$POOL_VER" ]; then
+    export SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=$base/$POOL_VER
+    break
+  fi
+done
+[ -n "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL:-}" ] \
+  || echo "WARNING: cubin pool missing ($POOL_VER) -- flashinfer_mxfp4 on SM100 will refuse to start; run k3.sh bootstrap" >> $LOG
 source $WS/venv-k3/bin/activate
 # Sized to the node, not hardcoded to a rental that no longer exists: one
 # threadpool per NUMA node; cpuinfer ~85% of PHYSICAL cores (RUNBOOK step 3 --
