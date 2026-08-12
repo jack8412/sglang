@@ -1003,10 +1003,6 @@ class Req(ReqDllmMixin):
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
-        # For prefill-swap: set when KV is swapped to CPU for large-chunk
-        # prefill workspace (distinct from decode retraction).  Resumed
-        # after the prefill completes via load_kv_cache().
-        self.is_swapped = False
 
         # Incremental streamining
         self.send_token_offset: int = 0
@@ -1866,7 +1862,6 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-    is_insert: bool = False,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
@@ -1878,7 +1873,7 @@ def release_req(
     if server_args.disaggregation_mode == "decode" and offload_kv:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, is_insert=is_insert)
+    release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -2842,10 +2837,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         return sorted_indices
 
-    def release_req(
-        self, idx: int, remaing_req_count: int, server_args: ServerArgs,
-        is_insert: bool = False,
-    ):
+    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
@@ -2854,7 +2846,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
-            is_insert=is_insert,
         )
 
     def prepare_encoder_info_decode(self):

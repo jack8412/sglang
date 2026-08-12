@@ -3060,95 +3060,10 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def maybe_swap_for_prefill(
-        self, running_batch: ScheduleBatch
-    ) -> ScheduleBatch:
-        """Retract running decode sessions to free GPU VRAM for a large-chunk
-        prefill's MoE workspace.
-
-        Triggered when the largest waiting prefill exceeds
-        ``prefill_swap_threshold`` AND the MoE workspace for the configured
-        chunk size would exceed available free VRAM.
-
-        Retracted sessions' KV is inserted into the radix tree
-        (``is_insert=True``) so that HiCache L2 can transparently back it up
-        to CPU host memory.  When the sessions are re-admitted after the
-        prefill, ``match_prefix`` hits the tree and HiCache restores the KV
-        from CPU — no recompute, no manual offload/load code.
-        """
-        threshold = get_schedule().prefill_swap_threshold
-        if threshold <= 0 or running_batch.is_empty():
-            return running_batch
-
-        # Find the largest pending prefill in the waiting queue.
-        max_prefill_tokens = 0
-        for req in self.waiting_queue:
-            n = len(req.origin_input_ids)
-            if n > max_prefill_tokens:
-                max_prefill_tokens = n
-        if max_prefill_tokens <= threshold:
-            return running_batch
-
-        # Estimate the MoE workspace for one forward at chunk size.
-        # Measured workspace (two OOM data points): 735 MiB + 112 KiB/token.
-        chunk_size = self.chunked_prefill_size
-        forward_tokens = min(max_prefill_tokens, chunk_size)
-        pot = 1 << (forward_tokens - 1).bit_length() if forward_tokens > 0 else 0
-        workspace_bytes = (735 << 20) + (112 << 10) * pot
-
-        # Available free VRAM in the KV pool (bytes).
-        available_slots = self.token_to_kv_pool_allocator.available_size()
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        k_bytes, v_bytes = kvcache.get_kv_size_bytes()
-        total_pool_bytes = k_bytes + v_bytes
-        pool_capacity = kvcache.size if hasattr(kvcache, "size") else 1
-        kv_bytes_per_token = total_pool_bytes / max(pool_capacity, 1)
-        available_bytes = available_slots * kv_bytes_per_token
-
-        # 1.2x safety margin on the workspace side.
-        if workspace_bytes * 1.2 <= available_bytes:
-            return running_batch  # Enough VRAM without swapping.
-
-        # Retract enough running requests to free the deficit.
-        deficit_bytes = workspace_bytes * 1.2 - available_bytes
-        retracted = []
-        remaining = list(running_batch.reqs)
-        for i, req in enumerate(remaining):
-            if deficit_bytes <= 0:
-                break
-            # Insert KV into the radix tree (is_insert=True) so HiCache can
-            # back it up to CPU host memory.  No manual offload — HiCache
-            # handles the device→host transfer transparently.
-            running_batch.release_req(
-                idx=i,
-                remaing_req_count=len(remaining) - i - 1,
-                server_args=self.server_args,
-                is_insert=True,
-            )
-            req.is_swapped = True
-            retracted.append(req)
-            deficit_bytes -= req.seqlen * kv_bytes_per_token
-
-        if retracted:
-            keep = [r for r in running_batch.reqs if not r.is_swapped]
-            running_batch.reqs = keep
-            running_batch.filter_batch(keep_indices=list(range(len(keep))))
-            for req in retracted:
-                self._add_request_to_queue(req, is_retracted=True)
-            logger.info(
-                "[prefill-swap] retracted %d decode session(s) into radix "
-                "tree (HiCache L2) for %d-token prefill (workspace %.1f "
-                "GiB, was %.1f GiB free)",
-                len(retracted), max_prefill_tokens,
-                workspace_bytes / (1 << 30), available_bytes / (1 << 30),
-            )
-        return running_batch
-
     def get_num_allocatable_reqs(self, running_bs):
         res = get_parallel().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
         return res
-
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
@@ -3165,10 +3080,6 @@ class Scheduler(
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
-
-        # Retract decode sessions into the radix tree (HiCache L2 backs
-        # them to CPU) if a large prefill needs the VRAM for its workspace.
-        running_batch = self.maybe_swap_for_prefill(running_batch)
 
         ret, running_batch = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,

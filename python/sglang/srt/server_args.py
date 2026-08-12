@@ -816,11 +816,6 @@ class ServerArgs:
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
         NS("schedule"),
     ] = None
-    prefill_swap_threshold: A[
-        int,
-        "Prefill token count above which running decode sessions' KV cache is swapped to CPU RAM to free GPU VRAM for the MoE workspace, enabling larger chunked-prefill sizes. 0 = disabled (never swap). Below the threshold, prefills use the safe chunk size that fits without swapping.",
-        NS("schedule"),
-    ] = 0
     schedule_policy: A[
         str,
         Arg(
