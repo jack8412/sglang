@@ -34,7 +34,10 @@
 #             override to four decimals (-0.5942), i.e. the same 31% of experts
 #             made unreachable, 8 tok/s slower. It exists to measure the
 #             sglang-side machinery with almost no CPU compute underneath.
-#   ceiling   full override, no margin at all. The GPU-only floor (83.5 tok/s).
+#   ceiling   full override, no margin at all. The GPU-only floor. Builds no KT
+#             wrapper and loads NO CPU expert weights (they are never computed),
+#             so it starts in minutes rather than loading ~1.45 TB it never reads
+#             -- which also stops it evicting the page cache for later rows.
 #   bare      nothing routing-related. For A/B rows that set every knob
 #             themselves, and the only safe base for a row that must NOT have
 #             cold-only or swapping on.
@@ -140,33 +143,8 @@ case "$PROFILE" in
                      --kt-expert-swap-interval 50 --kt-expert-swap-max 8) ;;
   margin10) ROUTING=(--kt-routing-margin 10) ;;
   ceiling)  ROUTING=(--kt-routing-full-override) ;;
-  # (full override is additionally gated below -- see the ceiling stop)
   bare)     ROUTING=() ;;
   *) echo "FATAL: unknown K3_PROFILE '$PROFILE' (prod|prod01|margin10|ceiling|bare)" | tee -a $LOG >&2; exit 2 ;;
-esac
-
-# ---------------------------------------------------------------------------
-# CEILING STOP (temporary, remove when the CPU-load fix lands)
-# ---------------------------------------------------------------------------
-# Full override computes NO CPU expert -- every routed CPU pick is replaced by a
-# GPU-resident one -- yet the run still loads the entire CPU expert set, because
-# --kt-cold-only-cpu-experts is refused without a margin (server_args.py:6986).
-# On K3 that is ~1.45 TB against this node's 2 TB of RAM, for weights that are
-# never read. Three consequences: startup is dominated by a pointless load, the
-# page cache is evicted so every later row reloads cold, and the row itself is
-# at real risk of memory pressure.
-#
-# Blocked until the load is actually skipped in that mode. Set
-# K3_ALLOW_CEILING=1 to run it anyway (knowing the above).
-case " ${ROUTING[*]} $* " in
-  *" --kt-routing-full-override "*)
-    if [ "${K3_ALLOW_CEILING:-0}" != "1" ]; then
-      echo "REFUSING full override: it still loads the whole CPU expert set (~1.45 TB
-  on K3) for experts it never computes -- cold-only is refused without a margin.
-  Blocked until the KT CPU load is skipped in this mode.
-  Override with K3_ALLOW_CEILING=1 if you accept the load time and memory." | tee -a $LOG >&2
-      exit 4
-    fi ;;
 esac
 
 # The recorder is OPT-IN, and both halves of that matter:

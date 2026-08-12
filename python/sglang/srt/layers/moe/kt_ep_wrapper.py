@@ -4788,8 +4788,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 num_experts, dtype=torch.int32, device=target_device
             )
 
+        # Full override computes no CPU expert at all, so none of the CPU-side
+        # machinery below is ever used: not the stream, not the staging buffer,
+        # not the doorbell, and above all not the expert weights. Loading them
+        # anyway cost most of startup and ~1.45 TB of host RAM on K3 (cold-only
+        # cannot help -- it is refused without a margin, and full override sets
+        # only the internal self._margin), and it evicted the page cache so the
+        # NEXT run reloaded cold.
+        #
+        # self.wrapper deliberately stays None rather than being built and left
+        # unloaded: every CPU-path call site already guards on `wrapper is None`
+        # (that is how tp_rank != 0 behaves), so None keeps all of them
+        # fail-safe. A built-but-unloaded wrapper would read as "CPU path
+        # available" and die inside kt-kernel on a null `moe` instead.
+        _skip_cpu_side = self._skip_cpu_path
+
         # Initialize dual-stream for CPU-GPU parallelism (rank 0 only)
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 and not _skip_cpu_side:
             self._cpu_stream = get_stream("kt_cpu")
             self._sync_done_event = torch.cuda.Event()
 
@@ -4803,7 +4818,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 and not _skip_cpu_side:
             # SwiGLU activation params for CPU experts. Source of truth is
             # MoeRunnerConfig, populated by the model file from HF config:
             #   - minimax_m3.py forwards config.swiglu_alpha / swiglu_limit
@@ -4904,7 +4919,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # capture: cudaHostAlloc is illegal during capture, and the graph bakes
         # the page's device addresses. Slots are bound later, per batch size --
         # binding allocates no device memory, so it is capture-safe.
-        if self.kt_config.transport == "doorbell" and self.tp_rank == 0:
+        if (
+            self.kt_config.transport == "doorbell"
+            and self.tp_rank == 0
+            and not _skip_cpu_side
+        ):
             kt_doorbell_init(self.kt_config.transport_pollers)
             if self._cond_enabled:
                 # Allocated here, before any capture: the predicate kernel

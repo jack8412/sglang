@@ -7041,6 +7041,30 @@ class ServerArgs:
                     "GPU-resident experts, so there is nothing to override "
                     "to and the routed contribution would be dropped."
                 )
+            # Full override no longer builds the KT wrapper or loads any CPU
+            # expert weight (kt_ep_wrapper: _skip_cpu_path gates construction),
+            # which is what makes it start in minutes instead of loading ~1.45 TB
+            # it never reads. The two flags below are the ways something would
+            # still go looking for those weights.
+            if self.kt_gpu_prefill_token_threshold:
+                raise ValueError(
+                    "--kt-routing-full-override is incompatible with "
+                    "--kt-gpu-prefill-token-threshold: full override does not "
+                    "load CPU expert weights at all, and the full-GPU prefill "
+                    "path exports them to the device from host staging buffers "
+                    "that were never written. On the MXFP4 layerwise path that "
+                    "raises mid-request; on the other layouts it silently "
+                    "prefills from uninitialised memory. Drop one of them."
+                )
+            if self.kt_expert_swap_interval > 0:
+                raise ValueError(
+                    "--kt-routing-full-override is incompatible with "
+                    "--kt-expert-swap-interval: no token can reach a CPU "
+                    "expert, so there is no demand signal to swap on, and the "
+                    "swap window would call into kt-kernel for weights full "
+                    "override never loaded (C++ 'Not Loaded'). Set the "
+                    "interval to 0 for ceiling runs."
+                )
 
         if not self.disable_shared_experts_fusion:
             self.disable_shared_experts_fusion = True
