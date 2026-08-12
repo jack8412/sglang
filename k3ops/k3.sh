@@ -469,7 +469,7 @@ echo "launched; waiting for /health_generate (log: $LOG)"
 sleep 15
 n=0
 while [ $n -lt 120 ]; do
-  c=$(curl -s -o /dev/null -w "%{http_code}" -m 5 http://127.0.0.1:31000/health_generate 2>/dev/null)
+  c=$(curl -s -o /dev/null -w "%{http_code}" -m 5 http://127.0.0.1:${K3_PORT:-30000}/health_generate 2>/dev/null)
   [ "$c" = "200" ] && { echo "HEALTHY"; exit 0; }
   # A dead launcher must not be waited on for 40 minutes.
   pgrep -f "launch_serve[r]" >/dev/null || {

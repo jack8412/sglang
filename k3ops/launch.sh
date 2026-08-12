@@ -1,40 +1,76 @@
 #!/bin/bash
 # usage: launch.sh <name> [extra server args...]
+#        K3_PROFILE=prod|prod01|margin10|ceiling|bare   (default: prod)
+#        K3_PORT=<n>      server port (default 30000, sglang's well-known one)
+#        K3_RECORD=1      arm the expert-distribution recorder (see below)
+#        K3_PLACE=off     suppress the placement flags entirely
+#
 # The K3 server launcher. Lives in the repo so a bootstrapped node has it
 # (k3.sh serve runs it from the node's sglang checkout); the previous copy
 # lived only on the node and evaporated with the rental.
 #
-# Baked-in defaults = the best-known parameter set, extracted 2026-08-12 from
-# every archived server log of the 2026-08-10/11 campaign (runs/logs). The
-# PRODUCTION recipe on top of these defaults (phases CO/CS, HANDOFF):
+# ---------------------------------------------------------------------------
+# PROFILES
+# ---------------------------------------------------------------------------
+# Margin routing is the product, not a variant: the point of the campaign is to
+# make it faster, and everything else here exists to measure it. So `prod` is
+# the default and carries the full shipping recipe. The instrument profiles are
+# separate rather than "prod minus a flag" for a concrete reason -- see the
+# store_true warning below.
 #
-#   --kt-routing-margin 0.5 --kt-cold-only-cpu-experts \
-#   --kt-expert-swap-interval 50 --kt-expert-swap-max 8
+#   prod      margin 0.5 + cold-only + swapping. Verified end to end by phase
+#             CS: -0.0215 nats vs exact routing, greedy output byte-identical,
+#             swapped-in experts bitwise-match the bulk loader on every NUMA
+#             partition. This is what the numbers in HANDOFF describe.
+#   prod01    the same stack at margin 0.1 -- the quality-first end of the
+#             tradeoff. A smaller margin substitutes LESS, so more tokens reach
+#             their CPU-resident first choice: closer to exact routing and
+#             slower. The sweep that established the shape (phase C, uniform
+#             placement, pre-optimisation build) read 31.8 / 42.0 / 47.7 tok/s
+#             at margin 0.1 / 1.0 / 10. Its nats are UNMEASURED -- margin 0.0
+#             is bit-exact (phase B) and 0.5 is -0.0215, so 0.1 sits between,
+#             but gate it with logprobs before quoting it as a serving option.
+#   margin10  margin 10. NOT a serving mode -- its nats are identical to full
+#             override to four decimals (-0.5942), i.e. the same 31% of experts
+#             made unreachable, 8 tok/s slower. It exists to measure the
+#             sglang-side machinery with almost no CPU compute underneath.
+#   ceiling   full override, no margin at all. The GPU-only floor (83.5 tok/s).
+#   bare      nothing routing-related. For A/B rows that set every knob
+#             themselves, and the only safe base for a row that must NOT have
+#             cold-only or swapping on.
 #
-# Evidence for the non-obvious defaults:
+# WARNING -- trailing args can override a VALUED flag (argparse keeps the last
+# occurrence) but CANNOT unset a store_true one. `--kt-cold-only-cpu-experts`
+# and `--kt-routing-full-override` cannot be turned off by anything you append.
+# A row that needs them off must choose a profile that never sets them.
+#
+# ---------------------------------------------------------------------------
+# Evidence for the non-obvious defaults
+# ---------------------------------------------------------------------------
 # - kt-transport doorbell: RB2 (margin 10) doorbell 75.3 tok/s vs packed
 #   hostnode 57.5; DB (margin 0.5) 43.6 vs 39.0. The server default is still
 #   hostnode, so the launcher sets doorbell explicitly. Full-override ceiling
 #   rows ran hostnode (transport absent from their graph) -- pass
-#   --kt-transport hostnode to reproduce those.
-# - cold-only is NOT a default only because it requires --kt-routing-margin;
-#   use it with every margin run (CO1: outputs byte-identical, -0.0215 nats
+#   --kt-transport hostnode to reproduce those exactly.
+# - cold-only requires --kt-routing-margin, which is why it lives in `prod`
+#   and not in the shared defaults (CO1: outputs byte-identical, -0.0215 nats
 #   unchanged, ~1 TB host RAM freed, weight load 110 s).
 # - attention backends: leave UNSET -- the KimiK3 override resolves all three
 #   to trtllm_mla on SM100/SM103 (verified in every old log). The fa2
 #   UserWarning from the flashinfer prefill wrapper appeared in every old
 #   campaign log too; it is noise, not a config error.
-# - --expert-distribution-recorder-mode stat only on recording runs (F1
-#   pattern) -- no old measurement row ran with the recorder armed.
-# - --kt-gpu-prefill-token-threshold deliberately absent (defaults unset):
-#   the full-GPU sweep is 5.2x slower than margin-routed prefill, costs
-#   7.54 GiB/GPU, and is refused at config time when margin is set.
+# - --kt-gpu-prefill-token-threshold deliberately absent: the full-GPU sweep is
+#   5.2x slower than margin-routed prefill, costs 7.54 GiB/GPU, and is refused
+#   at config time when a margin is set.
+set -u
+
 NAME=${1:?usage: launch.sh <name> [extra server args...]}; shift
 WS=/workspace
 mkdir -p $WS/runs/{status,probes,logs,meta} $WS/runs/edr
 LOG=$WS/runs/logs/$NAME.server.log
 : > $LOG
 export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=$WS/runs/edr
+
 # Prebuilt trtllm-gen MoE cubins. NOT optional for this config: with
 # --moe-runner-backend flashinfer_mxfp4 on SM100 the server REFUSES to start
 # without a valid pool (overrides.py raises; there is no pool-less JIT path).
@@ -49,43 +85,109 @@ for base in /opt/trtllm_gen_moe_cubin_pool /workspace/trtllm_gen_moe_cubin_pool;
 done
 [ -n "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL:-}" ] \
   || echo "WARNING: cubin pool missing ($POOL_VER) -- flashinfer_mxfp4 on SM100 will refuse to start; run k3.sh bootstrap" >> $LOG
+
 source $WS/venv-k3/bin/activate
+
 # Sized to the node, not hardcoded to a rental that no longer exists: one
 # threadpool per NUMA node; cpuinfer ~85% of PHYSICAL cores (RUNBOOK step 3 --
 # AMX is a per-core resource, SMT siblings add nothing). lscpu shows HOST
 # topology and is cgroup-blind, so clamp by nproc (which honors the cpuset):
 # on a container rental granted fewer CPUs than the host has, nproc wins.
+#
+# TWO CAVEATS, because this derivation is not identical to what was measured:
+#  - the whole 2026-08-10/11 campaign ran --kt-cpuinfer 200. On that node this
+#    formula yields 204 (nproc 240 clamps PHYS, 240*85/100), so a rerun is
+#    close but not bit-identical to the archived rows. Pass --kt-cpuinfer 200
+#    to reproduce one exactly.
+#  - the nproc clamp conflates logical with physical: if the cpuset exposes SMT
+#    siblings, PHYS becomes a LOGICAL count and 85% of it oversubscribes the
+#    physical cores AMX actually runs on. Unverified either way on the rental;
+#    check `lscpu -p=Core,Socket` inside the container before trusting it on a
+#    new node.
 PHYS=$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
 [ "$PHYS" -gt 0 ] || PHYS=$(nproc)
 [ "$PHYS" -gt "$(nproc)" ] && PHYS=$(nproc)
 NUMAN=$(numactl --hardware 2>/dev/null | awk '/^available:/{print $2}')
 [ -n "$NUMAN" ] || NUMAN=2
-# Placement: frequency from the newest recorded expert-distribution dump when
-# one exists (the shipping recipe -- uniform placement was the entire quality
-# gap, SPEC-MARGIN-ROUTING F2), else uniform. A measurement phase that must
-# hold placement constant across rows sets K3_PLACE=off: overriding the
-# strategy flag alone is NOT enough, because --init-expert-location would
-# still be passed and it is a generic sglang arg, not a kt one.
-PLACE=""
+
+# Placement: frequency, from the newest recorded expert-distribution dump.
+# This is not a tuning knob -- uniform placement WAS the entire quality gap
+# (SPEC-MARGIN-ROUTING F2: frequency placement reached exact-routing parity at
+# 99.0% gsm8k where uniform did not), and swapping builds on it by promoting
+# high-demand experts into the rows frequency placement assigned.
+#
+# No flag is emitted when there is no dump, rather than naming a strategy: a
+# literal `--kt-expert-placement-strategy uniform` here read as a deliberate
+# choice and quietly produced a quality-wrong run whenever a dump was absent.
+# A measurement phase that must hold placement constant across rows sets
+# K3_PLACE=off -- overriding the strategy flag alone is NOT enough, because
+# --init-expert-location would still be passed and it is a generic sglang arg,
+# not a kt one.
+PLACE=()
+DUMP=""
 if [ "${K3_PLACE:-auto}" != "off" ]; then
   DUMP=$(ls -t $WS/runs/edr/*.pt 2>/dev/null | head -1)
-  [ -n "$DUMP" ] && PLACE="--kt-expert-placement-strategy frequency --init-expert-location $DUMP"
+  [ -n "$DUMP" ] && PLACE=(--kt-expert-placement-strategy frequency --init-expert-location "$DUMP")
 fi
-# --expert-distribution-recorder-mode stat is armed at LAUNCH because it
-# cannot be turned on later: without it /start_expert_distribution_record
-# raises in the scheduler request loop and KILLS the server (RUNBOOK G3),
-# and regenerating a placement profile needs exactly that recording. Idle
-# cost is zero until /start is called.
-#
+
+# The routing skeleton. Everything the campaign varies lives here and nowhere
+# else, so a row's identity is one word rather than a flag list to diff.
+PROFILE=${K3_PROFILE:-prod}
+case "$PROFILE" in
+  prod)     ROUTING=(--kt-routing-margin 0.5 --kt-cold-only-cpu-experts
+                     --kt-expert-swap-interval 50 --kt-expert-swap-max 8) ;;
+  prod01)   ROUTING=(--kt-routing-margin 0.1 --kt-cold-only-cpu-experts
+                     --kt-expert-swap-interval 50 --kt-expert-swap-max 8) ;;
+  margin10) ROUTING=(--kt-routing-margin 10) ;;
+  ceiling)  ROUTING=(--kt-routing-full-override) ;;
+  bare)     ROUTING=() ;;
+  *) echo "FATAL: unknown K3_PROFILE '$PROFILE' (prod|prod01|margin10|ceiling|bare)" | tee -a $LOG >&2; exit 2 ;;
+esac
+
+# The recorder is OPT-IN, and both halves of that matter:
+#  - it cannot be turned on later. With the mode unset the recorder is a Noop
+#    whose start_record() raises, so /start_expert_distribution_record fails in
+#    the scheduler loop. Regenerating a placement profile therefore needs a
+#    RELAUNCH with K3_RECORD=1 -- which is the whole reason the *.pt dumps are
+#    safe to leave off the mirror.
+#  - arming it is not free: expert_distribution_recorder_mode being set trips
+#    _disable_tc_piecewise_cudagraph_if_incompatible, so a recording run has a
+#    different cuda-graph configuration from a measurement run. Never arm it on
+#    a row whose throughput you intend to quote.
+RECORD=()
+if [ "${K3_RECORD:-0}" = "1" ]; then
+  RECORD=(--expert-distribution-recorder-mode stat)
+  echo "[launch] recorder ARMED: this disables tc-piecewise cuda graph; do not quote throughput from this run" | tee -a $LOG >&2
+fi
+
+# A `prod` row without a placement dump is the dangerous case: it starts fine,
+# serves fine, and is quality-wrong -- frequency placement is what closes the
+# gap to exact routing, and swapping promotes into the rows it assigned. Refuse
+# rather than produce a plausible number. The recording run that CREATES a dump
+# legitimately has none, hence the K3_RECORD exemption.
+if [ -z "$DUMP" ] && [ "$PROFILE" = "prod" ] && [ "${K3_RECORD:-0}" != "1" ]; then
+  echo "FATAL: profile prod needs an expert-distribution dump in $WS/runs/edr (none found).
+  Frequency placement is the shipping recipe and uniform placement was the whole
+  quality gap, so this would serve a wrong configuration that looks healthy.
+  Either record one:   K3_RECORD=1 K3_PROFILE=bare launch.sh REC ...
+                       then /start_expert_distribution_record + a workload + dump
+  or state the intent: K3_PROFILE=bare (or margin10 / ceiling)" | tee -a $LOG >&2
+  exit 3
+fi
+[ -z "$DUMP" ] && echo "[launch] no placement dump; sglang will use its default (uniform) placement" | tee -a $LOG >&2
+
+echo "[launch] $NAME profile=$PROFILE place=${PLACE[*]:-none} record=${K3_RECORD:-0}" >> $LOG
+
 # Every flag below can be overridden by passing it again in the extra args:
-# argparse keeps the last value.
+# argparse keeps the last value (store_true flags excepted -- see the warning
+# at the top of this file).
 exec python -m sglang.launch_server \
-  --model-path $WS/k3 --trust-remote-code --tp 8 --port 31000 --host 127.0.0.1 \
+  --model-path $WS/k3 --trust-remote-code --tp 8 --port ${K3_PORT:-30000} --host 127.0.0.1 \
   --kt-method MXFP4 --kt-weight-path $WS/k3 \
   --kt-num-gpu-experts 620 \
   --kt-threadpool-count $NUMAN --kt-cpuinfer $((PHYS * 85 / 100)) \
   --kt-transport doorbell \
-  --kt-expert-placement-strategy uniform $PLACE \
+  "${PLACE[@]}" "${ROUTING[@]}" "${RECORD[@]}" \
   --moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4 \
   --mem-fraction-static 0.90 --context-length 32768 \
   --chunked-prefill-size 16384 \
