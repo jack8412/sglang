@@ -24,7 +24,21 @@ def moe_finalize_fuse_shared(
     shared_output: Optional[torch.Tensor],
     top_k: int,
     enable_pdl: bool = False,
+    acc_in: Optional[torch.Tensor] = None,
+    acc_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Top-k weighted unpermute of ``gemm2_out``, plus an optional shared add.
+
+    ``acc_in`` / ``acc_out`` are fp32 ``[num_tokens, hidden_dim]`` partial sums
+    that let one token's top-k be summed across SEVERAL launches over disjoint
+    expert slices (see ``expert_split_moe``).  Accumulation stays in fp32 the
+    whole way, so the result is rounded to bf16 exactly once -- as it is in a
+    single unsplit launch.  Pass ``acc_out`` on every slice but the last, and
+    ``acc_in`` on every slice but the first.
+
+    Returns the bf16 result, or ``acc_out`` itself when this launch produces a
+    partial (in which case no bf16 output is written).
+    """
     assert gemm2_out.dtype == torch.bfloat16
     assert expert_weights.dtype in (torch.float32, torch.bfloat16)
     assert expanded_idx_to_permuted_idx.dtype == torch.int32
@@ -42,19 +56,34 @@ def moe_finalize_fuse_shared(
         hidden_dim = shared_output.shape[1]
         assert hidden_dim <= gemm2_out.shape[1]
 
-    out = torch.empty(
-        num_tokens, hidden_dim, dtype=torch.bfloat16, device=gemm2_out.device
-    )
-    if shared_output is None:
-        shared_output = gemm2_out.new_empty((0, 0), dtype=torch.bfloat16)
+    empty = gemm2_out.new_empty((0, 0), dtype=torch.bfloat16)
+    if acc_out is None:
+        out = torch.empty(
+            num_tokens, hidden_dim, dtype=torch.bfloat16, device=gemm2_out.device
+        )
+    else:
+        # This launch writes the fp32 partial instead of a bf16 result; the
+        # accumulator carries the FINAL hidden dim, which may be narrower than
+        # gemm2_out's padded one.
+        assert acc_out.dtype == torch.float32
+        assert shared_output is None, "shared_output must be added on the last slice"
+        assert acc_out.shape[0] == num_tokens
+        hidden_dim = acc_out.shape[1]
+        assert hidden_dim <= gemm2_out.shape[1]
+        out = empty
+    if acc_in is not None:
+        assert acc_in.dtype == torch.float32
+        assert acc_in.shape == (num_tokens, hidden_dim)
 
     _jit_module().moe_finalize_fuse_shared(
         out,
         gemm2_out,
         expanded_idx_to_permuted_idx,
         expert_weights,
-        shared_output,
+        empty if shared_output is None else shared_output,
+        empty if acc_in is None else acc_in,
+        empty if acc_out is None else acc_out,
         int(top_k),
         bool(enable_pdl),
     )
-    return out
+    return acc_out if acc_out is not None else out

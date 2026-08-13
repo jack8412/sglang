@@ -22,56 +22,45 @@ The combine is exact, for two reasons that both have to hold:
   contributes exactly its own experts and the sum over a partition equals the
   whole.
 
-Verified bitwise against a single 896-expert call at T = 4K/16K/30K/48K, with
-slot accounting exact (resident + cold = T*top_k, overlap 0).
+The two slices are combined through finalize's fp32 accumulator rather than by
+concatenating their gemm2 buffers: each deferred call sizes its buffer for ALL
+T*top_k slots, so holding both plus a concatenation costs 3.5x the single
+call's peak (22.1 GiB vs 6.3 at T=48K) and will not fit beside a live server.
+Accumulating keeps the peak at one call's workspace plus an fp32 [T, hidden]
+buffer, and -- because the accumulation never leaves fp32 -- the result is
+rounded to bf16 exactly once, as an unsplit call does.
+
+Verified against a single 896-expert call at T = 4K/16K/30K/48K, with slot
+accounting exact (resident + cold = T*top_k, overlap 0).
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
 
-def merge_deferred_partials(
-    *,
-    gemm2_a: torch.Tensor,
-    idx_a: torch.Tensor,
-    gemm2_b: torch.Tensor,
-    idx_b: torch.Tensor,
-    validate: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Concatenate two ``do_finalize=False`` results into one finalize input.
+def assert_slices_partition(idx_a: torch.Tensor, idx_b: torch.Tensor) -> None:
+    """Every (token, k) slot must be owned by exactly one of the two slices.
 
-    Each call returns ``gemm2_out`` in ITS OWN permuted row space plus
-    ``expanded_idx_to_permuted_idx`` with -1 for slots it does not own.  The
-    two index vectors are disjoint by construction, so shifting b's valid
-    indices past a's rows yields a single combined gather.
-
-    Returns ``(gemm2_out, expanded_idx)`` ready for ``moe_finalize_fuse_shared``.
-
-    ``validate`` asserts disjointness -- cheap relative to the GEMMs but it
-    syncs, so it is off by default and used in tests and boot checks.
+    Both index vectors mark slots they do not own as -1, so a slot claimed by
+    both means the slices overlap (an expert would be counted twice) and a slot
+    claimed by neither means an expert is unreachable (silently dropped from
+    the token's sum).  Syncs, so this is a test/boot gate, not a hot path.
     """
-    n_rows_a = gemm2_a.shape[0]
-    idx_b_shifted = torch.where(idx_b >= 0, idx_b + n_rows_a, idx_b)
-    expanded_idx = torch.where(idx_a >= 0, idx_a, idx_b_shifted)
-
-    if validate:
-        both = (idx_a >= 0) & (idx_b >= 0)
-        if bool(both.any()):
-            raise RuntimeError(
-                f"split-moe: {int(both.sum())} slots claimed by BOTH expert "
-                "slices -- the slices are not disjoint"
-            )
-        neither = (idx_a < 0) & (idx_b < 0)
-        if bool(neither.any()):
-            raise RuntimeError(
-                f"split-moe: {int(neither.sum())} slots claimed by NEITHER "
-                "slice -- some experts are unreachable"
-            )
-
-    return torch.cat([gemm2_a, gemm2_b], dim=0), expanded_idx
+    both = (idx_a >= 0) & (idx_b >= 0)
+    if bool(both.any()):
+        raise RuntimeError(
+            f"split-moe: {int(both.sum())} slots claimed by BOTH expert "
+            "slices -- the slices are not disjoint"
+        )
+    neither = (idx_a < 0) & (idx_b < 0)
+    if bool(neither.any()):
+        raise RuntimeError(
+            f"split-moe: {int(neither.sum())} slots claimed by NEITHER "
+            "slice -- some experts are unreachable"
+        )
 
 
 def split_slice_moe(
@@ -126,14 +115,36 @@ def split_slice_moe(
             do_finalize=False,
         )
 
-    gemm2_r, weights, idx_r = _call(resident, 0, num_resident)
-    gemm2_c, _, idx_c = _call(cold, num_resident, num_experts - num_resident)
+    # Each deferred call allocates a gemm2 buffer sized for ALL T*top_k slots
+    # (it cannot know how many land in its own slice), so holding both at once
+    # -- let alone torch.cat'ing them into a third -- costs 3.5x the single
+    # call's peak and does not fit beside a live server.  Instead the resident
+    # slice is finalized into an fp32 accumulator and its gemm2 buffer freed
+    # before the cold call allocates; the cold slice then adds into that
+    # accumulator and rounds once.  Peak is one call's workspace plus the
+    # accumulator, and the result rounds to bf16 exactly as an unsplit call
+    # would.
+    num_tokens = packed_topk.shape[0]
+    if shared_output is not None:
+        hidden_size = shared_output.shape[1]
+    else:
+        # uint8 hidden states are fp4 pairs -- two elements per byte.
+        hidden_size = hidden_states.shape[-1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size *= 2
 
-    gemm2_out, expanded_idx = merge_deferred_partials(
-        gemm2_a=gemm2_r, idx_a=idx_r,
-        gemm2_b=gemm2_c, idx_b=idx_c,
-        validate=validate,
+    gemm2_r, weights, idx_r = _call(resident, 0, num_resident)
+    acc = torch.empty(
+        num_tokens, hidden_size, dtype=torch.float32, device=gemm2_r.device
     )
+    moe_finalize_fuse_shared(
+        gemm2_r, idx_r, weights, None, top_k, acc_out=acc
+    )
+    del gemm2_r
+
+    gemm2_c, _, idx_c = _call(cold, num_resident, num_experts - num_resident)
+    if validate:
+        assert_slices_partition(idx_r, idx_c)
     return moe_finalize_fuse_shared(
-        gemm2_out, expanded_idx, weights, shared_output, top_k
+        gemm2_c, idx_c, weights, shared_output, top_k, acc_in=acc
     )

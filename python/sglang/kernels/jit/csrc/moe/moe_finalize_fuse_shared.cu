@@ -75,7 +75,9 @@ __global__ void moeFinalizeKernel(
     int const* __restrict__ expandedIdxToPermutedIdx,
     TypeExpW const* __restrict__ expertWeightsPtr,
     BF16 const* __restrict__ sharedBiasPtr,
-    BF16* __restrict__ outPtr) {
+    BF16* __restrict__ outPtr,
+    float const* __restrict__ accInPtr,
+    float* __restrict__ accOutPtr) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaGridDependencySynchronize();
 #endif
@@ -94,10 +96,17 @@ __global__ void moeFinalizeKernel(
         float const val = static_cast<float>(inPtr[permutedIdx * hiddenDimPadded + hiddenIdx]);
         acc += scale * val;
       }
+      if (accInPtr != nullptr) {
+        acc += accInPtr[tokenIdx * hiddenDim + hiddenIdx];
+      }
       if (sharedBiasPtr != nullptr) {
         acc += static_cast<float>(sharedBiasPtr[tokenIdx * hiddenDim + hiddenIdx]);
       }
-      outPtr[tokenIdx * hiddenDim + hiddenIdx] = static_cast<BF16>(acc);
+      if (accOutPtr != nullptr) {
+        accOutPtr[tokenIdx * hiddenDim + hiddenIdx] = acc;
+      } else {
+        outPtr[tokenIdx * hiddenDim + hiddenIdx] = static_cast<BF16>(acc);
+      }
     }
   }
 
@@ -145,7 +154,9 @@ __global__ void moeFinalizeKernelVecLoad(
     int const* __restrict__ expandedIdxToPermutedIdx,
     TypeExpW const* __restrict__ expertWeightsPtr,
     BF16 const* __restrict__ sharedBiasPtr,
-    BF16* __restrict__ outPtr) {
+    BF16* __restrict__ outPtr,
+    float const* __restrict__ accInPtr,
+    float* __restrict__ accOutPtr) {
   static_assert(
       TopKUnrollFactor == 1 || TopKUnrollFactor == 2 || TopKUnrollFactor == 4, "TopKUnrollFactor must be 1, 2, or 4");
   using IdxPackedType = typename IdxPackedTraits<TopKUnrollFactor>::Packed;
@@ -179,11 +190,14 @@ __global__ void moeFinalizeKernelVecLoad(
     }
   }
 
-  BF16* outputPtr = outPtr + tokenIdx * hiddenDim;
-  auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
+  // outPtr is null when this launch produces an fp32 partial instead.
+  auto* outElemPtr = outPtr != nullptr ? reinterpret_cast<OutputElem*>(outPtr + tokenIdx * hiddenDim) : nullptr;
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(inPtr);
   auto const* sharedElemPtr =
       sharedBiasPtr != nullptr ? reinterpret_cast<InputElem const*>(sharedBiasPtr + tokenIdx * hiddenDim) : nullptr;
+  // fp32 accumulator rows: 8 floats per thread-element = two 128-bit accesses.
+  auto const* accInRow = accInPtr != nullptr ? accInPtr + tokenIdx * hiddenDim : nullptr;
+  auto* accOutRow = accOutPtr != nullptr ? accOutPtr + tokenIdx * hiddenDim : nullptr;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaGridDependencySynchronize();
@@ -224,6 +238,20 @@ __global__ void moeFinalizeKernelVecLoad(
       }
     }
 
+    if (accInRow != nullptr) {
+      float const* accSlot = accInRow + elemIndex * FINALIZE_ELEM_PER_THREAD;
+      float4 lo = vectorizedLoadPtx(reinterpret_cast<float4 const*>(accSlot));
+      float4 hi = vectorizedLoadPtx(reinterpret_cast<float4 const*>(accSlot + 4));
+      threadOutput[0] += lo.x;
+      threadOutput[1] += lo.y;
+      threadOutput[2] += lo.z;
+      threadOutput[3] += lo.w;
+      threadOutput[4] += hi.x;
+      threadOutput[5] += hi.y;
+      threadOutput[6] += hi.z;
+      threadOutput[7] += hi.w;
+    }
+
     if (sharedElemPtr != nullptr) {
       float4 shared = vectorizedLoadPtx(reinterpret_cast<float4 const*>(&sharedElemPtr[elemIndex]));
       InputElem sharedElem = *reinterpret_cast<InputElem const*>(&shared);
@@ -235,8 +263,16 @@ __global__ void moeFinalizeKernelVecLoad(
       }
     }
 
-    cutlass::NumericArrayConverter<BF16, float, FINALIZE_ELEM_PER_THREAD> toBF16;
-    outElemPtr[elemIndex] = toBF16(threadOutput);
+    if (accOutRow != nullptr) {
+      float* accSlot = accOutRow + elemIndex * FINALIZE_ELEM_PER_THREAD;
+#pragma unroll
+      for (int e = 0; e < FINALIZE_ELEM_PER_THREAD; ++e) {
+        accSlot[e] = threadOutput[e];
+      }
+    } else {
+      cutlass::NumericArrayConverter<BF16, float, FINALIZE_ELEM_PER_THREAD> toBF16;
+      outElemPtr[elemIndex] = toBF16(threadOutput);
+    }
   }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -258,6 +294,8 @@ void dispatchFinalize(
     void const* weightsPtrVoid,
     BF16 const* sharedPtr,
     BF16* outPtr,
+    float const* accInPtr,
+    float* accOutPtr,
     bool useVecLoad,
     cudaStream_t stream,
     cudaLaunchAttribute const* attrs,
@@ -287,7 +325,9 @@ void dispatchFinalize(
         expandedIdxPtr,
         weightsPtr,
         sharedPtr,
-        outPtr);
+        outPtr,
+        accInPtr,
+        accOutPtr);
     return;
   }
 
@@ -311,7 +351,9 @@ void dispatchFinalize(
         expandedIdxPtr,
         weightsPtr,
         sharedPtr,
-        outPtr);
+        outPtr,
+        accInPtr,
+        accOutPtr);
   };
   // Match flashinfer's LAUNCH_TOPK_EXPW dispatch order.
   if (topK % 4 == 0) {
@@ -328,21 +370,33 @@ void dispatchFinalize(
 // ---------------------------------------------------------------------------
 // Host launcher
 // ---------------------------------------------------------------------------
-void moe_finalize_fuse_shared(
+// ``acc_in`` / ``acc_out`` are fp32 [numTokens, hiddenDim] partial-sum buffers,
+// either of which may be empty. They let one token's top-k sum be split across
+// several launches (disjoint expert slices) while keeping the accumulation in
+// fp32 throughout, so the result rounds to bf16 exactly once -- as it would in
+// a single unsplit call. Empty acc_out means "produce the bf16 result now".
+static void finalizeImpl(
     TensorView out,
     TensorView gemm2_out,
     TensorView expanded_idx_to_permuted_idx,
     TensorView expert_weights,
     TensorView shared_output,
+    TensorView acc_in,
+    TensorView acc_out,
     int64_t top_k,
     bool enable_pdl) {
-  TVM_FFI_ICHECK_EQ(out.ndim(), 2) << "out must be 2-D [numTokens, hiddenDim]";
   TVM_FFI_ICHECK_EQ(gemm2_out.ndim(), 2) << "gemm2_out must be 2-D [totalNumPaddedTokens, hiddenDimPadded]";
   TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.ndim(), 1);
   TVM_FFI_ICHECK_EQ(expert_weights.ndim(), 2) << "expert_weights must be 2-D [numTokens, topK]";
 
-  int const numTokens = int(out.size(0));
-  int const hiddenDim = int(out.size(1));
+  bool const hasAccOut = acc_out.numel() > 0;
+  bool const hasAccIn = acc_in.numel() > 0;
+  // Dimensions come from whichever destination this launch writes.
+  TensorView const& shape_src = hasAccOut ? acc_out : out;
+  TVM_FFI_ICHECK_EQ(shape_src.ndim(), 2) << "destination must be 2-D [numTokens, hiddenDim]";
+
+  int const numTokens = int(shape_src.size(0));
+  int const hiddenDim = int(shape_src.size(1));
   int const hiddenDimPadded = int(gemm2_out.size(1));
   TVM_FFI_ICHECK_LE(top_k, sglang::MAX_TOPK);
   TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.size(0), numTokens * top_k);
@@ -356,13 +410,21 @@ void moe_finalize_fuse_shared(
     TVM_FFI_ICHECK_EQ(shared_output.size(1), hiddenDim);
   }
 
+  if (hasAccIn) {
+    TVM_FFI_ICHECK_EQ(acc_in.ndim(), 2);
+    TVM_FFI_ICHECK_EQ(acc_in.size(0), numTokens);
+    TVM_FFI_ICHECK_EQ(acc_in.size(1), hiddenDim);
+  }
+
   auto const* inPtr = static_cast<sglang::BF16 const*>(gemm2_out.data_ptr());
   auto const* expandedIdxPtr = static_cast<int const*>(expanded_idx_to_permuted_idx.data_ptr());
   auto const* sharedPtr = hasShared ? static_cast<sglang::BF16 const*>(shared_output.data_ptr()) : nullptr;
-  auto* outPtr = static_cast<sglang::BF16*>(out.data_ptr());
+  auto* outPtr = hasAccOut ? nullptr : static_cast<sglang::BF16*>(out.data_ptr());
+  auto const* accInPtr = hasAccIn ? static_cast<float const*>(acc_in.data_ptr()) : nullptr;
+  auto* accOutPtr = hasAccOut ? static_cast<float*>(acc_out.data_ptr()) : nullptr;
 
-  cudaSetDevice(out.device().device_id);
-  cudaStream_t const stream = get_stream(out.device());
+  cudaSetDevice(shape_src.device().device_id);
+  cudaStream_t const stream = get_stream(shape_src.device());
 
   // Dispatch heuristic (matches flashinfer): few waves → general kernel,
   // many waves → vectorized. The 1184 threshold comes from 148 SMs × 8
@@ -388,6 +450,8 @@ void moe_finalize_fuse_shared(
         expert_weights.data_ptr(),
         sharedPtr,
         outPtr,
+        accInPtr,
+        accOutPtr,
         useVecLoad,
         stream,
         attrs,
@@ -403,6 +467,8 @@ void moe_finalize_fuse_shared(
         expert_weights.data_ptr(),
         sharedPtr,
         outPtr,
+        accInPtr,
+        accOutPtr,
         useVecLoad,
         stream,
         attrs,
@@ -413,6 +479,24 @@ void moe_finalize_fuse_shared(
 
   cudaError_t const err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess) << "moe_finalize_fuse_shared launch failed: " << cudaGetErrorString(err);
+}
+
+// ``acc_in`` / ``acc_out`` follow the same empty-tensor-means-absent convention
+// as ``shared_output``: pass an empty acc_in on the first expert slice and an
+// empty acc_out on the last (which applies shared_output and writes bf16 into
+// ``out``). Both empty reproduces the original single-launch behaviour.
+void moe_finalize_fuse_shared(
+    TensorView out,
+    TensorView gemm2_out,
+    TensorView expanded_idx_to_permuted_idx,
+    TensorView expert_weights,
+    TensorView shared_output,
+    TensorView acc_in,
+    TensorView acc_out,
+    int64_t top_k,
+    bool enable_pdl) {
+  finalizeImpl(
+      out, gemm2_out, expanded_idx_to_permuted_idx, expert_weights, shared_output, acc_in, acc_out, top_k, enable_pdl);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_finalize_fuse_shared, moe_finalize_fuse_shared);
