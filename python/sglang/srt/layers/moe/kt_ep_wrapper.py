@@ -5123,17 +5123,24 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 logical_id = int(self.gpu_index_to_logical[gpu_idx].item())
                 allocator.map_resident(logical_id, {name: param.data[gpu_idx]})
 
-        # Save the original [620, ...] parameters for decode (the KT path
-        # uses ID remapping + margin routing that expects the 620-expert
-        # tensor).  During prefill _vmm_prefill_forward swaps in the VMM
-        # [896, ...] tensor; during decode the layer keeps these 620-expert
-        # tensors as-is.
-        self._vmm_decode_params = {}
+        # Replace the layer parameters with VMM-backed [896, ...] tensors.
+        # The VMM tensor has 620 resident experts at their logical positions
+        # and 276 cold experts unbacked.  Both decode and prefill use this
+        # tensor — decode masks cold expert IDs to -1 (existing behavior) but
+        # does NOT remap resident IDs (no logical→gpu_index), since the VMM
+        # tensor is indexed by logical ID directly.
+        self._vmm_decode_params = {}  # no longer used for swapping
         for name in self._VMM_WEIGHT_NAMES:
             if name not in weight_specs:
                 continue
-            # Keep the layer's existing [620, ...] parameter for decode.
-            self._vmm_decode_params[name] = getattr(layer, name)
+            # Free the original [620, ...] PyTorch parameter to avoid
+            # doubling VRAM — its data is now in the VMM-backed pages.
+            old_param = getattr(layer, name)
+            vmm_tensor = allocator.get_tensor(name)
+            setattr(layer, name, torch.nn.Parameter(
+                vmm_tensor, requires_grad=False
+            ))
+            del old_param
 
         self._vmm_allocator = allocator
 
@@ -5164,10 +5171,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         No margin routing, no ID remapping, no CPU path — the kernel sees
         the full [896, ...] VMM tensor and accesses all experts directly.
         Cold expert pages are mapped by the ExpertPipeline before this call.
-
-        The layer's weight parameters are temporarily swapped to the VMM
-        [896, ...] tensors for this forward, then restored to the [620, ...]
-        decode tensors so the next decode step uses the normal KT path.
+        The layer's parameters are already the VMM tensor (set in
+        _setup_vmm_weights), so no swapping is needed.
         """
         pipeline = _get_or_init_vmm_pipeline(layer)
         layer_idx = self.kt_config.layer_idx
@@ -5176,30 +5181,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if pipeline is not None:
             pipeline.wait_prefetch(layer_idx)
 
-        # Swap in VMM [896, ...] tensors for the full-expert forward.
-        # The VMM tensor was created in _setup_vmm_weights and stored on
-        # the allocator; the decode [620, ...] tensors are in
-        # self._vmm_decode_params.
-        swapped = False
-        if self._vmm_allocator is not None and self._vmm_decode_params:
-            for name in self._VMM_WEIGHT_NAMES:
-                if name in self._vmm_decode_params:
-                    vmm_tensor = self._vmm_allocator.get_tensor(name)
-                    setattr(layer, name, torch.nn.Parameter(
-                        vmm_tensor, requires_grad=False
-                    ))
-            # num_local_experts must be 896 for the kernel to see all experts.
-            with _scoped_layer_num_local_experts(layer, self.global_num_experts):
-                gpu_combine_input = self.gpu_method.apply(layer, dispatch_output)
-            swapped = True
-        else:
+        # Run the GPU MoE with the full [896, ...] VMM tensor.
+        # No _scoped_layer_num_local_experts — the layer's num_local_experts
+        # must be 896 for the kernel to see all experts.
+        with _scoped_layer_num_local_experts(layer, self.global_num_experts):
             gpu_combine_input = self.gpu_method.apply(layer, dispatch_output)
-
-        # Restore the [620, ...] decode tensors.
-        if swapped:
-            for name in self._VMM_WEIGHT_NAMES:
-                if name in self._vmm_decode_params:
-                    setattr(layer, name, self._vmm_decode_params[name])
 
         # Signal compute done + prefetch next layer + unmap previous.
         if pipeline is not None:
@@ -5751,11 +5737,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _kt_t_after_submit = time.perf_counter()
 
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
-        # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
+        # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices.
+        # When VMM is active, the layer's weight tensor is [896,...] indexed by
+        # logical ID — no remapping needed, only mask cold experts to -1.
         topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_and_remap_expert_ids(
-            topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
-        )
+        if self._expert_vmm:
+            # Mask-only: set cold expert IDs to -1, keep resident IDs as-is.
+            is_gpu = self.gpu_experts_mask_cuda[topk_ids]
+            masked_topk_ids = torch.where(is_gpu, topk_ids, -1)
+        else:
+            masked_topk_ids = mask_and_remap_expert_ids(
+                topk_ids, self.gpu_experts_mask_cuda,
+                self.logical_to_gpu_index_cuda,
+            )
 
         # Create modified dispatch output for GPU computation
         masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
@@ -5802,7 +5796,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             gpu_combine_input = None
             output = torch.zeros_like(x)
         else:
-            with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
+            # VMM mode: the weight tensor is [896,...] indexed by logical ID,
+            # so num_local_experts must be 896 for the kernel.  Non-VMM: the
+            # tensor is [620,...] indexed by gpu_index (0-619).
+            scope_n = self.global_num_experts if self._expert_vmm else self.num_gpu_experts
+            with _scoped_layer_num_local_experts(layer, scope_n):
                 gpu_combine_input = self.gpu_method.apply(
                     layer, masked_dispatch_output
                 )
