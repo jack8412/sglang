@@ -51,7 +51,7 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_buffer, get_parallel, get_stream
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
-from sglang.srt.utils import get_compiler_backend, is_cuda
+from sglang.srt.utils import get_compiler_backend, is_cuda, set_weight_attrs
 
 if is_cuda():
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
@@ -4801,18 +4801,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         ):
             layer_max_deferred = 0
 
-        # 1. Create weights for GPU experts using the wrapped method
-        # GPU weights are indexed by gpu_index (0 to num_gpu_experts-1), not logical expert ID
-        # The mapping logical_to_gpu_index is used to remap IDs during weight loading and inference
-        with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
-            self.gpu_method.create_weights(
-                layer=layer,
-                num_experts=self.num_gpu_experts,
-                hidden_size=hidden_size,
-                intermediate_size_per_partition=intermediate_size_per_partition,
-                params_dtype=params_dtype,
+        # 1. Create weights for GPU experts.
+        # VMM mode: allocate [896,...] via VMM directly — 620 resident pages
+        # backed (positions 0-619), 276 cold pages unbacked (620-895).
+        # The weight loader fills 0-619 (via existing remapping); the shuffle
+        # processes 0-619; positions 620-895 stay unbacked until prefill.
+        # Non-VMM: create [620,...] PyTorch params as before.
+        if self._expert_vmm:
+            self._create_vmm_weights(
+                layer, num_experts, hidden_size,
+                intermediate_size_per_partition, params_dtype,
                 **extra_weight_attrs,
             )
+        else:
+            with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
+                self.gpu_method.create_weights(
+                    layer=layer,
+                    num_experts=self.num_gpu_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size_per_partition=intermediate_size_per_partition,
+                    params_dtype=params_dtype,
+                    **extra_weight_attrs,
+                )
 
         # Move mask and mapping tables to GPU for inference
         target_device = next(layer.parameters()).device
@@ -5046,14 +5056,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.num_gpu_experts > 0 and hasattr(
             self.gpu_method, "process_weights_after_loading"
         ):
-            with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
+            # VMM mode: shuffle only the 620 resident positions (0-619).
+            # Non-VMM: shuffle the [620,...] tensor.
+            scope_n = self.num_gpu_experts
+            with _scoped_layer_num_local_experts(layer, scope_n):
                 self.gpu_method.process_weights_after_loading(layer)
-
-        # 1b. VMM expert mode: migrate the 620 shuffled resident experts
-        # into a VMM-backed [896, ...] tensor.  Cold expert VA is left
-        # unbacked — mapped on demand during prefill by ExpertPipeline.
-        if self._expert_vmm and self.num_gpu_experts > 0:
-            self._setup_vmm_weights(layer)
 
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
@@ -5082,82 +5089,91 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
     # -- VMM expert pipeline -------------------------------------------------
 
-    # The four parameter names that process_weights_after_loading rebinds
-    # to the shuffled trtllm-gen layout (see _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
-    # at line 262).
     _VMM_WEIGHT_NAMES = ("w13_weight", "w13_weight_scale_inv",
                          "w2_weight", "w2_weight_scale_inv")
 
-    def _setup_vmm_weights(self, layer: torch.nn.Module) -> None:
-        """Migrate the 620 shuffled resident experts from torch.Parameters
-        into a VMM-backed [896, ...] tensor, then replace the layer
-        parameters with the VMM tensor.  Cold expert VA is left unbacked."""
+    def _create_vmm_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        """Allocate [896,...] weight tensors via VMM, backing only the 620
+        resident positions (0-619).  The 276 cold positions (620-895) are
+        left as unbacked VA.  The weight loader and shuffle operate on the
+        VMM tensor directly — no PyTorch allocation, no copy.
+        """
         from sglang.srt.layers.moe.expert_vmm import ExpertVmmAllocator
 
-        device_id = next(layer.parameters()).device.index
         target_device = next(layer.parameters()).device
+        device_id = target_device.index
 
-        # Build weight specs from the existing (shuffled) parameters.
-        weight_specs = {}
-        for name in self._VMM_WEIGHT_NAMES:
-            param = getattr(layer, name, None)
-            if param is None:
-                continue
-            # Shape excluding the expert dim: param.shape[1:]
-            weight_specs[name] = (param.shape[1:], param.dtype)
+        # Determine the weight shapes by asking the inner method what it
+        # would create, without actually creating.  We know the shapes from
+        # DeepSeekMxfp4MoEMethod.create_weights:
+        #   w13_weight: [num_experts, 2*inter, hidden//2] int8
+        #   w2_weight:  [num_experts, hidden, inter//2] int8
+        #   w13_weight_scale_inv: [num_experts, 2*inter, hidden//32] float32
+        #   w2_weight_scale_inv:  [num_experts, hidden, inter//32] float32
+        inter = intermediate_size_per_partition
+        w13_shape = (2 * inter, hidden_size // 2)
+        w2_shape = (hidden_size, inter // 2)
+        w13_scale_shape = (2 * inter, hidden_size // 32)
+        w2_scale_shape = (hidden_size, inter // 32)
+
+        weight_specs = {
+            "w13_weight": (w13_shape, torch.int8),
+            "w2_weight": (w2_shape, torch.int8),
+            "w13_weight_scale_inv": (w13_scale_shape, torch.float32),
+            "w2_weight_scale_inv": (w2_scale_shape, torch.float32),
+        }
 
         allocator = ExpertVmmAllocator(
             device_id=device_id,
             layer_idx=self.kt_config.layer_idx,
             weight_specs=weight_specs,
-            num_experts=self.global_num_experts,
+            num_experts=num_experts,
             gpu_experts_mask=self.gpu_experts_mask,
         )
 
-        # Copy each resident expert's shuffled data into VMM-backed pages.
+        # Back the 620 resident positions (0-619) with physical pages.
+        # The weight loader will write to these; the shuffle will process
+        # them in-place.  Cold positions (620-895) stay unbacked.
         for name in self._VMM_WEIGHT_NAMES:
-            param = getattr(layer, name, None)
-            if param is None:
-                continue
+            spec = allocator._weight_specs[name]
             for gpu_idx in range(self.num_gpu_experts):
-                logical_id = int(self.gpu_index_to_logical[gpu_idx].item())
-                allocator.map_resident(logical_id, {name: param.data[gpu_idx]})
+                # Resident experts are at positions 0-619 (dense, matching
+                # the existing logical_to_gpu_index mapping).
+                empty = torch.zeros(
+                    spec["shape"][1:], dtype=spec["dtype"], device=target_device,
+                )
+                allocator._map_one(gpu_idx, name, empty)
 
-        # Replace the layer parameters with VMM-backed [896, ...] tensors.
-        # The VMM tensor has 620 resident experts at their logical positions
-        # and 276 cold experts unbacked.  Both decode and prefill use this
-        # tensor — decode masks cold expert IDs to -1 (existing behavior) but
-        # does NOT remap resident IDs (no logical→gpu_index), since the VMM
-        # tensor is indexed by logical ID directly.
-        self._vmm_decode_params = {}  # no longer used for swapping
+        # Register VMM-backed tensors as layer parameters.
         for name in self._VMM_WEIGHT_NAMES:
-            if name not in weight_specs:
-                continue
-            # Free the original [620, ...] PyTorch parameter to avoid
-            # doubling VRAM — its data is now in the VMM-backed pages.
-            old_param = getattr(layer, name)
             vmm_tensor = allocator.get_tensor(name)
-            setattr(layer, name, torch.nn.Parameter(
-                vmm_tensor, requires_grad=False
-            ))
-            del old_param
+            param = torch.nn.Parameter(vmm_tensor, requires_grad=False)
+            # Apply the same extra attrs the inner method would set.
+            set_weight_attrs(param, extra_weight_attrs)
+            layer.register_parameter(name, param)
 
         self._vmm_allocator = allocator
 
-        # Register in the process-global list so the pipeline can find
-        # all layer allocators.
+        # Register in the process-global registry.
+        global _KT_VMM_ALLOCATORS
         if self.kt_config.layer_idx == 0:
-            # First layer: initialize the global registry.
-            global _KT_VMM_ALLOCATORS
             _KT_VMM_ALLOCATORS = {}
         _KT_VMM_ALLOCATORS[self.kt_config.layer_idx] = allocator
 
         logger.info(
-            "[kt-expert-vmm] layer=%s: %d resident experts migrated to VMM, "
-            "%d cold experts VA reserved (unbacked)",
+            "[kt-expert-vmm] layer=%s: %d resident VMM pages backed, "
+            "%d cold VA unbacked",
             self.kt_config.layer_idx,
             self.num_gpu_experts,
-            self.global_num_experts - self.num_gpu_experts,
+            num_experts - self.num_gpu_experts,
         )
 
     def _vmm_prefill_forward(
