@@ -5108,7 +5108,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         from sglang.srt.layers.moe.expert_vmm import ExpertVmmAllocator
 
-        target_device = next(layer.parameters()).device
+        # The layer has no parameters yet (we're called from create_weights,
+        # before the inner method registers anything).  Use the CUDA device
+        # from the layer's existing tensors (e.g. attention weights) or the
+        # current device.
+        try:
+            target_device = next(layer.parameters()).device
+        except StopIteration:
+            target_device = torch.device("cuda", torch.cuda.current_device())
         device_id = target_device.index
 
         # Determine the weight shapes by asking the inner method what it
