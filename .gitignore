@@ -286,3 +286,10 @@ internal-docs/
 /RUNBOOK.md
 BENCHMARK.md
 SPEC-MARGIN-ROUTING.md
+
+# Experiment registry: phase results, server logs, probe JSON (local-only,
+# mirrored off the rented node which can disappear at any time)
+/runs/
+SPEC-DOORBELL-TRANSPORT.md
+HANDOFF.md
+SPEC-COLD-ONLY-RESIDENCY.md
