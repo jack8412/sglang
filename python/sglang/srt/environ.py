@@ -1379,6 +1379,13 @@ class Envs:
     # exactly once. Costs a device sync per layer, so it is a debug gate, not
     # a production default.
     SGLANG_KT_VERIFY_SPLIT_PREFILL = EnvBool(False)
+    # Per-layer copy/compute overlap for the cold-expert prefetch: how long the
+    # compute stream sat blocked on each layer's weights, and how the copy
+    # duration compares with the compute window it has to hide under. Events
+    # are recorded during the pass and read at the next reset, so no sync is
+    # added to the hot path -- but the summary log is per forward, so this is
+    # a triage knob rather than a production default.
+    SGLANG_DEBUG_KT_PIPELINE_OVERLAP = EnvBool(False)
     # P0 ablation for the doorbell-transport design: skip ONLY the two
     # cudaLaunchHostFunc submissions (submit/sync) while keeping the staging
     # D2H, the result H2D and the merge-add. Differencing this against the
