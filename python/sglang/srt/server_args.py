@@ -3038,6 +3038,11 @@ class ServerArgs:
         "Route every token entirely to GPU-resident experts: each CPU-resident pick is replaced by the token's best not-yet-selected GPU-resident expert, whatever the router-logit gap. Because no token can then reach a CPU expert, the per-layer CPU round-trip (staging copy, submit, sync, merge) is skipped statically. Requires at least top_k GPU-resident experts per layer and forces --kt-max-deferred-experts-per-token to 0.",
         NS("exec.moe"),
     ] = False
+    kt_expert_vmm: A[
+        bool,
+        "Allocate all expert weights via CUDA VMM so cold experts can be dynamically backed/unbacked per layer during prefill. Enables quality-identical full-expert prefill without CPU expert compute. Cold experts are loaded from CPU and swizzled on-the-fly into VMM-backed pages.",
+        NS("exec.moe"),
+    ] = False
     record_kt_gpu_expert_distribution: A[
         bool,
         "[ktransformers parameter] Record the per-layer GPU-resident expert mask each forward pass; dumped with the expert distribution stats.",

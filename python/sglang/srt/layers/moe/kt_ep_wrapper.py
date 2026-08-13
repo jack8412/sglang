@@ -211,6 +211,7 @@ class KTConfig:
     expert_swap_interval: int = 0
     expert_swap_max: int = 4
     expert_swap_hysteresis: float = 2.0
+    expert_vmm: bool = False
 
 
 # Process-level registries for the MXFP4 layerwise-prefill slot machinery
@@ -221,6 +222,57 @@ class KTConfig:
 # recipe runs 0, which would leave a swap driver with nothing to iterate.
 _KT_EP_METHODS = []
 _KT_SWAP_STATE = {"eager_forwards": 0, "windows": 0, "swaps": 0}
+
+# VMM expert pipeline: per-layer allocators and the shared pipeline manager.
+# Populated by _setup_vmm_weights as each layer is processed at boot.
+_KT_VMM_ALLOCATORS: dict = {}
+_KT_VMM_PIPELINE = None  # ExpertPipeline instance (shared)
+
+
+def _get_or_init_vmm_pipeline(layer: torch.nn.Module):
+    """Lazily initialize the shared ExpertPipeline once all layers are registered."""
+    global _KT_VMM_PIPELINE
+    if _KT_VMM_PIPELINE is not None:
+        return _KT_VMM_PIPELINE
+    if not _KT_VMM_ALLOCATORS:
+        return None
+
+    from sglang.srt.layers.moe.expert_pipeline import ExpertPipeline
+
+    device = next(layer.parameters()).device
+    copy_stream = torch.cuda.Stream(device=device)
+
+    # Cold expert IDs = logical IDs where gpu_experts_mask is False.
+    first_alloc = next(iter(_KT_VMM_ALLOCATORS.values()))
+    cold_ids = [
+        i for i in range(first_alloc.num_experts)
+        if not first_alloc.gpu_experts_mask[i]
+    ]
+
+    _KT_VMM_PIPELINE = ExpertPipeline(
+        allocators=_KT_VMM_ALLOCATORS,
+        cold_expert_ids=cold_ids,
+        copy_stream=copy_stream,
+        device=device,
+    )
+    return _KT_VMM_PIPELINE
+
+
+def _get_cold_data_source():
+    """Return a callable(layer_idx, expert_id) -> {weight_name: cpu_tensor}.
+
+    Reads raw (un-shuffled) TP-sharded expert data from the checkpoint via
+    CheckpointExpertReader.  The pipeline will swizzle it on GPU before use.
+    """
+    from sglang.srt.layers.moe.kt_expert_mover import CheckpointExpertReader
+
+    # TODO: initialize the reader with the correct checkpoint path and TP info.
+    # For now, return a stub that raises — wired up during deployment.
+    raise NotImplementedError(
+        "cold data source not yet wired to CheckpointExpertReader — "
+        "needs checkpoint path + tp_rank + tp_size from server_args"
+    )
+
 
 _MXFP4_PREFILL_LAYER_REGISTRY = {}
 _MXFP4_LAYERWISE_MANAGERS = {}
@@ -3756,6 +3808,7 @@ def create_kt_config_from_server_args(
         expert_swap_interval=server_args.kt_expert_swap_interval,
         expert_swap_max=server_args.kt_expert_swap_max,
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
+        expert_vmm=server_args.kt_expert_vmm,
     )
 
 
@@ -4632,6 +4685,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._skip_cpu_path = False
         self._margin_insist_count: Optional[torch.Tensor] = None
         self._margin_override_count: Optional[torch.Tensor] = None
+        # VMM expert pipeline: None unless kt_expert_vmm is enabled.
+        self._expert_vmm = kt_config.expert_vmm
+        self._vmm_allocator = None  # ExpertVmmAllocator, set in create_weights
+        self._vmm_pipeline = None   # ExpertPipeline (shared across layers)
         self._margin_format_warned = False
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -4964,6 +5021,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
                 self.gpu_method.process_weights_after_loading(layer)
 
+        # 1b. VMM expert mode: migrate the 620 shuffled resident experts
+        # into a VMM-backed [896, ...] tensor.  Cold expert VA is left
+        # unbacked — mapped on demand during prefill by ExpertPipeline.
+        if self._expert_vmm and self.num_gpu_experts > 0:
+            self._setup_vmm_weights(layer)
+
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
             torch.cuda.synchronize()
@@ -4988,6 +5051,117 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     layer.num_experts, dtype=torch.int64, device="cpu"
                 )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
+
+    # -- VMM expert pipeline -------------------------------------------------
+
+    # The four parameter names that process_weights_after_loading rebinds
+    # to the shuffled trtllm-gen layout (see _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+    # at line 262).
+    _VMM_WEIGHT_NAMES = ("w13_weight", "w13_weight_scale_inv",
+                         "w2_weight", "w2_weight_scale_inv")
+
+    def _setup_vmm_weights(self, layer: torch.nn.Module) -> None:
+        """Migrate the 620 shuffled resident experts from torch.Parameters
+        into a VMM-backed [896, ...] tensor, then replace the layer
+        parameters with the VMM tensor.  Cold expert VA is left unbacked."""
+        from sglang.srt.layers.moe.expert_vmm import ExpertVmmAllocator
+
+        device_id = next(layer.parameters()).device.index
+        target_device = next(layer.parameters()).device
+
+        # Build weight specs from the existing (shuffled) parameters.
+        weight_specs = {}
+        for name in self._VMM_WEIGHT_NAMES:
+            param = getattr(layer, name, None)
+            if param is None:
+                continue
+            # Shape excluding the expert dim: param.shape[1:]
+            weight_specs[name] = (param.shape[1:], param.dtype)
+
+        allocator = ExpertVmmAllocator(
+            device_id=device_id,
+            layer_idx=self.kt_config.layer_idx,
+            weight_specs=weight_specs,
+            num_experts=self.global_num_experts,
+            gpu_experts_mask=self.gpu_experts_mask,
+        )
+
+        # Copy each resident expert's shuffled data into VMM-backed pages.
+        for name in self._VMM_WEIGHT_NAMES:
+            param = getattr(layer, name, None)
+            if param is None:
+                continue
+            for gpu_idx in range(self.num_gpu_experts):
+                logical_id = int(self.gpu_index_to_logical[gpu_idx].item())
+                allocator.map_resident(logical_id, {name: param.data[gpu_idx]})
+
+        # Replace the layer parameters with VMM-backed [896, ...] tensors.
+        # The kernel will see one contiguous tensor covering all 896 experts;
+        # cold expert rows are unbacked VA (accessed only during prefill
+        # when the pipeline maps them).
+        for name in self._VMM_WEIGHT_NAMES:
+            if name not in weight_specs:
+                continue
+            vmm_tensor = allocator.get_tensor(name)
+            # Keep the Parameter wrapper so the rest of sglang's code
+            # (which may do getattr(layer, name)) sees a Parameter.
+            setattr(layer, name, torch.nn.Parameter(
+                vmm_tensor, requires_grad=False
+            ))
+
+        self._vmm_allocator = allocator
+
+        # Register in the process-global list so the pipeline can find
+        # all layer allocators.
+        if self.kt_config.layer_idx == 0:
+            # First layer: initialize the global registry.
+            global _KT_VMM_ALLOCATORS
+            _KT_VMM_ALLOCATORS = {}
+        _KT_VMM_ALLOCATORS[self.kt_config.layer_idx] = allocator
+
+        logger.info(
+            "[kt-expert-vmm] layer=%s: %d resident experts migrated to VMM, "
+            "%d cold experts VA reserved (unbacked)",
+            self.kt_config.layer_idx,
+            self.num_gpu_experts,
+            self.global_num_experts - self.num_gpu_experts,
+        )
+
+    def _vmm_prefill_forward(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+        num_tokens: int,
+    ) -> "CombineInput":
+        """Full 896-expert GPU forward during prefill using VMM-backed weights.
+
+        No margin routing, no ID remapping, no CPU path — the kernel sees
+        the full [896, ...] VMM tensor and accesses all experts directly.
+        Cold expert pages are mapped by the ExpertPipeline before this call.
+        """
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        pipeline = _get_or_init_vmm_pipeline(layer)
+        layer_idx = self.kt_config.layer_idx
+
+        # Wait for this layer's cold experts to be loaded.
+        if pipeline is not None:
+            pipeline.wait_prefetch(layer_idx)
+
+        # Run the GPU MoE with the full [896, ...] VMM tensor.
+        # No _scoped_layer_num_local_experts — the layer's num_local_experts
+        # is already 896 (set by the VMM tensor shape).  No mask/remap —
+        # topk_ids are logical IDs that index directly into the VMM tensor.
+        gpu_combine_input = self.gpu_method.apply(layer, dispatch_output)
+
+        # Signal compute done + prefetch next layer + unmap previous.
+        if pipeline is not None:
+            pipeline.record_compute_and_prefetch_next(
+                layer_idx, _get_cold_data_source()
+            )
+
+        return gpu_combine_input
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
@@ -5155,6 +5329,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+
+        # VMM expert prefill: when enabled and this is a prefill-scale forward,
+        # take the full-896-expert GPU path with pipeline-managed cold experts.
+        # Decode (small num_tokens) stays on the normal margin-routed path.
+        if self._expert_vmm and num_tokens > 64:
+            return self._vmm_prefill_forward(layer, dispatch_output, num_tokens)
+
         # No layer filter: placement strategies (layer_concentrated) put
         # wrappers on arbitrary layer indices; the per-layer step rate-limit
         # at the emission site keeps volume bounded.  Never instrument under
