@@ -200,6 +200,21 @@ class CheckpointExpertMover:
         )
         self._swizzle_into(layer, dst_row, bytes_)
 
+    def _read_bytes(self, layer_idx: int, expert_id: int):
+        """Read raw TP-sharded expert bytes from checkpoint (no swizzle).
+
+        Returns a :class:`Mxfp4ExpertBytes` for use with
+        ``swizzle_trtllm_expert`` outside the mover.
+        """
+        prefix = self.expert_prefix_for_layer(layer_idx)
+        return build_expert_bytes(
+            self.reader,
+            prefix,
+            expert_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
+
     def read_full_expert(self, layer, logical_id: int):
         """The FULL, unsliced expert, for the cold-only CPU install.
 

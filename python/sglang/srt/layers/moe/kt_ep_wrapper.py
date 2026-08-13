@@ -259,19 +259,47 @@ def _get_or_init_vmm_pipeline(layer: torch.nn.Module):
 
 
 def _get_cold_data_source():
-    """Return a callable(layer_idx, expert_id) -> {weight_name: cpu_tensor}.
+    """Return a callable(layer_idx, expert_id) -> Mxfp4ExpertBytes.
 
     Reads raw (un-shuffled) TP-sharded expert data from the checkpoint via
-    CheckpointExpertReader.  The pipeline will swizzle it on GPU before use.
+    CheckpointExpertReader + build_expert_bytes.  The pipeline swizzles it
+    on GPU into VMM-backed pages.
     """
-    from sglang.srt.layers.moe.kt_expert_mover import CheckpointExpertReader
+    global _KT_VMM_MOVER
+    if _KT_VMM_MOVER is not None:
+        return _KT_VMM_MOVER
 
-    # TODO: initialize the reader with the correct checkpoint path and TP info.
-    # For now, return a stub that raises — wired up during deployment.
-    raise NotImplementedError(
-        "cold data source not yet wired to CheckpointExpertReader — "
-        "needs checkpoint path + tp_rank + tp_size from server_args"
+    # Lazily initialize a CheckpointExpertMover that can read + swizzle
+    # cold experts.  Needs the checkpoint path and TP info from the first
+    # registered KT method.
+    if not _KT_EP_METHODS:
+        raise RuntimeError("no KT methods registered for VMM cold data source")
+
+    first_method = _KT_EP_METHODS[0]
+    weight_path = first_method.kt_config.weight_path
+    tp_rank = first_method.tp_rank
+    tp_size = first_method.tp_size
+
+    from sglang.srt.layers.moe.kt_expert_mover import CheckpointExpertMover
+
+    # The expert prefix maps layer_idx → checkpoint key prefix.
+    # K3 stores experts as: language_model.model.layers.{N}.block_sparse_moe.experts
+    # The mover needs a callable(layer_idx) → prefix string.
+    def expert_prefix_for_layer(layer_idx):
+        return f"language_model.model.layers.{layer_idx}.block_sparse_moe.experts"
+
+    _KT_VMM_MOVER = CheckpointExpertMover(
+        weight_path=weight_path,
+        expert_prefix_for_layer=expert_prefix_for_layer,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        param_names=first_method._VMM_WEIGHT_NAMES,
     )
+    return _KT_VMM_MOVER
+
+
+# Global cold expert mover for VMM pipeline (lazily initialized).
+_KT_VMM_MOVER = None
 
 
 _MXFP4_PREFILL_LAYER_REGISTRY = {}
