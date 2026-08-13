@@ -5095,19 +5095,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 logical_id = int(self.gpu_index_to_logical[gpu_idx].item())
                 allocator.map_resident(logical_id, {name: param.data[gpu_idx]})
 
-        # Replace the layer parameters with VMM-backed [896, ...] tensors.
-        # The kernel will see one contiguous tensor covering all 896 experts;
-        # cold expert rows are unbacked VA (accessed only during prefill
-        # when the pipeline maps them).
+        # Save the original [620, ...] parameters for decode (the KT path
+        # uses ID remapping + margin routing that expects the 620-expert
+        # tensor).  During prefill _vmm_prefill_forward swaps in the VMM
+        # [896, ...] tensor; during decode the layer keeps these 620-expert
+        # tensors as-is.
+        self._vmm_decode_params = {}
         for name in self._VMM_WEIGHT_NAMES:
             if name not in weight_specs:
                 continue
-            vmm_tensor = allocator.get_tensor(name)
-            # Keep the Parameter wrapper so the rest of sglang's code
-            # (which may do getattr(layer, name)) sees a Parameter.
-            setattr(layer, name, torch.nn.Parameter(
-                vmm_tensor, requires_grad=False
-            ))
+            # Keep the layer's existing [620, ...] parameter for decode.
+            self._vmm_decode_params[name] = getattr(layer, name)
 
         self._vmm_allocator = allocator
 
@@ -5138,9 +5136,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         No margin routing, no ID remapping, no CPU path — the kernel sees
         the full [896, ...] VMM tensor and accesses all experts directly.
         Cold expert pages are mapped by the ExpertPipeline before this call.
-        """
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        The layer's weight parameters are temporarily swapped to the VMM
+        [896, ...] tensors for this forward, then restored to the [620, ...]
+        decode tensors so the next decode step uses the normal KT path.
+        """
         pipeline = _get_or_init_vmm_pipeline(layer)
         layer_idx = self.kt_config.layer_idx
 
@@ -5148,11 +5148,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if pipeline is not None:
             pipeline.wait_prefetch(layer_idx)
 
-        # Run the GPU MoE with the full [896, ...] VMM tensor.
-        # No _scoped_layer_num_local_experts — the layer's num_local_experts
-        # is already 896 (set by the VMM tensor shape).  No mask/remap —
-        # topk_ids are logical IDs that index directly into the VMM tensor.
-        gpu_combine_input = self.gpu_method.apply(layer, dispatch_output)
+        # Swap in VMM [896, ...] tensors for the full-expert forward.
+        # The VMM tensor was created in _setup_vmm_weights and stored on
+        # the allocator; the decode [620, ...] tensors are in
+        # self._vmm_decode_params.
+        swapped = False
+        if self._vmm_allocator is not None and self._vmm_decode_params:
+            for name in self._VMM_WEIGHT_NAMES:
+                if name in self._vmm_decode_params:
+                    vmm_tensor = self._vmm_allocator.get_tensor(name)
+                    setattr(layer, name, torch.nn.Parameter(
+                        vmm_tensor, requires_grad=False
+                    ))
+            # num_local_experts must be 896 for the kernel to see all experts.
+            with _scoped_layer_num_local_experts(layer, self.global_num_experts):
+                gpu_combine_input = self.gpu_method.apply(layer, dispatch_output)
+            swapped = True
+        else:
+            gpu_combine_input = self.gpu_method.apply(layer, dispatch_output)
+
+        # Restore the [620, ...] decode tensors.
+        if swapped:
+            for name in self._VMM_WEIGHT_NAMES:
+                if name in self._vmm_decode_params:
+                    setattr(layer, name, self._vmm_decode_params[name])
 
         # Signal compute done + prefetch next layer + unmap previous.
         if pipeline is not None:
