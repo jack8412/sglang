@@ -451,7 +451,14 @@ EOS
 cmd_serve(){
   local name=${1:?usage: k3.sh serve NAME [extra server args...]}; shift
   say "launching $name on $HOST: $*"
-  ssh -o ConnectTimeout=45 -o ServerAliveInterval=30 "$HOST" bash -s -- "$name" "$@" <<'EOS'
+  # launch.sh reads K3_PROFILE / K3_RECORD from its environment, and ssh does
+  # not carry them, so forward them explicitly -- without this the caller's
+  # `K3_PROFILE=bare k3.sh serve ...` is silently ignored and the launcher
+  # refuses (or worse, serves a different placement than was asked for).
+  ssh -o ConnectTimeout=45 -o ServerAliveInterval=30 "$HOST" bash -s -- \
+    "${K3_PROFILE:-}" "${K3_RECORD:-}" "$name" "$@" <<'EOS'
+K3_PROFILE=$1; shift
+K3_RECORD=$1; shift
 NAME=$1; shift
 WS=/workspace
 LAUNCHER=$WS/sglang/k3ops/launch.sh
@@ -467,7 +474,10 @@ fi
 tmux kill-session -t bench 2>/dev/null
 pkill -INT -f "launch_serve[r]" 2>/dev/null; sleep 15
 pkill -9 -f "sglang::sched[u]ler" 2>/dev/null; sleep 5
-tmux new-session -d -s bench -n "$NAME" "bash $LAUNCHER $NAME $*"
+ENVP=""
+[ -n "$K3_PROFILE" ] && ENVP="K3_PROFILE=$K3_PROFILE "
+[ -n "$K3_RECORD" ] && ENVP="${ENVP}K3_RECORD=$K3_RECORD "
+tmux new-session -d -s bench -n "$NAME" "${ENVP}bash $LAUNCHER $NAME $*"
 echo "launched; waiting for /health_generate (log: $LOG)"
 # Grace period: the first pgrep can beat launch.sh's exec of the server, and
 # a false DIED here cost a full campaign (phase V rows all "died" at t+0.2s).
