@@ -101,7 +101,6 @@ class ExpertVmmAllocator:
             total_bytes = per_expert_aligned * num_experts
 
             va_base = reserve_va(total_bytes, self.granularity)
-            set_access(va_base, total_bytes, device_id)
 
             self._va_bases[name] = va_base
             self._va_sizes[name] = total_bytes
