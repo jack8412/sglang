@@ -121,12 +121,16 @@ class ExpertVmmAllocator:
         """Back all resident expert positions (0..num_residents-1) with one
         large physical handle per weight name.  This is efficient — one
         cuMemCreate + cuMemMap covers the entire resident range, avoiding
-        per-expert handle overhead.
+        per-expert handle overhead and alignment waste.
         """
         for name in self._weight_specs:
             spec = self._weight_specs[name]
-            aligned = spec["per_expert_aligned"]
-            resident_bytes = aligned * num_residents
+            # Use UNALIGNED per-expert bytes — the alignment waste of
+            # 2.09 MB -> 4 MiB per expert would multiply by 620× and
+            # OOM.  Instead, pack experts contiguously and align only
+            # the total handle size to granularity.
+            resident_bytes = spec["per_expert_bytes"] * num_residents
+            resident_bytes = _align_up(resident_bytes, self.granularity)
             va = self._va_bases[name]
 
             handle = create_local_handle(resident_bytes, self.device_id)
@@ -135,6 +139,7 @@ class ExpertVmmAllocator:
             self._resident_handles[name] = handle
 
         self._resident_mapped = True
+        self._num_residents = num_residents
 
     def map_resident(self, expert_id: int, weight_data: Dict[str, torch.Tensor]) -> None:
         """Back one resident expert's VA and copy its (already-shuffled) data."""
@@ -222,8 +227,11 @@ class ExpertVmmAllocator:
             rh = self._resident_handles.pop(name, 0)
             if rh != 0:
                 spec = self._weight_specs[name]
-                aligned = spec["per_expert_aligned"]
-                resident_bytes = aligned * self.num_experts  # safe upper bound
+                # Use the same unaligned size as map_residents.
+                resident_bytes = _align_up(
+                    spec["per_expert_bytes"] * self._num_residents,
+                    self.granularity,
+                )
                 unmap_va(self._va_bases[name], resident_bytes)
                 release_handle(rh)
             # Release any cold handles.
