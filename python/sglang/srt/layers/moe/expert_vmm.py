@@ -114,6 +114,27 @@ class ExpertVmmAllocator:
 
         self._resident_mapped = False
         self._cold_mapped: set = set()  # expert IDs currently backed
+        # Per-weight: the single large resident handle (or 0 if not mapped).
+        self._resident_handles: Dict[str, int] = {}
+
+    def map_residents(self, num_residents: int) -> None:
+        """Back all resident expert positions (0..num_residents-1) with one
+        large physical handle per weight name.  This is efficient — one
+        cuMemCreate + cuMemMap covers the entire resident range, avoiding
+        per-expert handle overhead.
+        """
+        for name in self._weight_specs:
+            spec = self._weight_specs[name]
+            aligned = spec["per_expert_aligned"]
+            resident_bytes = aligned * num_residents
+            va = self._va_bases[name]
+
+            handle = create_local_handle(resident_bytes, self.device_id)
+            map_handle(va, resident_bytes, handle)
+            set_access(va, resident_bytes, self.device_id)
+            self._resident_handles[name] = handle
+
+        self._resident_mapped = True
 
     def map_resident(self, expert_id: int, weight_data: Dict[str, torch.Tensor]) -> None:
         """Back one resident expert's VA and copy its (already-shuffled) data."""
@@ -197,6 +218,15 @@ class ExpertVmmAllocator:
     def destroy(self) -> None:
         """Release all handles and free the VA reservation."""
         for name in list(self._handles.keys()):
+            # Release resident handle (one large handle).
+            rh = self._resident_handles.pop(name, 0)
+            if rh != 0:
+                spec = self._weight_specs[name]
+                aligned = spec["per_expert_aligned"]
+                resident_bytes = aligned * self.num_experts  # safe upper bound
+                unmap_va(self._va_bases[name], resident_bytes)
+                release_handle(rh)
+            # Release any cold handles.
             for expert_id in range(self.num_experts):
                 handle = self._handles[name][expert_id]
                 if handle != 0:

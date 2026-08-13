@@ -5146,18 +5146,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             gpu_experts_mask=self.gpu_experts_mask,
         )
 
-        # Back the 620 resident positions (0-619) with physical pages.
-        # The weight loader will write to these; the shuffle will process
-        # them in-place.  Cold positions (620-895) stay unbacked.
-        for name in self._VMM_WEIGHT_NAMES:
-            spec = allocator._weight_specs[name]
-            for gpu_idx in range(self.num_gpu_experts):
-                # Resident experts are at positions 0-619 (dense, matching
-                # the existing logical_to_gpu_index mapping).
-                empty = torch.zeros(
-                    spec["shape"][1:], dtype=spec["dtype"], device=target_device,
-                )
-                allocator._map_one(gpu_idx, name, empty)
+        # Back the 620 resident positions (0-619) with one large physical
+        # handle per weight name — efficient (1 cuMemCreate, not 620).
+        # The weight loader writes to these; the shuffle processes them
+        # in-place.  Cold positions (620-895) stay unbacked.
+        allocator.map_residents(self.num_gpu_experts)
 
         # Register VMM-backed tensors as layer parameters.
         for name in self._VMM_WEIGHT_NAMES:
