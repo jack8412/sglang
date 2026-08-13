@@ -1374,6 +1374,11 @@ class Envs:
     # the loader produced. Read-only; the gate the mover must pass before it
     # is trusted to rewrite resident weights.
     SGLANG_KT_VERIFY_EXPERT_MOVER = EnvBool(False)
+    # Per-forward slot-accounting check for split-slice full-expert prefill:
+    # assert the resident and cold expert slices claim every routed slot
+    # exactly once. Costs a device sync per layer, so it is a debug gate, not
+    # a production default.
+    SGLANG_KT_VERIFY_SPLIT_PREFILL = EnvBool(False)
     # P0 ablation for the doorbell-transport design: skip ONLY the two
     # cudaLaunchHostFunc submissions (submit/sync) while keeping the staging
     # D2H, the result H2D and the merge-add. Differencing this against the

@@ -211,6 +211,7 @@ class KTConfig:
     expert_swap_interval: int = 0
     expert_swap_max: int = 4
     expert_swap_hysteresis: float = 2.0
+    split_prefill: bool = False
 
 
 # Process-level registries for the MXFP4 layerwise-prefill slot machinery
@@ -221,6 +222,15 @@ class KTConfig:
 # recipe runs 0, which would leave a swap driver with nothing to iterate.
 _KT_EP_METHODS = []
 _KT_SWAP_STATE = {"eager_forwards": 0, "windows": 0, "swaps": 0}
+
+# Split-slice full-expert prefill: every wrapped MoE layer that armed the path,
+# in construction order, plus the shared cold store and prefetch pipeline built
+# once all layers have loaded.  Mutated in place only -- never rebound -- and
+# cleared exclusively by reset_split_prefill(), so a second engine in the same
+# process cannot inherit stale layers.  (Keying a reset on layer_idx == 0 would
+# not work: K3's early layers are dense, so layer 0 is never an MoE layer.)
+_KT_SPLIT_PREFILL_LAYERS = []
+_KT_SPLIT_PREFILL_STATE = {"store": None, "pipeline": None}
 
 _MXFP4_PREFILL_LAYER_REGISTRY = {}
 _MXFP4_LAYERWISE_MANAGERS = {}
@@ -3756,6 +3766,7 @@ def create_kt_config_from_server_args(
         expert_swap_interval=server_args.kt_expert_swap_interval,
         expert_swap_max=server_args.kt_expert_swap_max,
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
+        split_prefill=server_args.kt_expert_split_prefill,
     )
 
 
@@ -4630,6 +4641,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self._margin = 0.0
         # Armed in create_weights once num_gpu_experts and top_k are known.
         self._skip_cpu_path = False
+        # Split-slice full-expert prefill.  Armed in create_weights once the
+        # cold store and pipeline exist; _split_prefill_ready gates the hot
+        # path so a partially-built config cannot half-enter it.
+        self._split_prefill = kt_config.split_prefill
+        self._split_prefill_ready = False
+        self._split_prefill_threshold = max(1, kt_config.chunked_prefill_size or 1)
+        self._split_prefill_validate = envs.SGLANG_KT_VERIFY_SPLIT_PREFILL.get()
+        self._cold_pipeline = None
+        self._cold_scalars = None
         self._margin_insist_count: Optional[torch.Tensor] = None
         self._margin_override_count: Optional[torch.Tensor] = None
         self._margin_format_warned = False
@@ -4656,9 +4676,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
         self.gpu_index_to_logical = gpu_expert_indices.to(torch.int32)
 
+        # Split-slice prefill (expert_split_moe) addresses ALL experts in one
+        # slot space: residents keep their dense indices [0, num_gpu), and the
+        # cold experts follow at [num_gpu, num_experts) in ascending logical
+        # order -- the same torch.where ordering the residents get, so both
+        # halves derive from one pass over the mask.  Unlike
+        # logical_to_gpu_index this is a bijection: no -1, nothing dropped.
+        cold_expert_indices = torch.where(~self.gpu_experts_mask)[0]
+        self.logical_to_slot = torch.empty(
+            len(self.gpu_experts_mask), dtype=torch.int32
+        )
+        self.logical_to_slot[gpu_expert_indices] = torch.arange(
+            len(gpu_expert_indices), dtype=torch.int32
+        )
+        self.logical_to_slot[cold_expert_indices] = torch.arange(
+            len(gpu_expert_indices),
+            len(gpu_expert_indices) + len(cold_expert_indices),
+            dtype=torch.int32,
+        )
+        self.cold_index_to_logical = cold_expert_indices.to(torch.int32)
+
         # CUDA tensors for inference (will be set in create_weights)
         self.gpu_experts_mask_cuda = None
         self.logical_to_gpu_index_cuda = None
+        self.logical_to_slot_cuda = None
 
         self.gpu_prefill_token_threshold = kt_config.gpu_prefill_token_threshold or 0
         self._full_init_args = None
@@ -4733,6 +4774,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         target_device = next(layer.parameters()).device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
+        self.logical_to_slot_cuda = self.logical_to_slot.to(device=target_device)
 
         # Full override arms the static CPU-path skip, but only where the
         # override is PROVABLE: each displaced slot needs its own distinct
@@ -4964,6 +5006,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
                 self.gpu_method.process_weights_after_loading(layer)
 
+        # 1b. Split-slice prefill: the cold slice needs its OWN per-expert
+        # scalar vectors.  The kernel indexes gemm1_alpha / gemm1_beta by
+        # LOCAL expert index, so a 620-length vector against a 276-expert
+        # slice reads out of bounds.  Both are constant-filled per layer, so
+        # the cold copies are just the resident value repeated.
+        if self._split_prefill and self.num_gpu_experts > 0:
+            n_cold = self.global_num_experts - self.num_gpu_experts
+            self._cold_scalars = {
+                "alpha": layer.gemm1_alpha[:1].repeat(n_cold).contiguous(),
+                "beta": layer.gemm1_clamp_limit[:1].repeat(n_cold).contiguous(),
+            }
+            _register_split_prefill_layer(self, layer)
+
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
             torch.cuda.synchronize()
@@ -5120,6 +5175,107 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return self._sync_cpu_forward(staged_hidden_states)
 
+    # -- split-slice full-expert prefill -----------------------------------
+
+    def _split_prefill_apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+        num_tokens: int,
+    ) -> "CombineInput":
+        """Compute every routed expert on GPU as two disjoint expert slices.
+
+        The resident weights stay exactly as decode leaves them (a dense
+        ``[num_gpu, ...]`` stack indexed by gpu_index); the cold slice comes
+        from the prefetch pipeline.  Because both slices are addressed in ONE
+        slot space -- residents at ``[0, num_gpu)``, cold at
+        ``[num_gpu, num_experts)`` -- topk ids need only a bijective gather,
+        not the mask-and-remap decode uses.
+
+        No margin routing, no CPU submit/sync: every expert the router picked
+        is evaluated, which is the quality claim.
+        """
+        from sglang.kernels.ops.moe import trtllm_gen_moe as situ_moe
+        from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+        from sglang.kernels.ops.quantization.per_token_group_quant import (
+            per_token_group_quant,
+        )
+        from sglang.srt.layers.moe import route_quant_handoff
+        from sglang.srt.layers.moe.expert_split_moe import split_slice_moe
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        layer_idx = self.kt_config.layer_idx
+        # The first MoE layer of a forward re-primes both slots: a prefill pass
+        # is not guaranteed to have run to completion (aborts, chunk
+        # boundaries), so slot occupancy from a previous pass is not reusable.
+        if _KT_SPLIT_PREFILL_LAYERS and (
+            _KT_SPLIT_PREFILL_LAYERS[0][0] is self
+        ):
+            self._cold_pipeline.reset()
+            self._cold_pipeline.prime()
+        cold_buf = self._cold_pipeline.wait_prefetch(layer_idx)
+
+        x = dispatch_output.hidden_states
+        if x.dim() > 2:
+            x = x.view(-1, x.shape[-1])
+
+        # The fused route+quant handoff publishes ids packed from LOGICAL
+        # expert ids, which would bypass the slot remap below and silently
+        # address the wrong rows.  Drain it and quantize ourselves; the
+        # handoff is disarmed under KT anyway (KimiK3MoE gates it on
+        # isinstance(method, Mxfp4MoEMethod), and ours is the KT wrapper),
+        # so this is a guard rather than a hot path.
+        prepared = route_quant_handoff.take(x)
+        if prepared is not None:
+            _, x_quant, x_scale = prepared
+            x_scale = x_scale.view(torch.float8_e4m3fn)
+        else:
+            x_quant, x_scale = per_token_group_quant(
+                x, group_size=32, scale_ue8m0=True
+            )
+            x_scale = x_scale.view(torch.float8_e4m3fn)
+
+        # One slot space for both slices, so this is a bijective gather --
+        # no -1, nothing dropped (contrast mask_and_remap_expert_ids).
+        topk_output = dispatch_output.topk_output
+        slot_ids = self.logical_to_slot_cuda[topk_output.topk_ids.long()].to(
+            torch.int32
+        )
+        packed = PackTopkIds.execute(
+            slot_ids, topk_output.topk_weights.to(torch.float32)
+        )
+
+        out = split_slice_moe(
+            situ_moe=situ_moe,
+            packed_topk=packed,
+            hidden_states=x_quant,
+            hidden_states_scale=x_scale,
+            resident={
+                "w13": layer.w13_weight,
+                "w13_scale": layer.w13_weight_scale,
+                "w2": layer.w2_weight,
+                "w2_scale": layer.w2_weight_scale,
+                "alpha": layer.gemm1_alpha,
+                "beta": layer.gemm1_clamp_limit,
+            },
+            cold={
+                "w13": cold_buf["w13_weight"],
+                "w13_scale": cold_buf["w13_weight_scale"],
+                "w2": cold_buf["w2_weight"],
+                "w2_scale": cold_buf["w2_weight_scale"],
+                "alpha": self._cold_scalars["alpha"],
+                "beta": self._cold_scalars["beta"],
+            },
+            num_experts=self.global_num_experts,
+            num_resident=self.num_gpu_experts,
+            top_k=packed.shape[1],
+            intermediate_size=self.gpu_method.intermediate_size_per_partition,
+            validate=self._split_prefill_validate,
+        )
+
+        self._cold_pipeline.record_compute_and_prefetch_next(layer_idx)
+        return StandardCombineInput(hidden_states=out)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -5155,6 +5311,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+
+        # Split-slice full-expert prefill: evaluate the resident and cold
+        # expert sets as two disjoint slices on GPU and merge, so every routed
+        # expert is actually computed.  Only above a token threshold (decode
+        # keeps the margin-routed CPU path) and never under stream capture --
+        # this path is eager by construction.  is_extend_in_batch is NOT a
+        # usable signal here; plain TP serving never writes it.
+        if (
+            self._split_prefill_ready
+            and num_tokens >= self._split_prefill_threshold
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return self._split_prefill_apply(layer, dispatch_output, num_tokens)
+
         # No layer filter: placement strategies (layer_concentrated) put
         # wrappers on arbitrary layer indices; the per-layer step rate-limit
         # at the emission site keeps volume bounded.  Never instrument under
@@ -6461,6 +6631,99 @@ class _PerLayerMover:
             )
             self._by_layer[layer_idx] = mover
         return mover
+
+
+def _register_split_prefill_layer(method, layer) -> None:
+    """Record a layer that armed split-slice prefill (post-load, per layer)."""
+    layer_idx = method.kt_config.layer_idx
+    for existing, _ in _KT_SPLIT_PREFILL_LAYERS:
+        if existing.kt_config.layer_idx == layer_idx:
+            raise RuntimeError(
+                f"split-prefill: layer {layer_idx} registered twice -- call "
+                f"reset_split_prefill() between engine constructions"
+            )
+    _KT_SPLIT_PREFILL_LAYERS.append((method, layer))
+
+
+def reset_split_prefill() -> None:
+    """Drop all split-prefill state (engine teardown / re-construction)."""
+    _KT_SPLIT_PREFILL_LAYERS.clear()
+    _KT_SPLIT_PREFILL_STATE["store"] = None
+    _KT_SPLIT_PREFILL_STATE["pipeline"] = None
+
+
+def finalize_split_prefill(server_args) -> bool:
+    """Build the cold-expert store and prefetch pipeline, then arm every layer.
+
+    Called once after ALL layers have loaded -- the store needs the full MoE
+    layer list, and the pipeline's slot parity is defined over it.  Returns
+    True if the path is armed.
+
+    On any failure the path is disarmed everywhere and serving continues on
+    the existing margin-routed CPU path: a partially-built split-prefill would
+    compute a subset of experts and silently degrade quality.
+    """
+    if not _KT_SPLIT_PREFILL_LAYERS:
+        return False
+
+    from sglang.srt.layers.moe.expert_cold_store import (
+        WEIGHT_NAMES,
+        build_cold_store,
+    )
+    from sglang.srt.layers.moe.expert_pipeline import ColdExpertPipeline
+
+    anchor, anchor_layer = _KT_SPLIT_PREFILL_LAYERS[0]
+    layer_indices = [m.kt_config.layer_idx for m, _ in _KT_SPLIT_PREFILL_LAYERS]
+    device = anchor_layer.w13_weight.device
+
+    try:
+        per_expert_shapes = {
+            name: (tuple(getattr(anchor_layer, name).shape[1:]),
+                   getattr(anchor_layer, name).dtype)
+            for name in WEIGHT_NAMES
+        }
+        store = build_cold_store(
+            layer_indices=layer_indices,
+            gpu_experts_mask=anchor.gpu_experts_mask,
+            weight_path=anchor.kt_config.weight_path,
+            tp_rank=get_parallel().tp_rank,
+            tp_size=get_parallel().tp_size,
+            expert_prefix_for_layer=lambda li: (
+                f"language_model.model.layers.{li}.block_sparse_moe.experts"
+            ),
+            per_expert_shapes=per_expert_shapes,
+            device=device,
+        )
+        pipeline = ColdExpertPipeline(
+            store=store,
+            device=device,
+            per_expert_shapes=per_expert_shapes,
+            moe_layer_indices=layer_indices,
+        )
+    except Exception:
+        logger.exception(
+            "[split-prefill] build failed; falling back to the margin-routed "
+            "CPU path for every layer"
+        )
+        for method, _ in _KT_SPLIT_PREFILL_LAYERS:
+            method._split_prefill_ready = False
+        return False
+
+    _KT_SPLIT_PREFILL_STATE["store"] = store
+    _KT_SPLIT_PREFILL_STATE["pipeline"] = pipeline
+    for method, _ in _KT_SPLIT_PREFILL_LAYERS:
+        method._cold_pipeline = pipeline
+        method._split_prefill_ready = True
+
+    logger.info(
+        "[split-prefill] armed on %d layers: %d resident + %d cold experts, "
+        "threshold %d tokens",
+        len(_KT_SPLIT_PREFILL_LAYERS),
+        anchor.num_gpu_experts,
+        store.num_cold,
+        anchor._split_prefill_threshold,
+    )
+    return True
 
 
 def _get_or_create_expert_mover(anchor):

@@ -660,6 +660,7 @@ class ModelRunner:
             is_hybrid_swa=self.is_hybrid_swa,
         )
         self.maybe_apply_post_load_model_transforms()
+        self.maybe_init_split_prefill()
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
@@ -756,6 +757,13 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+
+    def maybe_init_split_prefill(self):
+        if not get_exec().moe.kt_expert_split_prefill:
+            return
+        from sglang.srt.layers.moe.kt_ep_wrapper import finalize_split_prefill
+
+        finalize_split_prefill(self.server_args)
 
     def maybe_init_lora_manager(self):
         if get_lora().enable_lora:
