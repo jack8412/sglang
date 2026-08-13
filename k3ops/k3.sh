@@ -455,11 +455,16 @@ cmd_serve(){
   # not carry them, so forward them explicitly -- without this the caller's
   # `K3_PROFILE=bare k3.sh serve ...` is silently ignored and the launcher
   # refuses (or worse, serves a different placement than was asked for).
+  # ssh reassembles the remote command into ONE string that the remote shell
+  # re-splits, so an empty argument disappears and every later argument shifts
+  # -- which silently made NAME the first server flag. Hence the sentinel.
   ssh -o ConnectTimeout=45 -o ServerAliveInterval=30 "$HOST" bash -s -- \
-    "${K3_PROFILE:-}" "${K3_RECORD:-}" "$name" "$@" <<'EOS'
+    "${K3_PROFILE:-__unset__}" "${K3_RECORD:-__unset__}" "$name" "$@" <<'EOS'
 K3_PROFILE=$1; shift
 K3_RECORD=$1; shift
 NAME=$1; shift
+[ "$K3_PROFILE" = __unset__ ] && K3_PROFILE=""
+[ "$K3_RECORD" = __unset__ ] && K3_RECORD=""
 WS=/workspace
 LAUNCHER=$WS/sglang/k3ops/launch.sh
 LOG=$WS/runs/logs/$NAME.server.log
