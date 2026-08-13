@@ -232,6 +232,12 @@ _KT_SWAP_STATE = {"eager_forwards": 0, "windows": 0, "swaps": 0}
 _KT_SPLIT_PREFILL_LAYERS = []
 _KT_SPLIT_PREFILL_STATE = {"store": None, "pipeline": None}
 
+# Smallest chunk worth paying the cold-expert stream for. The stream is a
+# fixed per-forward cost (~2.0 s measured: every cold expert lands once
+# regardless of token count), so the split path beats the ~1,400 tok/s
+# CPU-expert path above ~2,800 tokens. Rounded up for margin.
+_SPLIT_PREFILL_MIN_TOKENS = 4096
+
 _MXFP4_PREFILL_LAYER_REGISTRY = {}
 _MXFP4_LAYERWISE_MANAGERS = {}
 _MXFP4_LAYERWISE_DISABLED_REASONS = {}
@@ -4646,7 +4652,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # path so a partially-built config cannot half-enter it.
         self._split_prefill = kt_config.split_prefill
         self._split_prefill_ready = False
-        self._split_prefill_threshold = max(1, kt_config.chunked_prefill_size or 1)
+        # Break-even against the CPU-expert path, NOT the chunk size.  The
+        # split path's cost is dominated by a FIXED per-forward stream -- every
+        # cold expert lands once however many tokens the chunk holds -- so it
+        # wins above roughly (stream seconds x CPU tokens/s): measured 1.99 s
+        # and ~1,400 tok/s give ~2,800 tokens.
+        #
+        # Gating on chunked_prefill_size instead meant only an exactly-full
+        # chunk qualified, so the scheduler's remainder always fell back: a
+        # 65,498-token prompt became 32768 (split, 2.0 s) + 32730 (CPU, 23 s),
+        # 38 tokens short of the threshold and 6.4x slower overall.
+        self._split_prefill_threshold = _SPLIT_PREFILL_MIN_TOKENS
         self._split_prefill_validate = envs.SGLANG_KT_VERIFY_SPLIT_PREFILL.get()
         self._cold_pipeline = None
         self._cold_scalars = None
