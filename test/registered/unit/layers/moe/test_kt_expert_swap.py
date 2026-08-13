@@ -264,7 +264,7 @@ class TestSwapWindow(CustomTestCase):
         entry = self._entry()
         order = []
 
-        def move(layer, row, expert):
+        def move(layer, row, expert, demoted):
             # tables must still show the OLD occupant at this point
             order.append(
                 (row, expert, int(entry["tables"].gpu_index_to_logical[row]))
@@ -282,7 +282,7 @@ class TestSwapWindow(CustomTestCase):
 
         entry = self._entry()
 
-        def boom(layer, row, expert):
+        def boom(layer, row, expert, demoted):
             raise RuntimeError("export failed")
 
         res = run_swap_window([entry], move_weights=boom)
@@ -300,7 +300,7 @@ class TestSwapWindow(CustomTestCase):
         seq = []
         run_swap_window(
             [entry],
-            move_weights=lambda l, r, e: seq.append("move"),
+            move_weights=lambda l, r, e, d: seq.append("move"),
             quiesce=lambda: seq.append("quiesce"),
         )
         self.assertEqual(seq[0], "quiesce")

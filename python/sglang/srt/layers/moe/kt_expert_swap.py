@@ -314,7 +314,13 @@ class ExpertSwapPolicy:
 # bookkeeping that can be asserted; this is the one step that physically
 # rewrites weights, so it is the one step worth testing on its own (bitwise,
 # against a known-good full-set copy for the same expert) before it is trusted.
-MoveWeightsFn = Callable[[object, int, int], None]
+# (layer, dst_row, promote_logical_id, demote_logical_id). The demoted id is
+# passed rather than looked up from gpu_index_to_logical[dst_row] because a
+# mover that also maintains a cold-side store needs to know which expert is
+# leaving, and the tables still describe the PRE-swap placement at this point
+# -- a reverse lookup would be correct today and silently wrong the moment
+# this call moved after apply_swaps_to_tables.
+MoveWeightsFn = Callable[[object, int, int, int], None]
 
 
 class SwapInstallError(RuntimeError):
@@ -381,7 +387,7 @@ def run_swap_window(
                 int(tables.logical_to_gpu_index[s.demote].item()) for s in swaps
             ]
             for s, row in zip(swaps, rows):
-                move_weights(entry["layer"], row, s.promote)
+                move_weights(entry["layer"], row, s.promote, s.demote)
                 if install_cpu_expert is not None:
                     # BEFORE the tables flip: the demoted expert must not be
                     # routable on the CPU until its weights are actually

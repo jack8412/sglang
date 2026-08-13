@@ -6488,8 +6488,45 @@ def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
     if mover is None:
         return
 
-    def _move(layer, dst_row, logical_id):
-        mover.move(layer, dst_row, logical_id)
+    store = _KT_SPLIT_PREFILL_STATE["store"]
+
+    def _move(layer, dst_row, logical_id, demoted_id):
+        """Write expert ``logical_id`` into resident row ``dst_row``.
+
+        With split-prefill armed the cold store already holds that expert's
+        shard in exactly this layout, so the move is four pinned copies rather
+        than a checkpoint read + TP slice + swizzle.  The store is then
+        updated in the same window, because it is authoritative for the cold
+        set: a stale row would be promoted into a resident row on some later
+        swap and silently serve every decode step after it.
+
+        Ordering is load-bearing and mirrors run_swap_window's own rule.  The
+        promoted expert vacates a cold slot that the demoted expert then
+        takes, so the promoted row is staged BEFORE anything is written back.
+        """
+        layer_idx = layer.layer_id
+        slot = None if store is None else store.slot_of(layer_idx, logical_id)
+        if slot is None:
+            # No store, or the expert is not in the cold set (a re-promotion
+            # inside one window). Fall back to the checkpoint path.
+            mover.move(layer, dst_row, logical_id)
+            return
+
+        # Both reads happen before either write: the promoted expert's shard
+        # out of the cold slot, and the demoted expert's weights out of the
+        # resident row. Either write would otherwise destroy the other's
+        # source, since promotion and demotion trade exactly these two places.
+        promoted = store.stage_row(layer_idx, slot)
+        demoted = {
+            name: getattr(layer, name).data[dst_row].to("cpu", non_blocking=False)
+            for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+        }
+
+        for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
+            getattr(layer, name).data[dst_row].copy_(
+                promoted[name], non_blocking=True
+            )
+        store.write_row(layer_idx, slot, demoted, logical_id=demoted_id)
 
     def _verify_install_once(entry):
         """SGLANG_KT_VERIFY_CPU_INSTALL=1: prove the demotion install bitwise.
@@ -6596,7 +6633,10 @@ class _PerLayerMover:
         self._by_layer = {}
         self._args = (weight_path, tp_rank, tp_size)
 
-    def move(self, layer, dst_row, logical_id):
+    def move(self, layer, dst_row, logical_id, demoted_id=None):
+        # demoted_id is part of the MoveWeightsFn contract for movers that
+        # maintain a cold-side store; the checkpoint mover reads the promoted
+        # expert straight from disk and does not need it.
         self._for(layer)(layer, dst_row, logical_id)
 
     def read_full_expert(self, layer, logical_id):
