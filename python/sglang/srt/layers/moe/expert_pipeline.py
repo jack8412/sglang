@@ -102,14 +102,19 @@ class _OverlapProbe:
         # Margin: the compute window a copy had to hide under, minus the copy.
         margins = [comp - cp for cp, comp in zip(copy, compute)]
         worst = min(range(n), key=lambda i: margins[i])
+        # The stall share is quoted against stall + MoE compute -- the window
+        # this probe can see. It is NOT a share of the forward, which also
+        # contains attention, the dense path and communication; dividing by
+        # the forward needs a number the pipeline does not have.
         return (
             f"[cold-pipeline] {n} layers | "
-            f"copy {sum(copy)/n:.1f} ms avg (max {max(copy):.1f}) | "
-            f"compute {tot_compute/n:.1f} ms avg | "
+            f"copy {sum(copy)/n:.1f} ms avg (max {max(copy):.1f}), "
+            f"{sum(copy)/1000:.2f} s total | "
+            f"moe {tot_compute/n:.1f} ms avg | "
             f"STALL {tot_stall/n:.2f} ms avg, {max(stall):.1f} max, "
-            f"{tot_stall:.0f} ms total = {100*tot_stall/max(tot_stall+tot_compute, 1e-9):.0f}% "
-            f"of the pass | worst margin {margins[worst]:+.1f} ms at layer pos "
-            f"{rows[worst][0]}"
+            f"{tot_stall:.0f} ms total = "
+            f"{100*tot_stall/max(tot_stall+tot_compute, 1e-9):.0f}% of stall+moe "
+            f"| worst margin {margins[worst]:+.1f} ms at layer pos {rows[worst][0]}"
         )
 
 
