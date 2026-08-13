@@ -65,14 +65,19 @@ set -u
 HOST=${K3_HOST:-gpusrv}
 SGLANG_LOCAL=${K3_SGLANG:-/home/user/sglang}
 KT_LOCAL=${K3_KT:-/home/user/ktransformers}
-BRANCH_SGLANG=k3-hybrid
-BRANCH_KT=feat/mxfp4-kimi-k3
+# Follow whatever branch this checkout is on, so starting a new work branch
+# needs no edit here -- a stale pin silently deploys the OLD branch and the
+# sha check then fails with the node looking mysteriously behind.
+BRANCH_SGLANG=${K3_BRANCH:-$(git -C "$SGLANG_LOCAL" branch --show-current)}
+BRANCH_KT=${K3_BRANCH_KT:-feat/mxfp4-kimi-k3}
 REMOTE_WS=/workspace
 VENV=$REMOTE_WS/venv-k3
 TORCH_PIN=2.13.0
 
 say(){ echo "[k3] $*"; }
 die(){ echo "[k3] FATAL: $*" >&2; exit 1; }
+[ -n "$BRANCH_SGLANG" ] || die "$SGLANG_LOCAL is on a detached HEAD -- \
+check out a branch, or set K3_BRANCH to the one to deploy"
 rsh(){ ssh -o ConnectTimeout=45 -o ServerAliveInterval=30 "$HOST" bash -s; }
 
 # Prints ENV-PROBE:OK / ENV-PROBE:BAD. Used by bootstrap to decide between
