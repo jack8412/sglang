@@ -370,14 +370,22 @@ if pgrep -f "h[f] download" >/dev/null; then
   echo "an hf download is already running outside tmux -- not starting a second"
   exit 0
 fi
+# Sized from the repo manifest rather than guessed: moonshotai/Kimi-K3 is 118
+# files totalling 1454 GiB (HF API with blobs=true, checked 2026-08-13). hf
+# builds each file as a partial under the local dir and RENAMES it into place
+# on the same filesystem, so peak usage is that total plus metadata -- it does
+# not transiently double. 1500 keeps ~46 GiB of slack and still refuses a disk
+# that genuinely cannot finish. The previous 1800 had no manifest behind it and
+# refused a 1777 GiB B300 node with 300+ GiB to spare.
+NEED_TOTAL=1500
 # The gate must credit bytes already downloaded, or it refuses the very
 # resume it advertises: a half-downloaded k3 on a right-sized disk has
-# LESS than 1800 GiB free precisely because the download made progress.
+# LESS than \$NEED_TOTAL GiB free precisely because the download made progress.
 HAVE=\$(du -sBG \$WS/k3 2>/dev/null | cut -f1 | tr -dc '0-9'); HAVE=\${HAVE:-0}
 FREE=\$(df -BG --output=avail \$WS | tail -1 | tr -dc '0-9')
 [ -z "\$FREE" ] && { echo "REFUSING: cannot determine free space on \$WS"; exit 1; }
-NEED=\$((1800 - HAVE)); [ \$NEED -lt 0 ] && NEED=0
-[ "\$FREE" -lt "\$NEED" ] && { echo "REFUSING: \$FREE GiB free but ~\$NEED GiB still needed (have \$HAVE GiB of ~1.6 TB)"; exit 1; }
+NEED=\$((NEED_TOTAL - HAVE)); [ \$NEED -lt 0 ] && NEED=0
+[ "\$FREE" -lt "\$NEED" ] && { echo "REFUSING: \$FREE GiB free but ~\$NEED GiB still needed (have \$HAVE GiB of ~1.45 TB)"; exit 1; }
 # Keep the previous attempt's tail: the rerun is the documented recovery
 # step and must not erase the evidence of why the last attempt died.
 [ -f \$WS/runs/logs/k3-download.log ] && mv \$WS/runs/logs/k3-download.log \$WS/runs/logs/k3-download.log.1
