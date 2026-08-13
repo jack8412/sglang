@@ -4664,6 +4664,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 38 tokens short of the threshold and 6.4x slower overall.
         self._split_prefill_threshold = _SPLIT_PREFILL_MIN_TOKENS
         self._split_prefill_validate = envs.SGLANG_KT_VERIFY_SPLIT_PREFILL.get()
+        # Cap the MoE's per-call transients by running it in token tiles. Both
+        # scale with tokens -- the gemm2 buffer the kernel sizes for all
+        # T*top_k slots, and the fp32 accumulator -- while a token's output
+        # depends only on its own row, so tiling changes no value. 0 disables.
+        self._split_prefill_token_tile = (
+            envs.SGLANG_KT_SPLIT_PREFILL_TOKEN_TILE.get() or None
+        )
         self._cold_pipeline = None
         self._cold_scalars = None
         self._margin_insist_count: Optional[torch.Tensor] = None
@@ -5287,6 +5294,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             top_k=packed.shape[1],
             intermediate_size=self.gpu_method.intermediate_size_per_partition,
             validate=self._split_prefill_validate,
+            token_tile=self._split_prefill_token_tile,
         )
 
         self._cold_pipeline.record_compute_and_prefetch_next(layer_idx)

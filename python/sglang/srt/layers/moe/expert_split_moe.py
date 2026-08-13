@@ -63,6 +63,61 @@ def assert_slices_partition(idx_a: torch.Tensor, idx_b: torch.Tensor) -> None:
         )
 
 
+def _tiled_split_slice_moe(
+    *,
+    situ_moe,
+    packed_topk: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    resident: dict,
+    cold: dict,
+    num_experts: int,
+    num_resident: int,
+    top_k: int,
+    intermediate_size: int,
+    shared_output: Optional[torch.Tensor],
+    validate: bool,
+    token_tile: int,
+) -> torch.Tensor:
+    """Run ``split_slice_moe`` over token tiles, writing into one output.
+
+    Each tile's transients are freed before the next allocates, so peak
+    follows the tile, not the chunk. The output is preallocated and written
+    in place -- collecting tiles and concatenating would reintroduce a
+    full-size buffer and undo the saving.
+    """
+    num_tokens = packed_topk.shape[0]
+    hidden_size = (
+        shared_output.shape[1] if shared_output is not None
+        else hidden_states.shape[-1] * (2 if hidden_states.dtype == torch.uint8 else 1)
+    )
+    out = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+    )
+    for lo in range(0, num_tokens, token_tile):
+        hi = min(lo + token_tile, num_tokens)
+        out[lo:hi] = split_slice_moe(
+            situ_moe=situ_moe,
+            packed_topk=packed_topk[lo:hi],
+            hidden_states=hidden_states[lo:hi],
+            hidden_states_scale=(
+                None if hidden_states_scale is None else hidden_states_scale[lo:hi]
+            ),
+            resident=resident,
+            cold=cold,
+            num_experts=num_experts,
+            num_resident=num_resident,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            shared_output=(
+                None if shared_output is None else shared_output[lo:hi]
+            ),
+            validate=validate,
+            token_tile=None,          # already tiled
+        )
+    return out
+
+
 def split_slice_moe(
     *,
     situ_moe,
@@ -77,8 +132,18 @@ def split_slice_moe(
     intermediate_size: int,
     shared_output: Optional[torch.Tensor] = None,
     validate: bool = False,
+    token_tile: Optional[int] = None,
 ) -> torch.Tensor:
     """Run the MoE over resident + cold expert slices and finalize once.
+
+    ``token_tile`` splits the call into batches of at most that many tokens.
+    A token's MoE output depends only on its own row, so tiling changes no
+    value -- but both large transients (the gemm2 buffer, which the kernel
+    sizes for ALL T*top_k slots, and the fp32 accumulator) scale with the
+    tile rather than the chunk. Measured at a 49152 chunk: peak 7.01 GiB
+    untiled vs 2.94 at a 16384 tile, for ~7% more MoE time -- and the MoE is
+    ~19% of the forward, so ~1.3% end to end. That is what lets a large chunk
+    coexist with a long-context KV pool.
 
     ``resident`` / ``cold`` each carry ``w13``, ``w13_scale``, ``w2``,
     ``w2_scale``, ``alpha``, ``beta`` -- the per-slice weights and the
@@ -88,6 +153,19 @@ def split_slice_moe(
     ``packed_topk`` must already be in SLOT space: resident experts at
     ``[0, num_resident)`` and cold experts at ``[num_resident, num_experts)``.
     """
+    num_tokens = packed_topk.shape[0]
+    if token_tile and num_tokens > token_tile:
+        return _tiled_split_slice_moe(
+            situ_moe=situ_moe, packed_topk=packed_topk,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            resident=resident, cold=cold, num_experts=num_experts,
+            num_resident=num_resident, top_k=top_k,
+            intermediate_size=intermediate_size,
+            shared_output=shared_output, validate=validate,
+            token_tile=token_tile,
+        )
+
     from sglang.kernels.ops.moe.moe_finalize_fuse_shared import (
         moe_finalize_fuse_shared,
     )
