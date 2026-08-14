@@ -3861,7 +3861,23 @@ def _margin_override_topk_ids_impl(
     else:
         slot_logit = torch.gather(logits, -1, safe_ids)
         lead = slot_logit - best_alt
-        override_slots = cpu_routed & (lead < margin) & finite_alt
+        # ``margin`` is either a float (server default for every token) or a
+        # [num_tokens] tensor of per-request overrides. The tensor form
+        # broadcasts against lead's [num_tokens, top_k] once unsqueezed, so the
+        # rule is unchanged per slot -- only the threshold varies by row.
+        if isinstance(margin, torch.Tensor):
+            # Per-token thresholds. The extra ``margin > 0`` term carries the
+            # count-only contract PER TOKEN: with a scalar margin the caller
+            # enforces "0.0 means route exactly" by skipping the rewrite for
+            # the whole batch, which cannot express one request at 0.0 beside
+            # another at 2.0. Without this term such a request would be
+            # overridden whenever its lead were negative.
+            margin = margin.reshape(-1, 1)
+            override_slots = (
+                cpu_routed & (lead < margin) & (margin > 0.0) & finite_alt
+            )
+        else:
+            override_slots = cpu_routed & (lead < margin) & finite_alt
 
     # Rank overridden slots within each token, then drop any slot whose
     # assigned alternative is -inf (fewer unselected residents than
@@ -4842,7 +4858,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # steps -- exactly 92 layers x 3 and 92 x 2. Baked into the captured
         # graph, so they run every step forever whether or not anything reads
         # them. Maintained only where something does.
-        if self._margin is not None and self._counters_enabled:
+        # Gated on the swap interval, NOT on margin. Demand is
+        # `routed & ~gpu_experts_mask[topk_ids]` and hits are its complement --
+        # both functions of the routed ids and the residency mask alone. The
+        # margin only decides how demand splits into kept-on-CPU vs
+        # substituted-to-GPU, and that split cancels in the sum the policy
+        # reads (kt_expert_swap.py:283). So swapping does not need margin, and
+        # exact routing + adaptive placement is now a legal configuration.
+        # See SPEC-SWAP-DEMAND.md.
+        if self._counters_enabled and (
+            self._margin is not None or self.kt_config.expert_swap_interval > 0
+        ):
+            # Demand the router asked for and we did NOT substitute away. With
+            # margin unset nothing is ever substituted, so this holds all of it;
+            # under margin routing it is the "insist" half and the counter below
+            # carries the rest. Either way the policy sums the two.
             self._margin_insist_count = torch.zeros(
                 num_experts, dtype=torch.int32, device=target_device
             )
@@ -5347,6 +5377,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and num_tokens >= self._split_prefill_threshold
             and not torch.cuda.is_current_stream_capturing()
         ):
+            # Count demand before returning. Split prefill computes every
+            # expert on GPU, so residency does not change this forward's
+            # result -- but the router's behaviour over the PROMPT is the best
+            # available forecast of what the decode about to start will ask
+            # for, since the two share a domain. Observing it here is what
+            # lets a swap at the prefill->decode boundary cut a set for the
+            # request's own domain. Free of consequence as well as cheap:
+            # nothing here can perturb what it measures. See SPEC-SWAP-DEMAND.
+            if self._counters_enabled:
+                self._update_demand_counters(dispatch_output.topk_output.topk_ids)
             return self._split_prefill_apply(layer, dispatch_output, num_tokens)
 
         # No layer filter: placement strategies (layer_concentrated) put
@@ -5541,7 +5581,27 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # counting across decode graph replays.  The full-GPU prefill paths
         # above bypass this on purpose: they compute every routed expert on
         # GPU, so overriding there would cost accuracy for nothing.
-        if self._margin is not None:
+        #
+        # Margin-unset serving still feeds the swap policy. Demand and hits are
+        # functions of the routed ids and the residency mask alone, so nothing
+        # about them requires a margin (SPEC-SWAP-DEMAND). This branch is what
+        # makes exact routing WITH adaptive placement a legal configuration --
+        # bit-exact output, resident set still following the workload.
+        # Margin routing runs when the SERVER set a default, or when any
+        # request in this batch asked for one. Gating on the server default
+        # alone silently dropped SamplingParams.kt_routing_margin on a server
+        # started without --kt-routing-margin: the value reached ForwardBatch
+        # and the graph buffer, and then nothing read it.
+        _per_req_margin = self._any_request_margin()
+
+        if self._margin is None and not _per_req_margin and self._counters_enabled:
+            self._update_demand_counters(dispatch_output.topk_output.topk_ids)
+            # Swap windows moved to the scheduler (SPEC-SWAP-DEMAND Phase 3):
+            # mid-prompt re-cuts stall the throughput-critical path, and this
+            # call site never ran under --kt-expert-split-prefill anyway --
+            # split prefill returns before it and decode replays a graph.
+
+        if self._margin is not None or _per_req_margin:
             from sglang.srt.layers.moe.topk import StandardTopKOutput
 
             _format_ok = (
@@ -5566,7 +5626,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         topk_output.topk_ids,
                         topk_output.router_logits,
                         self.gpu_experts_mask_cuda,
-                        self._margin,
+                        self._resolve_margin(topk_output.topk_ids),
                         self._full_override,
                     )
                 )
@@ -5576,7 +5636,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     )
                 # margin == 0.0 is count-only (documented flag contract):
                 # counters record what WOULD override, routing stays exact.
-                if self._full_override or self._margin > 0.0:
+                # With per-request margins the decision is per token, made
+                # inside the kernel by the `margin > 0` term, so the rewrite is
+                # applied and tokens at 0.0 come back unchanged. The
+                # `is not None` guard matters: a server with no default but a
+                # request that asked reaches here with self._margin None, and
+                # `None > 0.0` raises.
+                if (
+                    self._full_override
+                    or _per_req_margin
+                    or (self._margin is not None and self._margin > 0.0)
+                ):
                     topk_output = topk_output._replace(topk_ids=new_topk_ids)
                     dispatch_output = dispatch_output._replace(
                         topk_output=topk_output
@@ -5586,16 +5656,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # The first registered layer drives the swap window for the
                 # whole model: later layers have not read their membership
                 # yet this forward, so one window keeps the batch consistent.
-                if (
-                    self.kt_config.expert_swap_interval > 0
-                    and _KT_EP_METHODS
-                    and _KT_EP_METHODS[0] is self
-                    and not torch.cuda.is_current_stream_capturing()
-                ):
-                    try:
-                        maybe_run_expert_swap_window(self)
-                    except Exception:
-                        logger.exception("[kt-swap] window failed; serving continues")
+                # Swap windows moved to the scheduler (SPEC-SWAP-DEMAND Phase 3):
+                # mid-prompt re-cuts stall the throughput-critical path, and this
+                # call site never ran under --kt-expert-split-prefill anyway --
+                # split prefill returns before it and decode replays a graph.
             elif not self._margin_format_warned:
                 self._margin_format_warned = True
                 logger.warning(
@@ -5918,6 +5982,96 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             slot = kt_doorbell_bind_slot(self, staging_buffer, topk_ids)
             self._db_slots[batch_size] = slot
         return slot
+
+    def _any_request_margin(self) -> bool:
+        """True when some request in this batch carried a margin override.
+
+        Cheap: the per-token tensor is None unless a request asked, so this is
+        an identity check, not a scan.
+        """
+        from sglang.srt.model_executor.forward_context import (
+            get_forward_context,
+            has_forward_context,
+        )
+
+        if not has_forward_context():
+            return False
+        return get_forward_context().kt_routing_margin is not None
+
+    def _resolve_margin(self, topk_ids):
+        """The margin threshold for this forward: a float, or one per token.
+
+        Returns ``self._margin`` unless some request in the batch carried a
+        ``SamplingParams.kt_routing_margin``, in which case a [num_tokens]
+        tensor is returned with the server default substituted wherever a
+        request did not ask for one (sentinel < 0).
+
+        Falls back to the scalar whenever the per-token tensor is absent or the
+        wrong length. That direction is deliberate: getting this wrong by
+        length would apply one request's quality setting to another's tokens,
+        which is silent and unattributable, whereas falling back merely ignores
+        an override and leaves behaviour at the documented server default.
+        """
+        from sglang.srt.model_executor.forward_context import (
+            get_forward_context,
+            has_forward_context,
+        )
+
+        # get_forward_context() asserts rather than returning None, and this
+        # code also runs from paths that publish no context (unit tests, the
+        # standalone probes in runs/meta), so the guard is required.
+        if not has_forward_context():
+            return self._margin
+        per_token = get_forward_context().kt_routing_margin
+        if per_token is None or per_token.shape[0] != topk_ids.shape[0]:
+            return self._margin
+        # What a token gets when its request named no margin. The server
+        # default if there is one; otherwise 0.0, which is not a fallback but
+        # the exact meaning of an unset server margin -- margin 0.0 is
+        # count-only by the flag's contract: record what WOULD override,
+        # route exactly. So a request opting in to margin routing on a server
+        # that did not enable it leaves every other request bit-exact.
+        default = 0.0 if self._margin is None else float(self._margin)
+        # Sentinel (negative) means "this request did not ask"; SamplingParams
+        # rejects negative margins, so the value cannot be a real request's.
+        return torch.where(
+            per_token < 0.0, torch.full_like(per_token, default), per_token
+        )
+
+    def _update_demand_counters(self, topk_ids) -> None:
+        """Fold one forward into the demand counters, with no margin involved.
+
+        For the paths that never produce insist/override slots: split prefill
+        (which computes every expert on GPU and returns before the margin
+        block) and margin-unset serving. Demand is defined directly:
+
+            demand = routed & ~gpu_experts_mask[topk_ids]
+            hits   = routed &  gpu_experts_mask[topk_ids]
+
+        which is the same quantity ``_update_margin_counters`` produces as
+        insist + override -- margin only partitions it. Everything lands in the
+        insist counter because nothing was substituted; ``snapshot_counters``
+        sums the pair, so the policy sees an identical figure either way.
+
+        Counts on the ids the ROUTER chose. Under split prefill that is also
+        the id actually computed (all 896 are), so there is no pre/post
+        distinction to get wrong here.
+        """
+        # Both guards are load-bearing and independent: the swap driver checks
+        # gpu_experts_mask_cuda and the counter separately (:6599), so the mask
+        # can be absent while the counters exist. Indexing a None mask here
+        # would crash the split-prefill path.
+        if self._margin_insist_count is None or self.gpu_experts_mask_cuda is None:
+            return
+        safe_ids = topk_ids.clamp_min(0).reshape(-1).to(torch.int64)
+        routed = (topk_ids >= 0).reshape(-1)
+        resident = self.gpu_experts_mask_cuda[safe_ids]
+        self._margin_insist_count.scatter_add_(
+            0, safe_ids, (routed & ~resident).to(torch.int32)
+        )
+        self._resident_hit_count.scatter_add_(
+            0, safe_ids, (routed & resident).to(torch.int32)
+        )
 
     def _update_margin_counters(self, topk_ids, insist_slots, override_slots) -> None:
         """Fold one forward into the per-expert demand counters.
@@ -6443,7 +6597,78 @@ def _kt_swap_tables(method) -> "object":
     )
 
 
-def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
+# Phase-3 boundary state (SPEC-SWAP-DEMAND). Module-level for the same reason
+# _KT_SWAP_STATE is: the driver is a free function over the registered wrappers,
+# not a method on any one of them.
+# Minimum wall-clock seconds between boundary windows. Sized from the swap
+# cost model in SPEC-SWAP-DEMAND: one unit of --kt-expert-swap-max moves
+# 92 layers x 4.39 MB = 403.6 MB/rank, ~14.5 ms at the measured 27.9 GB/s.
+# At the default budget that is ~58 ms, so a 30 s floor holds the window
+# under ~0.2% of serving time even before the budget is raised.
+_KT_SWAP_MIN_SECONDS = 30.0
+
+_KT_BOUNDARY_STATE = {
+    "last_was_extend": False,
+    "last_swap_ts": 0.0,
+    "observed": False,
+}
+
+
+def maybe_run_expert_swap_at_decode_boundary(is_decode: bool, is_extend: bool) -> None:
+    """Run one swap window at a prefill->decode boundary, from the scheduler.
+
+    WHY NOT WHERE IT USED TO BE. ``maybe_run_expert_swap_window`` is called from
+    a layer's ``apply()`` and only executes eagerly, so under
+    ``--kt-expert-split-prefill`` it never runs at all: split prefill returns
+    before the margin block that hosts the call, and decode replays a captured
+    graph in which no Python executes. Swapping was inert in exactly the
+    configuration this campaign ships.
+
+    WHY HERE. The scheduler loop is Python between batches, so a device sync is
+    legal and nothing is mid-chunk. It is also the only place that knows a
+    request just left prefill -- the moment when the demand observed over the
+    prompt is freshest and the decode about to consume the resident set has not
+    started. One window per request-arrival instead of several per prompt.
+
+    RATE LIMIT IS NOT OPTIONAL. With continuous batching at 8 concurrent
+    requests a prefill->decode transition lands every ~2.5 s; an unthrottled
+    window there costs far more than it returns. The interval is expressed in
+    seconds of wall clock rather than forwards because the cost being bounded
+    (a quiesce plus weight copies) is wall-clock cost.
+    """
+    if not _KT_EP_METHODS:
+        return
+    anchor = _KT_EP_METHODS[0]
+    cfg = anchor.kt_config
+    if cfg.expert_swap_interval <= 0:
+        _KT_BOUNDARY_STATE["last_was_extend"] = is_extend
+        return
+
+    crossed = is_decode and _KT_BOUNDARY_STATE["last_was_extend"]
+    _KT_BOUNDARY_STATE["last_was_extend"] = is_extend
+    if not crossed:
+        return
+
+    now = time.monotonic()
+    if now - _KT_BOUNDARY_STATE["last_swap_ts"] < _KT_SWAP_MIN_SECONDS:
+        return
+    _KT_BOUNDARY_STATE["last_swap_ts"] = now
+
+    first = not _KT_BOUNDARY_STATE["observed"]
+    _KT_BOUNDARY_STATE["observed"] = True
+    try:
+        # First transition observes only: the EMA needs history before a
+        # decision rests on it.
+        maybe_run_expert_swap_window(anchor, force=True, act=not first)
+    except Exception:
+        logger.exception("[kt-swap] boundary window failed; serving continues")
+
+
+def maybe_run_expert_swap_window(
+    anchor: "KTEPWrapperMethod",
+    force: bool = False,
+    act: Optional[bool] = None,
+) -> None:
     """Quiesce and re-cut expert membership, every N eager forwards.
 
     Called from the FIRST registered layer's apply(). Two properties make that
@@ -6475,9 +6700,15 @@ def maybe_run_expert_swap_window(anchor: "KTEPWrapperMethod") -> None:
     # the first window acts -- and a short run still swaps instead of doing
     # nothing at all, which is how three separate runs came back empty.
     sample_every = max(1, cfg.expert_swap_interval // 5)
-    if n % sample_every:
+    if not force and n % sample_every:
         return
-    act = (n % cfg.expert_swap_interval) == 0
+    # A boundary call has already decided WHETHER to act -- it fires once
+    # per prefill->decode transition and is rate-limited on wall clock, so
+    # re-gating on the eager-forward counter would drop most windows. It
+    # still passes act=False for its first call, because a cumulative
+    # counter's first delta is the whole launch history and acting on that
+    # baseline is what the interval//5 sampling exists to prevent.
+    act = act if act is not None else (n % cfg.expert_swap_interval) == 0
 
     entries = []
     for method in _KT_EP_METHODS:

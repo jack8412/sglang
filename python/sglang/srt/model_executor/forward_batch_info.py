@@ -473,6 +473,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
 
+    # Per-token override for --kt-routing-margin, float32 [num_tokens].
+    # Built from each request's SamplingParams.kt_routing_margin and expanded
+    # to tokens, so one batch can serve requests at different quality points.
+    # None when no request asked for one, in which case the KT wrapper uses the
+    # server default. Read inside the MoE forward, not by the sampler.
+    kt_routing_margin: Optional[torch.Tensor] = None
+
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
@@ -969,6 +976,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.dcp_kv_mask = (
                 ret.positions % model_runner.dcp_size == model_runner.dcp_rank
             )
+
+        ret.kt_routing_margin = _build_kt_routing_margin(batch, ret, device)
 
         return ret
 
@@ -1756,3 +1765,74 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+# Sentinel for "this request did not ask for a margin". The value is negative
+# because SamplingParams.verify() rejects negative margins, so it cannot
+# collide with a real request value; the KT wrapper substitutes the server
+# default wherever it sees one.
+KT_ROUTING_MARGIN_UNSET = -1.0
+
+
+def _build_kt_routing_margin(
+    batch: ScheduleBatch,
+    fb: "ForwardBatch",
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Per-token margin overrides, or None when nobody asked for one.
+
+    Returning None on the common path matters: it is what keeps this free for
+    every deployment that does not use per-request margins, and it is the
+    signal the KT wrapper uses to take its original scalar path.
+
+    Expansion is per token because the MoE sees a flat token batch with no
+    request boundaries. Decode contributes one token per request; extend
+    contributes ``extend_seq_lens`` of them.
+
+    Falls back to None rather than guessing whenever the expanded length does
+    not match the batch (speculative decoding contributes several tokens per
+    request, and a wrong-length margin tensor would silently mis-assign
+    quality settings across requests).
+    """
+    reqs = batch.reqs
+    if not reqs:
+        return None
+    # Short-circuit BEFORE materialising anything. This runs on every forward
+    # of every deployment, and the overwhelmingly common answer is "nobody
+    # asked", so the common path must not build a list.
+    if all(
+        r.sampling_params is None or r.sampling_params.kt_routing_margin is None
+        for r in reqs
+    ):
+        return None
+    per_req = [
+        (
+            r.sampling_params.kt_routing_margin
+            if r.sampling_params is not None
+            and r.sampling_params.kt_routing_margin is not None
+            else KT_ROUTING_MARGIN_UNSET
+        )
+        for r in reqs
+    ]
+
+    if fb.forward_mode.is_decode():
+        counts = None
+    elif fb.extend_seq_lens_cpu is not None:
+        counts = fb.extend_seq_lens_cpu
+    else:
+        return None
+
+    if counts is None:
+        values = per_req
+    else:
+        if len(counts) != len(per_req):
+            return None
+        values = [m for m, n in zip(per_req, counts) for _ in range(n)]
+
+    num_tokens = int(fb.input_ids.shape[0]) if fb.input_ids is not None else 0
+    if len(values) != num_tokens:
+        return None
+    # Host-side build then async H2D, matching how extend_seq_lens is staged
+    # a few hundred lines above. Constructing straight onto the device would
+    # make this a synchronising copy on every forward that uses the feature.
+    return torch.tensor(values, dtype=torch.float32).to(device, non_blocking=True)

@@ -435,6 +435,9 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = server_args.enable_hisparse
+        # Init-static: server args are frozen for the scheduler's lifetime, so
+        # resolve this once rather than re-reading it on every run_batch.
+        self.enable_kt_expert_swap = bool(server_args.kt_expert_swap_interval)
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
 
@@ -3534,6 +3537,30 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
+    def _maybe_run_kt_expert_swap(self, batch: ScheduleBatch) -> None:
+        """Delegate the prefill->decode expert-swap boundary to the KT module.
+
+        Orchestration only: the scheduler contributes the one fact no layer can
+        see -- that this batch is decode and the previous was extend -- and the
+        policy, rate limit and transfers live in kt_ep_wrapper. Inert (a dict
+        lookup and a return) unless --kt-expert-swap-interval is set.
+
+        It has to be here rather than in a layer's apply(): the window needs
+        Python and a device sync, and under --kt-expert-split-prefill neither
+        exists at the point the old call site sat -- split prefill returns
+        before it, and decode replays a captured graph.
+        """
+        if not self.enable_kt_expert_swap:
+            return
+        from sglang.srt.layers.moe.kt_ep_wrapper import (
+            maybe_run_expert_swap_at_decode_boundary,
+        )
+
+        maybe_run_expert_swap_at_decode_boundary(
+            is_decode=batch.forward_mode.is_decode(),
+            is_extend=batch.forward_mode.is_extend(),
+        )
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -3548,6 +3575,8 @@ class Scheduler(
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
+
+        self._maybe_run_kt_expert_swap(batch)
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)

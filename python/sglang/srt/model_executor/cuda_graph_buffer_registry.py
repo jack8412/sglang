@@ -507,6 +507,30 @@ class CudaGraphBufferRegistry:
         return dataclasses.replace(forward_batch_template, **replace_kwargs)
 
 
+def _kt_routing_margin_post_fill(buf, fb, ctx) -> None:
+    """Write this iteration's per-token margins, or clear the head.
+
+    Clearing matters as much as writing: the buffer is graph-resident and
+    persists across replays, so a batch with no per-request margins must reset
+    the head to the sentinel rather than inherit the previous batch's values.
+    A plain FB copy cannot express that -- fill_from skips a None source and
+    leaves the head stale -- which is why this slot is computed.
+    """
+    # Imported here, not at module scope: forward_batch_info is a TYPE_CHECKING
+    # import in this file precisely to keep the two modules acyclic.
+    from sglang.srt.model_executor.forward_batch_info import KT_ROUTING_MARGIN_UNSET
+
+    head = buf[: ctx.padded_num_tokens]
+    src = fb.kt_routing_margin
+    if src is None:
+        head.fill_(KT_ROUTING_MARGIN_UNSET)
+        return
+    n = min(int(src.shape[0]), head.shape[0])
+    head[:n].copy_(src[:n])
+    if n < head.shape[0]:
+        head[n:].fill_(KT_ROUTING_MARGIN_UNSET)
+
+
 def build_decode_registry(
     *,
     device: torch.device,
@@ -548,6 +572,10 @@ def build_decode_registry(
     it instead of allocating, so the registry shares one physical allocation
     with that object. With ``source=None`` the registry allocates its own.
     """
+    from sglang.srt.model_executor.forward_batch_info import (
+        KT_ROUTING_MARGIN_UNSET,
+    )
+
     reg = CudaGraphBufferRegistry(
         device=device,
         max_bs=max_bs,
@@ -576,6 +604,33 @@ def build_decode_registry(
             cache_loc_dtype,
             axis="tokens",
             padding_policy=PaddingPolicy.ZERO,
+        ),
+        # Per-request --kt-routing-margin overrides, expanded to tokens.
+        #
+        # Graph-resident because decode replays a captured graph: a tensor
+        # freshly allocated per step would never be read. Sentinel-padded
+        # rather than zero-padded because 0.0 is a MEANINGFUL margin
+        # (count-only -- record what would override, route exactly), so a
+        # padded lane must stay distinguishable from a request asking for 0.
+        #
+        # COMPUTED (copy_from_fb=False + post_fill), which is load-bearing:
+        # extract_buffer carries the template for a plain-copy slot whose FB
+        # field is None, and capture runs on a dummy batch that carries no
+        # per-request margins. A plain slot would therefore be absent AT
+        # CAPTURE, the captured kernels would close over the scalar default,
+        # and every later replay would silently ignore per-request margins --
+        # right answers for the wrong request's quality setting. Being
+        # computed, the buffer is always exposed, so capture binds to it and
+        # replays read whatever post_fill wrote.
+        GraphSlot(
+            "kt_routing_margin",
+            _tokens,
+            torch.float32,
+            axis="tokens",
+            padding_policy=PaddingPolicy.FILL_SENTINEL,
+            pad_value=KT_ROUTING_MARGIN_UNSET,
+            copy_from_fb=False,
+            post_fill=_kt_routing_margin_post_fill,
         ),
         GraphSlot(
             "req_pool_indices",

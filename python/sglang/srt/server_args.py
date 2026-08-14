@@ -7026,12 +7026,13 @@ class ServerArgs:
                 "SPEC-DOORBELL-TRANSPORT.md."
             )
 
-        if self.kt_expert_swap_interval and self.kt_routing_margin is None:
-            raise ValueError(
-                "--kt-expert-swap-interval needs --kt-routing-margin: the swap "
-                "policy is driven by the insist/override/resident-hit counters, "
-                "which only exist when margin routing is on."
-            )
+        # --kt-expert-swap-interval no longer requires --kt-routing-margin.
+        # The swap policy reads demand (router asked for a non-resident expert)
+        # and hits (asked for a resident one); both are functions of the routed
+        # ids and the residency mask alone. Margin only decides how demand
+        # splits into kept-on-CPU vs substituted-to-GPU, and that split cancels
+        # in the sum the policy consumes. Exact routing with adaptive placement
+        # is therefore a legal configuration. See SPEC-SWAP-DEMAND.md.
 
         if self.kt_routing_full_override:
             if self.kt_max_deferred_experts_per_token:

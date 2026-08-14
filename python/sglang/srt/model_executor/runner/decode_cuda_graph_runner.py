@@ -836,6 +836,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         seq_lens_cpu = _slot("seq_lens_cpu")
         out_cache_loc = _slot("out_cache_loc")
         positions = _slot("positions")
+        kt_routing_margin = _slot("kt_routing_margin")
         encoder_lens = (
             _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
         )
@@ -919,6 +920,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
             input_ids=input_ids,
+            kt_routing_margin=kt_routing_margin,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
@@ -1082,7 +1084,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
-        with forward_context(ForwardContext(attn_backend=attn_backend)):
+        with forward_context(
+            ForwardContext(
+                attn_backend=attn_backend,
+                # Load-bearing: the KT MoE resolves per-request margins
+                # off the context. Capturing without it makes the wrapper
+                # see None, fall back to the scalar server default, and
+                # bake THAT into the graph -- so every replay would ignore
+                # SamplingParams.kt_routing_margin, silently.
+                kt_routing_margin=forward_batch.kt_routing_margin,
+            )
+        ):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if forward_batch.lora_ids is not None:

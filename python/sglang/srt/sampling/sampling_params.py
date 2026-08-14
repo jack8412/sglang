@@ -63,6 +63,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     top_p: float = 1.0
     top_k: int = TOP_K_ALL
     min_p: float = 0.0
+    # Per-request override for --kt-routing-margin (KT hybrid CPU/GPU MoE).
+    # None = use the server default. Unlike the fields around it this is NOT a
+    # sampling knob: it is read inside the MoE forward, not by the sampler. It
+    # lives here because it is the per-request surface callers already reach
+    # for, and it is carried per request to the model rather than through
+    # SamplingBatchInfo. Ignored entirely by non-KT models.
+    kt_routing_margin: Optional[float] = None
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -155,6 +162,14 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             )
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
+        if self.kt_routing_margin is not None and self.kt_routing_margin < 0.0:
+            # Upper bound is deliberately open: the margin is a router-logit
+            # gap, and a large value (the margin10 instrument) is a legitimate
+            # setting, not an error. 0.0 is count-only by the flag's contract.
+            raise ValueError(
+                f"kt_routing_margin must be non-negative, got "
+                f"{self.kt_routing_margin}."
+            )
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
         if self.top_k < 1 or self.top_k == -1:
