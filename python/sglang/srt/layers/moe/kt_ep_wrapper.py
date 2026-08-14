@@ -6857,16 +6857,31 @@ def maybe_run_expert_swap_window(
         torch.cuda.synchronize()
 
         # WRITE: scatter every promoted row back, again one kernel per name.
+        promoted = {
+            name: torch.stack([it["promoted"][name] for it in items]).to(
+                dev, non_blocking=True
+            )
+            for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+        }
+        if store is not None and getattr(store, "raw_layout", False):
+            # The store holds checkpoint-layout bytes, so the resident row's
+            # trtllm layout is produced HERE, on the GPU, rather than by asking
+            # the CPU for it. Same four-gather form split prefill uses, just
+            # over this layer's swaps instead of its whole cold set.
+            promoted = _swizzle_promoted_rows(promoted)
         for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
-            stacked = torch.stack([it["promoted"][name] for it in items])
             _bytes(getattr(layer, name).data).index_copy_(
-                0, idx, _bytes(stacked.to(dev, non_blocking=True))
+                0, idx, _bytes(promoted[name])
             )
 
         # The store is authoritative for the cold set, so the demoted rows go
         # back into the slots the promoted experts vacated. Slices of the
         # pinned staging are already on CPU, so write_row's .to("cpu") is free;
         # they are handed back in the param's own dtype, which write_row checks.
+        if store is not None and getattr(store, "raw_layout", False):
+            # Mirror of the promotion side: the rows gathered off the GPU are
+            # in trtllm layout, and a raw store must not be given those.
+            staged = _unswizzle_demoted_rows(staged, dtypes)
         for i, it in enumerate(items):
             store.write_row(
                 layer_idx,
@@ -7455,21 +7470,11 @@ def finalize_split_prefill(server_args) -> bool:
         # The plan builder falls back rather than guessing, so honour that here
         # too: without it, `dynamic` would size the store by a None shape map.
         dynamic = dynamic and swizzle_plan is not None and raw_shapes is not None
-        if dynamic and anchor.kt_config.expert_swap_interval > 0:
-            # The swap path shares these rows and assumes GPU layout on BOTH
-            # sides: _move scatters stage_row() straight into a resident row,
-            # and _flush_moves write_row()s bytes gathered off the GPU. Against
-            # a raw store that mixes layouts silently -- right shapes, right
-            # sizes, wrong experts, no crash. Refuse rather than serve that.
-            raise ValueError(
-                "SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE stores the cold set in "
-                "checkpoint layout, but --kt-expert-swap-interval "
-                f"{anchor.kt_config.expert_swap_interval} makes the swap path "
-                "read and write those same rows as GPU-layout bytes. Run with "
-                "--kt-expert-swap-interval 0, or leave dynamic swizzle off, "
-                "until promotion swizzles and demotion unswizzles across that "
-                "boundary."
-            )
+        # Swapping used to be refused here: the swap path reads and writes
+        # these same rows, and against a raw store that mixed layouts silently.
+        # It no longer does -- _flush_moves swizzles a promotion on its way to
+        # the resident row and unswizzles a demotion on its way back -- so the
+        # two can now run together.
         store = build_cold_store(
             layer_indices=layer_indices,
             gpu_experts_mask=anchor.gpu_experts_mask,
@@ -7504,6 +7509,19 @@ def finalize_split_prefill(server_args) -> bool:
 
     _KT_SPLIT_PREFILL_STATE["store"] = store
     _KT_SPLIT_PREFILL_STATE["pipeline"] = pipeline
+    # The swap path needs these too: against a raw store a promotion must
+    # swizzle on the way to the GPU and a demotion must unswizzle on the way
+    # back, or the two sides silently disagree about layout.
+    _KT_SPLIT_PREFILL_STATE["swizzle_plan"] = swizzle_plan
+    _KT_SPLIT_PREFILL_STATE["swizzle_inverse"] = None
+    _KT_SPLIT_PREFILL_STATE["raw_scale_shapes"] = (
+        None
+        if not dynamic
+        else (
+            tuple(raw_shapes["w13_weight_scale"][0]),
+            tuple(raw_shapes["w2_weight_scale"][0]),
+        )
+    )
     for method, _ in _KT_SPLIT_PREFILL_LAYERS:
         method._cold_pipeline = pipeline
         method._split_prefill_ready = True
@@ -7589,6 +7607,113 @@ def _start_demotion_prefetch(anchor, entries):
     logger.info(
         "[kt-swap] prefetching %d demoted experts off the critical path", len(plan)
     )
+
+
+def _swizzle_promoted_rows(promoted):
+    """Checkpoint-layout promoted rows -> the resident trtllm layout, on GPU.
+
+    Against a raw store this is what replaces asking kt for a GPU-layout
+    export. kt's own export costs 57-68 ms per layer's cold set, ~38.7 ms of it
+    CPU work reading AMX buffers and expanding E8M0 scales to bf16 -- work this
+    path would immediately undo, since the resident layout wants those codes
+    back as bytes. Doing the transform on device instead touches no CPU at all
+    and reuses the same four-gather form split prefill uses.
+    """
+    from sglang.srt.layers.moe.kt_mxfp4_export import apply_batched_swizzle
+
+    plan = _KT_SPLIT_PREFILL_STATE.get("swizzle_plan")
+    if plan is None:
+        raise RuntimeError(
+            "raw cold store but no swizzle plan: promotions cannot be written "
+            "to a resident row without one"
+        )
+    names = _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+    out = apply_batched_swizzle(
+        plan=plan,
+        raw_w13=promoted[names[0]],
+        raw_w13_scale=promoted[names[1]],
+        raw_w2=promoted[names[2]],
+        raw_w2_scale=promoted[names[3]],
+    )
+    return dict(zip(names, out))
+
+
+def _unswizzle_demoted_rows(staged, dtypes):
+    """Resident trtllm rows -> checkpoint layout, for writing back to a raw store.
+
+    Per expert rather than batched: a window demotes at most a handful per
+    layer (8 at the default swap-max), so ~52 us each is nothing, and the
+    per-expert inverse is the form already proved bitwise.
+    """
+    from sglang.srt.layers.moe.kt_mxfp4_export import (
+        trtllm_inverse_indices,
+        trtllm_permute_indices,
+        unswizzle_trtllm_expert,
+    )
+
+    names = _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+    shapes = _KT_SPLIT_PREFILL_STATE.get("raw_scale_shapes")
+    if shapes is None:
+        raise RuntimeError("raw cold store but no raw scale shapes recorded")
+    w13_scale_shape, w2_scale_shape = shapes
+
+    # staged is PINNED HOST memory, but the permutations and the interleave
+    # are CUDA-only, so the transform runs on the plan's device and the result
+    # comes back to host for write_row.
+    plan = _KT_SPLIT_PREFILL_STATE.get("swizzle_plan")
+    if plan is None:
+        raise RuntimeError("raw cold store but no swizzle plan for the inverse")
+    dev = plan.w13_rows.device
+    staged = {n: staged[n].to(dev, non_blocking=True) for n in names}
+
+    inverse = _KT_SPLIT_PREFILL_STATE.get("swizzle_inverse")
+    if inverse is None:
+        # Built lazily and cached: the first demotion of the process pays for
+        # it, and it is shape-derived so it serves every layer thereafter.
+        indices = trtllm_permute_indices(
+            w13_sample=torch.empty(
+                (w13_scale_shape[0], w13_scale_shape[1] * 16),
+                dtype=torch.uint8,
+                device=dev,
+            ),
+            w13_scale_sample=torch.empty(
+                w13_scale_shape, dtype=torch.uint8, device=dev
+            ),
+            w2_sample=torch.empty(
+                (w2_scale_shape[0], w2_scale_shape[1] * 16),
+                dtype=torch.uint8,
+                device=dev,
+            ),
+            w2_scale_sample=torch.empty(
+                w2_scale_shape, dtype=torch.uint8, device=dev
+            ),
+            w13_gate_up_halves=True,
+        )
+        inverse = trtllm_inverse_indices(
+            indices,
+            w13_scale_shape=w13_scale_shape,
+            w2_scale_shape=w2_scale_shape,
+            device=dev,
+        )
+        _KT_SPLIT_PREFILL_STATE["swizzle_inverse"] = inverse
+
+    n_rows = staged[names[0]].shape[0]
+    out = {n: [] for n in names}
+    for i in range(n_rows):
+        raw = unswizzle_trtllm_expert(
+            w13=staged[names[0]][i],
+            w13_scale=staged[names[1]][i],
+            w2=staged[names[2]][i],
+            w2_scale=staged[names[3]][i],
+            inverse=inverse,
+            w13_scale_shape=w13_scale_shape,
+            w2_scale_shape=w2_scale_shape,
+        )
+        for n, t in zip(
+            names, (raw.w13, raw.w13_scale_e8m0, raw.w2, raw.w2_scale_e8m0)
+        ):
+            out[n].append(t.view(dtypes[n]))
+    return {n: torch.stack(v).to("cpu") for n, v in out.items()}
 
 
 def _build_dynamic_swizzle_plan(anchor, device):

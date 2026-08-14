@@ -75,6 +75,11 @@ class ColdExpertStore:
         # (layer, name) -> pinned [num_cold, *shape]
         self._rows: Dict[Tuple[int, str], torch.Tensor] = {}
         self.dirty = False
+        # True when the rows hold CHECKPOINT-layout bytes rather than the
+        # resident trtllm layout. Everything that reads or writes a row has to
+        # know which it is: the two have identical shapes and sizes, so mixing
+        # them produces wrong experts and no error at all.
+        self.raw_layout = False
 
     # -- allocation --------------------------------------------------------
 
@@ -219,6 +224,7 @@ def build_cold_store(
         num_cold=num_cold,
         slot_to_logical={layer: list(cold_ids) for layer in layers},
     )
+    store.raw_layout = bool(raw_layout)
     store.allocate()
 
     reader = CheckpointExpertReader(weight_path)
