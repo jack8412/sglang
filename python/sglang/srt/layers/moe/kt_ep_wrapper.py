@@ -6671,16 +6671,29 @@ def maybe_run_expert_swap_window(
     force: bool = False,
     act: Optional[bool] = None,
 ) -> None:
-    """Quiesce and re-cut expert membership, every N eager forwards.
+    """Quiesce and re-cut expert membership for the whole model.
 
-    Called from the FIRST registered layer's apply(). Two properties make that
-    a legal place. It only runs eagerly (prefill), so Python is actually
-    executing and a device sync is allowed — under a captured decode replay
-    none of this code runs at all. And membership is consumed exclusively
-    *inside* apply(): the margin override, the id remap, and kt-kernel's own
-    mask read. A later layer's tables are therefore not yet read this forward,
-    and the anchor layer re-reads its own below, so the whole model sees one
-    consistent membership for the batch.
+    Driven from the scheduler at a prefill->decode boundary
+    (``maybe_run_expert_swap_at_decode_boundary``), not from a layer.
+
+    It used to be called from the FIRST registered layer's ``apply()``, and
+    that was legal for a specific reason: membership is consumed exclusively
+    inside ``apply()`` -- the margin override, the id remap, kt-kernel's own
+    mask read -- so at layer 0 no later layer had read its tables yet and the
+    batch still saw one consistent membership. That call site is gone. Under
+    ``--kt-expert-split-prefill`` it never ran (split prefill returns before
+    the margin block that hosted it, and decode replays a captured graph in
+    which no Python executes), so swapping was inert in the shipping config.
+
+    From the scheduler the consistency argument is strictly stronger: the call
+    lands BETWEEN batches, so no layer of any forward has read membership yet,
+    rather than merely no layer after this one.
+
+    ``force`` skips the eager-forward sampling gate; ``act`` overrides whether
+    this window actually swaps (the boundary driver decides, and passes False
+    on its first call so the EMA has history before anything rests on it).
+    The two are separate on purpose -- conflating "skip the gate" with "act"
+    is what made the first boundary window swap on a launch-history baseline.
 
     The device sync is the quiesce: when it returns, every previously issued
     forward has completed, including the host nodes that enqueue CPU expert
