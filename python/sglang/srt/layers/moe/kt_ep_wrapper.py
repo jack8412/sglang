@@ -6613,6 +6613,12 @@ def _kt_swap_tables(method) -> "object":
 # seconds, and the reason survives the move to the scheduler.
 _KT_BOUNDARY_DIVISOR = 10
 
+# How long a demotion will wait on the background disk prefetch before giving
+# up and reading the expert itself. Generous on purpose: the read is already in
+# flight, so waiting costs at most what is LEFT of it, while giving up costs
+# the whole read again. Bounded only so a stuck reader cannot wedge a window.
+_KT_PREFETCH_WAIT_S = 60.0
+
 _KT_BOUNDARY_STATE = {
     "last_was_extend": False,
     "transitions": 0,
@@ -6751,12 +6757,25 @@ def maybe_run_expert_swap_window(
             }
         )
     if not entries or not act:
-        # Sampling-only pass: counters folded into the EMAs, nothing moved.
+        # Sampling-only pass: counters folded into the EMAs, nothing moved --
+        # but it is also the last boundary before an acting one, so it is where
+        # the demotion reads get started off the critical path.
+        if entries:
+            _start_demotion_prefetch(anchor, entries)
         return
 
     mover = _get_or_create_expert_mover(anchor)
     if mover is None:
         return
+
+    # Phase accounting for one window, logged on the way out.
+    _timing = {
+        "read_s": 0.0,
+        "install_s": 0.0,
+        "prefetch_hits": 0,
+        "prefetch_misses": 0,
+    }
+    _window_t0 = time.perf_counter()
 
     store = _KT_SPLIT_PREFILL_STATE["store"]
 
@@ -6956,10 +6975,20 @@ def maybe_run_expert_swap_window(
         if method.wrapper is None:
             return
         _verify_install_once(entry)
+        t0 = time.perf_counter()
         tensors = _read_demoted_expert(entry, demote_id)
+        t1 = time.perf_counter()
         method.wrapper.swap_expert_slot(
             promote_id, demote_id, *[t.data_ptr() for t in tensors]
         )
+        # Timed separately on purpose. The split between "fetching the bytes"
+        # and "handing them to kt" was previously inferred by subtracting an
+        # ESTIMATED disk rate from the measured window, which is guesswork
+        # dressed as a number -- and the loader shows the install is a memcpy
+        # plus a strided restride of down_proj, with no format conversion, so
+        # the estimate was probably wrong. Measure both.
+        _timing["read_s"] += t1 - t0
+        _timing["install_s"] += time.perf_counter() - t1
 
     def _begin_layer(entry, swaps, rows):
         """Read this layer's demoted experts off the GPU, before any move.
@@ -7009,9 +7038,22 @@ def maybe_run_expert_swap_window(
         on this process's first demotion, and any failure falls back rather
         than installing bytes nobody has checked.
         """
-        # Prefetched by _begin_layer, before any of this layer's moves ran, in
-        # one collective per tensor. Nothing here is per-rank data: either the
-        # whole layer was prefetched on every rank or on none.
+        # 1. The background disk prefetch started at the previous boundary.
+        #    Waiting on it is the point: the read is already in flight, so
+        #    waiting costs at most what remains of it, while re-reading
+        #    synchronously costs the whole thing again.
+        pf = _KT_SWAP_STATE.get("prefetch")
+        if pf is not None:
+            pf["done"].wait(timeout=_KT_PREFETCH_WAIT_S)
+            got = pf["data"].get((entry.get("layer_idx"), demote_id))
+            if got is not None:
+                _timing["prefetch_hits"] += 1
+                return got
+            _timing["prefetch_misses"] += 1
+
+        # 2. Prefetched by _begin_layer off the GPU, before any of this layer's
+        #    moves ran, in one collective per tensor. Nothing here is per-rank
+        #    data: either the whole layer was prefetched on every rank or none.
         got = _pending["prefetched"].get(demote_id)
         if got is None:
             return mover.read_full_expert(entry["layer"], demote_id)
@@ -7082,6 +7124,23 @@ def maybe_run_expert_swap_window(
             result.layers_touched,
             result.skipped_layers,
             _KT_SWAP_STATE["swaps"],
+        )
+        # The phase split, MEASURED. It was previously inferred by subtracting
+        # an estimated disk rate from the window total, and the loader says
+        # that estimate was probably wrong: the install is a memcpy plus a
+        # strided restride of down_proj, with no format conversion in it.
+        logger.info(
+            "[kt-swap] window %d timing: total %.2fs = fetch %.2fs + install "
+            "%.2fs (+%.2fs elsewhere); prefetch %d hit / %d miss",
+            _KT_SWAP_STATE["windows"],
+            time.perf_counter() - _window_t0,
+            _timing["read_s"],
+            _timing["install_s"],
+            (time.perf_counter() - _window_t0)
+            - _timing["read_s"]
+            - _timing["install_s"],
+            _timing["prefetch_hits"],
+            _timing["prefetch_misses"],
         )
 
 
@@ -7431,6 +7490,78 @@ def finalize_split_prefill(server_args) -> bool:
         anchor._split_prefill_threshold,
     )
     return True
+
+
+def _start_demotion_prefetch(anchor, entries):
+    """Read what the NEXT window will demote, on a background thread.
+
+    Under cold-only residency a demoted expert owns no CPU buffers, so the
+    window must give it some before it becomes routable, and those bytes come
+    off the checkpoint: ~17.5 MB per demotion, 8 swaps x 92 layers, against a
+    measured window of ~31 s over a 7.1 s baseline. The plan is knowable one
+    boundary early -- `select` is pure, it reads the EMAs and mutates nothing --
+    so the reading need not sit on the critical path at all.
+
+    Best-effort, and deliberately so. A plan that changes between here and the
+    acting window simply misses the cache and is read synchronously. Nothing
+    blocks on this thread, and crucially NO COLLECTIVE is involved: a rank that
+    skips the prefetch, or finishes late, cannot desynchronise the group. That
+    is the whole reason this is a safer shape than gathering the same bytes off
+    the GPU, which deadlocked three times for exactly that reason.
+    """
+    import threading
+
+    state = _KT_SWAP_STATE.get("prefetch")
+    if state is not None and not state["done"].is_set():
+        return  # one in flight already
+    if not entries:
+        return
+    method0 = entries[0].get("method")
+    if method0 is None or not method0.kt_config.cold_only_cpu_experts:
+        return  # nothing to install: the demoted expert keeps its CPU buffers
+    # Only the rank that installs needs the bytes. Safe to vary by rank here
+    # precisely because there is no collective below.
+    if method0.wrapper is None:
+        return
+    mover = _get_or_create_expert_mover(anchor)
+    if mover is None:
+        return
+
+    plan = []
+    for entry in entries:
+        try:
+            swaps = entry["policy"].select(entry["tables"].gpu_experts_mask)
+        except Exception:
+            continue
+        for s in swaps:
+            plan.append((entry["layer"], entry["layer_idx"], s.demote))
+    if not plan:
+        return
+
+    done = threading.Event()
+    data: dict = {}
+    _KT_SWAP_STATE["prefetch"] = {"done": done, "data": data, "planned": len(plan)}
+
+    def _work():
+        t0 = time.perf_counter()
+        try:
+            for layer, layer_idx, demote_id in plan:
+                try:
+                    data[(layer_idx, demote_id)] = mover.read_full_expert(
+                        layer, demote_id
+                    )
+                except Exception:
+                    pass  # a miss just costs a synchronous read later
+        finally:
+            _KT_SWAP_STATE["prefetch"]["seconds"] = time.perf_counter() - t0
+            done.set()
+
+    threading.Thread(
+        target=_work, name="kt-swap-prefetch", daemon=True
+    ).start()
+    logger.info(
+        "[kt-swap] prefetching %d demoted experts off the critical path", len(plan)
+    )
 
 
 def _get_or_create_gpu_reader():

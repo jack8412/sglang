@@ -1,0 +1,49 @@
+# Build context for docker/k3_hybrid/k3_hybrid.Dockerfile.
+#
+# BuildKit reads <dockerfile-path>.dockerignore in preference to the context
+# root's .dockerignore, so this file governs THIS build only and leaves the
+# repo's root .dockerignore (a symlink to .gitignore) alone.
+#
+# The context is the repo root, and the image only needs source. Everything
+# excluded here is either regenerable, a run output, or host-specific.
+
+# 309 MB of history the image cannot use. setuptools_scm falls back to
+# 0.0.0.dev0 without it; provenance is carried by the SGLANG_BUILD_COMMIT
+# build-arg instead (see the Dockerfile header), which is cheaper and pins the
+# sha into a label you can read off a running container.
+.git
+
+# Run outputs. runs/ is ~103 MB and grows; edr/*.pt dumps are 333 MB each.
+# These belong on the host and are mounted at /workspace/runs at run time.
+runs/
+
+# Local tooling and caches
+.venv/
+venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+**/.ipynb_checkpoints/
+
+# Build artifacts that must be rebuilt inside the image, never copied in --
+# a host-built .so links against the host's torch/CUDA and breaks the image.
+**/*.so
+**/*.o
+**/*.a
+build/
+dist/
+**/*.egg-info/
+python/sglang/_version.py
+rust/target/
+sgl-model-gateway/target/
+sgl-kernel/build/
+
+# Not consumed by this image
+docs/
+benchmark/
+examples/
+assets/
+prof*/
