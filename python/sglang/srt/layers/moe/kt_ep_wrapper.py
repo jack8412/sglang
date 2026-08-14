@@ -212,6 +212,7 @@ class KTConfig:
     expert_swap_max: int = 4
     expert_swap_hysteresis: float = 2.0
     split_prefill: bool = False
+    split_prefill_token_tile: int = 0
 
 
 # Process-level registries for the MXFP4 layerwise-prefill slot machinery
@@ -3773,6 +3774,7 @@ def create_kt_config_from_server_args(
         expert_swap_max=server_args.kt_expert_swap_max,
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
         split_prefill=server_args.kt_expert_split_prefill,
+        split_prefill_token_tile=server_args.kt_expert_split_prefill_token_tile,
     )
 
 
@@ -4668,9 +4670,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # scale with tokens -- the gemm2 buffer the kernel sizes for all
         # T*top_k slots, and the fp32 accumulator -- while a token's output
         # depends only on its own row, so tiling changes no value. 0 disables.
-        self._split_prefill_token_tile = (
-            envs.SGLANG_KT_SPLIT_PREFILL_TOKEN_TILE.get() or None
-        )
+        self._split_prefill_token_tile = kt_config.split_prefill_token_tile or None
         self._cold_pipeline = None
         self._cold_scalars = None
         self._margin_insist_count: Optional[torch.Tensor] = None

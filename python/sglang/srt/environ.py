@@ -1386,15 +1386,6 @@ class Envs:
     # added to the hot path -- but the summary log is per forward, so this is
     # a triage knob rather than a production default.
     SGLANG_DEBUG_KT_PIPELINE_OVERLAP = EnvBool(False)
-    # Run split-slice prefill's MoE in token tiles of at most this many tokens
-    # (0 = whole chunk at once). A token's MoE output depends only on its own
-    # row, so this changes no value, but the two large transients -- the gemm2
-    # buffer the kernel sizes for ALL T*top_k slots, and the fp32 accumulator --
-    # then follow the tile instead of the chunk. Measured at a 49152 chunk:
-    # 7.01 GiB peak untiled vs 2.94 at a 16384 tile, for ~7% more MoE time
-    # (~1.3% of the forward). This is what lets a large prefill chunk coexist
-    # with a long-context KV pool.
-    SGLANG_KT_SPLIT_PREFILL_TOKEN_TILE = EnvInt(0)
     # P0 ablation for the doorbell-transport design: skip ONLY the two
     # cudaLaunchHostFunc submissions (submit/sync) while keeping the staging
     # D2H, the result H2D and the merge-add. Differencing this against the
@@ -1554,6 +1545,10 @@ _convert_SGL_to_SGLANG()
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_ENABLE_GRPC",
     "Please use '--grpc-port' to enable the native gRPC server.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_KT_SPLIT_PREFILL_TOKEN_TILE",
+    "Please use '--kt-expert-split-prefill-token-tile' instead.",
 )
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
