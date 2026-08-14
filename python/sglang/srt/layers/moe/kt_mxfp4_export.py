@@ -200,6 +200,126 @@ def trtllm_permute_indices(
     )
 
 
+class TrtllmInverseIndices(msgspec.Struct):
+    """The inverse of :class:`TrtllmPermuteIndices`, for reading a slot back.
+
+    Swapping demotes a GPU-resident expert, and under cold-only residency its
+    CPU buffers must then be filled. Reading those bytes off the checkpoint
+    costs ~17.5 MB per demotion; the GPU already holds them, just shuffled.
+    These indices turn the shuffled row back into the exported layout, so the
+    demoted expert can be installed from device memory instead of from disk.
+
+    ``*_unlace`` are the inverses of ``nvfp4_block_scale_interleave``, which
+    publishes none — see :func:`recover_interleave_map`.
+    """
+
+    w13_weight: torch.Tensor
+    w13_scale: torch.Tensor
+    w2_weight: torch.Tensor
+    w2_scale: torch.Tensor
+    w13_scale_unlace: torch.Tensor
+    w2_scale_unlace: torch.Tensor
+
+
+def recover_interleave_map(shape, device) -> torch.Tensor:
+    """Recover ``src`` with ``interleave(x).flatten()[q] == x.flatten()[src[q]]``.
+
+    ``nvfp4_block_scale_interleave`` is a fixed byte permutation with no
+    published inverse, so the map is measured rather than derived: feed it
+    tensors whose bytes encode each element's own flat position in base 256 —
+    one pass per digit — and read the digits back out of the result.
+
+    Raises if the result is not a permutation of ``range(n)``; every use of the
+    map assumes the op neither drops nor duplicates a byte, and a layout change
+    upstream must fail loudly here rather than silently install wrong weights.
+    """
+    from flashinfer import nvfp4_block_scale_interleave
+
+    n = 1
+    for d in shape:
+        n *= int(d)
+    pos = torch.arange(n, device=device)
+    digits = 0
+    while (1 << (8 * digits)) < max(n, 2):
+        digits += 1
+
+    src = torch.zeros(n, dtype=torch.int64, device=device)
+    for j in range(digits):
+        plane = ((pos >> (8 * j)) & 0xFF).to(torch.uint8).reshape(shape)
+        out = nvfp4_block_scale_interleave(plane).reshape(-1).to(torch.int64)
+        src = src | (out << (8 * j))
+
+    if src.numel() != n or not torch.equal(
+        torch.sort(src).values, torch.arange(n, device=device)
+    ):
+        raise RuntimeError(
+            "nvfp4_block_scale_interleave is not a pure permutation for shape "
+            f"{tuple(shape)}; the trtllm scale layout changed and unswizzling "
+            "would produce wrong CPU weights"
+        )
+    return src
+
+
+def trtllm_inverse_indices(
+    indices: TrtllmPermuteIndices,
+    *,
+    w13_scale_shape,
+    w2_scale_shape,
+    device,
+) -> TrtllmInverseIndices:
+    """Invert one set of permute indices. Shape-derived, so cache per shape."""
+    return TrtllmInverseIndices(
+        w13_weight=torch.argsort(indices.w13_weight),
+        w13_scale=torch.argsort(indices.w13_scale),
+        w2_weight=torch.argsort(indices.w2_weight),
+        w2_scale=torch.argsort(indices.w2_scale),
+        w13_scale_unlace=recover_interleave_map(w13_scale_shape, device),
+        w2_scale_unlace=recover_interleave_map(w2_scale_shape, device),
+    )
+
+
+def unswizzle_trtllm_expert(
+    *,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    inverse: TrtllmInverseIndices,
+    w13_scale_shape,
+    w2_scale_shape,
+) -> Mxfp4ExpertBytes:
+    """Exact inverse of :func:`swizzle_trtllm_expert` for one resident row.
+
+    Bitwise, on every tensor — proved against the forward path before this was
+    wired in (``runs/meta/verify_unswizzle.py``). The forward is
+    ``out = x[idx]`` for weights and ``out = interleave(x[idx])`` for scales,
+    so the inverse un-interleaves first and then applies the inverse
+    permutation.
+    """
+
+    def _unlace(flat_out, unlace, shape):
+        back = torch.empty_like(flat_out)
+        back[unlace] = flat_out  # out = in[src]  =>  in[src] = out
+        return back.reshape(shape)
+
+    return Mxfp4ExpertBytes(
+        w13=w13.reshape(-1, w13.shape[-1]).view(torch.uint8)[inverse.w13_weight]
+        .contiguous(),
+        w13_scale_e8m0=_unlace(
+            w13_scale.reshape(-1).view(torch.uint8),
+            inverse.w13_scale_unlace,
+            w13_scale_shape,
+        )[inverse.w13_scale].contiguous(),
+        w2=w2.reshape(-1, w2.shape[-1]).view(torch.uint8)[inverse.w2_weight]
+        .contiguous(),
+        w2_scale_e8m0=_unlace(
+            w2_scale.reshape(-1).view(torch.uint8),
+            inverse.w2_scale_unlace,
+            w2_scale_shape,
+        )[inverse.w2_scale].contiguous(),
+    )
+
+
 def swizzle_trtllm_expert(
     bytes_: Mxfp4ExpertBytes,
     indices: TrtllmPermuteIndices,

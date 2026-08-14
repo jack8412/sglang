@@ -6763,7 +6763,8 @@ def maybe_run_expert_swap_window(
     # Batched move state. run_swap_window applies a layer's swaps in one
     # consecutive run (kt_expert_swap.py:386-391), so "the layer changed" is a
     # sufficient flush trigger, and no interface change is needed.
-    _pending = {"layer": None, "layer_idx": None, "items": []}
+    _pending = {"layer": None, "layer_idx": None, "items": [], "row_of": {}}
+    gpu_reader = _get_or_create_gpu_reader()
 
     def _flush_moves():
         """Apply one layer's staged swaps as a handful of bulk copies.
@@ -6792,6 +6793,11 @@ def maybe_run_expert_swap_window(
             return
         layer, layer_idx = pend["layer"], pend["layer_idx"]
         pend["items"] = []
+        # Past this point the recorded rows hold PROMOTED experts, so no
+        # demotion may read them back. row_of names only rows not yet written;
+        # dropping it here is what keeps that true no matter what triggered the
+        # flush (layer change, or the checkpoint fallback mid-layer).
+        pend["row_of"].clear()
 
         rows = [it["dst_row"] for it in items]
         dev = getattr(layer, _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]).data.device
@@ -6851,6 +6857,11 @@ def maybe_run_expert_swap_window(
         if _pending["layer_idx"] != layer_idx:
             _flush_moves()
             _pending["layer"], _pending["layer_idx"] = layer, layer_idx
+            _pending["row_of"].clear()
+        # install_cpu_expert runs immediately after this call and is given only
+        # the logical ids, so the row the demoted expert still occupies is
+        # recorded here for it to read back from.
+        _pending["row_of"][demoted_id] = dst_row
         _pending["items"].append(
             {
                 "dst_row": dst_row,
@@ -6926,10 +6937,56 @@ def maybe_run_expert_swap_window(
         if method.wrapper is None:
             return
         _verify_install_once(entry)
-        tensors = mover.read_full_expert(entry["layer"], demote_id)
+        tensors = _read_demoted_expert(entry, demote_id)
         method.wrapper.swap_expert_slot(
             promote_id, demote_id, *[t.data_ptr() for t in tensors]
         )
+
+    def _read_demoted_expert(entry, demote_id):
+        """The demoted expert's full bytes, from the GPU if that is proven.
+
+        Device memory already holds them; the checkpoint read they replace is
+        ~17.5 MB per demotion and dominated the swap window. The GPU route is
+        used only after it has been shown bitwise-equal to the checkpoint route
+        on this process's first demotion, and any failure falls back rather
+        than installing bytes nobody has checked.
+        """
+        row = _pending["row_of"].get(demote_id)
+        if gpu_reader is None or row is None or _KT_SWAP_STATE.get("gpu_readback_off"):
+            return mover.read_full_expert(entry["layer"], demote_id)
+        try:
+            got = [t.to("cpu") for t in gpu_reader.read_full_expert(entry["layer"], row)]
+        except Exception:
+            logger.exception(
+                "[kt-swap] GPU read-back failed; falling back to the checkpoint"
+            )
+            _KT_SWAP_STATE["gpu_readback_off"] = True
+            return mover.read_full_expert(entry["layer"], demote_id)
+
+        if not _KT_SWAP_STATE.get("gpu_readback_verified"):
+            _KT_SWAP_STATE["gpu_readback_verified"] = True
+            want = mover.read_full_expert(entry["layer"], demote_id)
+            bad = [
+                i
+                for i, (a, b) in enumerate(zip(got, want))
+                if a.shape != b.shape or not torch.equal(a, b)
+            ]
+            if bad:
+                logger.error(
+                    "[kt-swap] GPU read-back DIFFERS from the checkpoint on "
+                    "tensor(s) %s (expert %d, layer %s) — disabling it and "
+                    "reading the checkpoint instead",
+                    bad,
+                    demote_id,
+                    entry.get("layer_idx"),
+                )
+                _KT_SWAP_STATE["gpu_readback_off"] = True
+                return want
+            logger.info(
+                "[kt-swap] GPU read-back verified bitwise against the "
+                "checkpoint; demotions no longer touch disk"
+            )
+        return got
 
     try:
         result = run_swap_window(
@@ -6962,6 +7019,136 @@ def maybe_run_expert_swap_window(
             result.skipped_layers,
             _KT_SWAP_STATE["swaps"],
         )
+
+
+class _GpuResidentExpertReader:
+    """Read a resident expert back out of GPU memory, in checkpoint layout.
+
+    WHY. Under cold-only residency a demoted expert owns no CPU buffers, so
+    every demotion must be given weights before it becomes routable. Reading
+    them off the checkpoint costs ~17.5 MB per demotion -- 8 swaps x 92 layers
+    = ~12.9 GB per window, which at this node's ~1.1 GB/s is ~11.7 s and is
+    essentially the entire 12.5 s a batched swap window still cost. The bytes
+    are already in device memory; only the layout differs.
+
+    Two things stand between the resident row and the exported bytes:
+
+      1. the trtllm-gen shuffle, inverted exactly by ``unswizzle_trtllm_expert``
+         (bitwise on every tensor -- runs/meta/verify_unswizzle.py); and
+      2. TP. A rank holds one eighth of the expert, while kt slices across its
+         own NUMA partitions internally and therefore wants the whole thing.
+         So the shards are all-gathered -- ~17.5 MB per expert over NVLink,
+         which is microseconds against the seconds of disk it replaces.
+
+    Everything here is shape-derived and cached per layer shape, so the cost
+    per demotion is the unswizzle plus one collective.
+    """
+
+    def __init__(self, param_names):
+        self.param_names = param_names
+        self._inverse = None
+        self._shapes = None
+
+    def _prepare(self, layer):
+        """Derive the exported shard shapes and the inverse indices, once.
+
+        The permutations depend only on shapes, so a sample of the right shape
+        is enough and no checkpoint read is needed to build them. Scales carry
+        one E8M0 code per 32 values while weights pack two values per byte, so
+        a scale tensor is exactly 1/16 the columns of its weight.
+        """
+        if self._inverse is not None:
+            return
+        from sglang.srt.layers.moe.kt_mxfp4_export import (
+            trtllm_inverse_indices,
+            trtllm_permute_indices,
+        )
+
+        w13_n, _, w2_n, _ = self.param_names
+        w13 = getattr(layer, w13_n).data
+        w2 = getattr(layer, w2_n).data
+        dev = w13.device
+        w13_shape = tuple(w13.shape[1:])
+        w2_shape = tuple(w2.shape[1:])
+        w13_scale_shape = (w13_shape[0], w13_shape[1] // 16)
+        w2_scale_shape = (w2_shape[0], w2_shape[1] // 16)
+
+        def sample(shape):
+            return torch.empty(shape, dtype=torch.uint8, device=dev)
+
+        indices = trtllm_permute_indices(
+            w13_sample=sample(w13_shape),
+            w13_scale_sample=sample(w13_scale_shape),
+            w2_sample=sample(w2_shape),
+            w2_scale_sample=sample(w2_scale_shape),
+            w13_gate_up_halves=True,
+        )
+        self._inverse = trtllm_inverse_indices(
+            indices,
+            w13_scale_shape=w13_scale_shape,
+            w2_scale_shape=w2_scale_shape,
+            device=dev,
+        )
+        self._shapes = (w13_scale_shape, w2_scale_shape)
+
+    def read_full_expert(self, layer, dst_row: int):
+        """The full unsliced expert at resident row ``dst_row``.
+
+        Returns ``(gate, up, down, gate_s, up_s, down_s)``, contiguous uint8 --
+        the same tuple and order ``CheckpointExpertMover.read_full_expert``
+        returns, so the two are drop-in interchangeable.
+
+        Must be called while ``dst_row`` still holds the DEMOTED expert, i.e.
+        before the promoted row is written back.
+        """
+        from sglang.srt.layers.moe.kt_mxfp4_export import unswizzle_trtllm_expert
+
+        self._prepare(layer)
+        w13_n, w13_s_n, w2_n, w2_s_n = self.param_names
+        w13_scale_shape, w2_scale_shape = self._shapes
+
+        shard = unswizzle_trtllm_expert(
+            w13=getattr(layer, w13_n).data[dst_row],
+            w13_scale=getattr(layer, w13_s_n).data[dst_row],
+            w2=getattr(layer, w2_n).data[dst_row],
+            w2_scale=getattr(layer, w2_s_n).data[dst_row],
+            inverse=self._inverse,
+            w13_scale_shape=w13_scale_shape,
+            w2_scale_shape=w2_scale_shape,
+        )
+
+        # build_expert_bytes packs w13 as [gate | up] ROW halves of this rank's
+        # slice, and shards down by COLUMN; undo both, in rank order.
+        per = shard.w13.shape[0] // 2
+        per_s = shard.w13_scale_e8m0.shape[0] // 2
+        parts = [
+            (shard.w13[:per], 0),
+            (shard.w13[per:], 0),
+            (shard.w2, 1),
+            (shard.w13_scale_e8m0[:per_s], 0),
+            (shard.w13_scale_e8m0[per_s:], 0),
+            (shard.w2_scale_e8m0, 1),
+        ]
+        return tuple(self._all_gather(t, dim) for t, dim in parts)
+
+    def _all_gather(self, shard: torch.Tensor, dim: int) -> torch.Tensor:
+        """Concatenate this tensor's TP shards, in rank order, along ``dim``.
+
+        Every rank swaps the same experts (the policy is deterministic for
+        exactly this reason), so all ranks reach this collective the same
+        number of times and in the same order.
+        """
+        tp_size = get_parallel().tp_size
+        if tp_size == 1:
+            return shard.contiguous()
+        shard = shard.contiguous()
+        out = torch.empty(
+            (tp_size,) + tuple(shard.shape), dtype=shard.dtype, device=shard.device
+        )
+        dist.all_gather_into_tensor(
+            out, shard, group=get_tp_group().device_group
+        )
+        return torch.cat(list(out.unbind(0)), dim=dim).contiguous()
 
 
 class _PerLayerMover:
@@ -7102,6 +7289,19 @@ def finalize_split_prefill(server_args) -> bool:
         anchor._split_prefill_threshold,
     )
     return True
+
+
+def _get_or_create_gpu_reader():
+    """Process-wide reader for demoted experts; None if it cannot be built."""
+    reader = _KT_SWAP_STATE.get("gpu_reader")
+    if reader is None:
+        try:
+            reader = _GpuResidentExpertReader(_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES)
+            _KT_SWAP_STATE["gpu_reader"] = reader
+        except Exception:
+            logger.exception("[kt-swap] could not build the GPU expert reader")
+            return None
+    return reader
 
 
 def _get_or_create_expert_mover(anchor):
