@@ -188,6 +188,74 @@ class KtRamExpertSource:
         }
 
 
+def verify_against_checkpoint(
+    source: "KtRamExpertSource",
+    *,
+    weight_path: str,
+    layer_idx: int,
+    expert_ids: Sequence[int],
+    tp_rank: int,
+    tp_size: int,
+) -> bool:
+    """Bitwise: do kt's buffers reproduce the checkpoint, shard for shard?
+
+    The gate on replacing the pinned store with this source. Every way the
+    mapping can be wrong -- partition concat axis, physical vs logical ids, the
+    TP slice -- yields right-shaped wrong bytes, so equality is demonstrated
+    against ``build_expert_bytes`` rather than argued.
+    """
+    from sglang.srt.layers.moe.kt_expert_mover import (
+        CheckpointExpertReader,
+        build_expert_bytes,
+    )
+
+    prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe.experts"
+    pairs = (
+        ("w13", "w13"),
+        ("w13_scale", "w13_scale_e8m0"),
+        ("w2", "w2"),
+        ("w2_scale", "w2_scale_e8m0"),
+    )
+    reader = CheckpointExpertReader(weight_path)
+    ok = True
+    try:
+        for eid in expert_ids:
+            want = build_expert_bytes(
+                reader, prefix, int(eid), tp_rank=tp_rank, tp_size=tp_size
+            )
+            try:
+                got = source.raw_shard(int(eid))
+            except Exception:
+                logger.exception("[kt-ram] raw_shard(%d) failed", eid)
+                ok = False
+                continue
+            for mine, theirs in pairs:
+                a = got[mine].reshape(-1)
+                b = getattr(want, theirs).reshape(-1).to(torch.uint8)
+                if a.shape != b.shape or not torch.equal(a, b):
+                    logger.error(
+                        "[kt-ram] layer %d expert %d %s DIFFERS from the "
+                        "checkpoint (%s vs %s, %s bytes differ)",
+                        layer_idx,
+                        eid,
+                        mine,
+                        tuple(got[mine].shape),
+                        tuple(getattr(want, theirs).shape),
+                        "shape" if a.shape != b.shape else int((a != b).sum()),
+                    )
+                    ok = False
+    finally:
+        reader.close()
+    if ok:
+        logger.info(
+            "[kt-ram] layer %d: %d expert(s) reproduce the checkpoint bitwise "
+            "from kt's resident buffers",
+            layer_idx,
+            len(expert_ids),
+        )
+    return ok
+
+
 def build_kt_ram_source(method, *, tp_rank: int, tp_size: int):
     """Build a source for one layer's kt MoE object, or None if unavailable."""
     wrapper = getattr(method, "wrapper", None)
@@ -210,5 +278,5 @@ def build_kt_ram_source(method, *, tp_rank: int, tp_size: int):
         geometry=geometry,
         tp_rank=tp_rank,
         tp_size=tp_size,
-        physical_to_logical=getattr(method, "_kt_physical_to_logical", None),
+        physical_to_logical=method._kt_physical_to_logical,
     )

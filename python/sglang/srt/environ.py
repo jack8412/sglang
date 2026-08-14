@@ -1394,6 +1394,13 @@ class Envs:
     # streaming out of kt's own buffers, which hold checkpoint layout too.
     # Off until the batched swizzle is proved bitwise on a live server.
     SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE = EnvBool(False)
+    # One-shot bitwise self-check of the kt-RAM expert source: rebuild a few
+    # experts from kt's resident buffers and compare against the checkpoint.
+    # The gate before that source may replace the pinned cold store, because
+    # every way it can be wrong -- partition concat axis, physical vs logical
+    # expert ids, the TP slice -- yields right-shaped wrong bytes rather than
+    # an error. Read-only.
+    SGLANG_KT_VERIFY_RAM_SOURCE = EnvBool(False)
     # Per-forward slot-accounting check for split-slice full-expert prefill:
     # assert the resident and cold expert slices claim every routed slot
     # exactly once. Costs a device sync per layer, so it is a debug gate, not

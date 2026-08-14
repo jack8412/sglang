@@ -4670,6 +4670,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # path so a partially-built config cannot half-enter it.
         self._split_prefill = kt_config.split_prefill
         self._split_prefill_ready = False
+        # Set on the wrapper-owning rank once kt loads this layer's CPU
+        # weights; the kt-RAM expert source needs it to turn logical expert ids
+        # into physical buffer slots.
+        self._kt_physical_to_logical = None
         # Break-even against the CPU-expert path, NOT the chunk size.  The
         # split path's cost is dominated by a FIXED per-forward stream -- every
         # cold expert lands once however many tokens the chunk holds -- so it
@@ -5096,6 +5100,51 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     layer.num_experts, dtype=torch.int64, device="cpu"
                 )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
+            # For the kt-RAM expert source: buffer indices are PHYSICAL slots,
+            # and this map is what turns a logical id into one.
+            self._kt_physical_to_logical = physical_to_logical_map_cpu.tolist()
+            self._maybe_verify_kt_ram_source()
+
+    def _maybe_verify_kt_ram_source(self):
+        """SGLANG_KT_VERIFY_RAM_SOURCE=1: prove kt's buffers match the checkpoint.
+
+        Runs here -- immediately after this layer's kt weights load, on the
+        rank that owns the wrapper -- because the buffers this checks exist
+        nowhere else and at no earlier time. Read-only, a few experts, once per
+        process (the mapping is layer-independent, so one layer's evidence
+        covers the rest).
+        """
+        if not envs.SGLANG_KT_VERIFY_RAM_SOURCE.get():
+            return
+        if _KT_SWAP_STATE.get("ram_source_verified"):
+            return
+        _KT_SWAP_STATE["ram_source_verified"] = True
+        from sglang.srt.layers.moe.kt_ram_source import (
+            build_kt_ram_source,
+            verify_against_checkpoint,
+        )
+
+        source = build_kt_ram_source(
+            self, tp_rank=self.tp_rank, tp_size=get_parallel().tp_size
+        )
+        if source is None:
+            logger.error(
+                "[kt-ram] verification requested but no source could be built "
+                "(no expert_buffer_pointers on this wrapper?)"
+            )
+            return
+        n = source.experts
+        ids = sorted({0, n // 3, (2 * n) // 3, n - 1})
+        if self._kt_physical_to_logical is not None:
+            ids = [int(self._kt_physical_to_logical[i]) for i in ids]
+        verify_against_checkpoint(
+            source,
+            weight_path=self.kt_config.weight_path,
+            layer_idx=self.kt_config.layer_idx,
+            expert_ids=ids,
+            tp_rank=self.tp_rank,
+            tp_size=get_parallel().tp_size,
+        )
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
