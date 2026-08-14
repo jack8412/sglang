@@ -2,8 +2,6 @@
 # usage: launch.sh <name> [extra server args...]
 #        K3_PROFILE=prod|prod01|margin10|ceiling|bare   (default: prod)
 #        K3_PORT=<n>      server port (default 30000, sglang's well-known one)
-#        K3_RECORD=1      arm the expert-distribution recorder (see below)
-#        K3_PLACE=off     suppress the placement flags entirely
 #
 # The K3 server launcher. Lives in the repo so a bootstrapped node has it
 # (k3.sh serve runs it from the node's sglang checkout); the previous copy
@@ -69,10 +67,9 @@ set -u
 
 NAME=${1:?usage: launch.sh <name> [extra server args...]}; shift
 WS=/workspace
-mkdir -p $WS/runs/{status,probes,logs,meta} $WS/runs/edr
+mkdir -p $WS/runs/{status,probes,logs,meta}
 LOG=$WS/runs/logs/$NAME.server.log
 : > $LOG
-export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=$WS/runs/edr
 
 # Prebuilt trtllm-gen MoE cubins. NOT optional for this config: with
 # --moe-runner-backend flashinfer_mxfp4 on SM100 the server REFUSES to start
@@ -113,25 +110,32 @@ PHYS=$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
 NUMAN=$(numactl --hardware 2>/dev/null | awk '/^available:/{print $2}')
 [ -n "$NUMAN" ] || NUMAN=2
 
-# Placement: frequency, from the newest recorded expert-distribution dump.
-# This is not a tuning knob -- uniform placement WAS the entire quality gap
-# (SPEC-MARGIN-ROUTING F2: frequency placement reached exact-routing parity at
-# 99.0% gsm8k where uniform did not), and swapping builds on it by promoting
-# high-demand experts into the rows frequency placement assigned.
+# PLACEMENT PROFILES REMOVED (2026-08-14). The launcher no longer discovers or
+# loads an expert-distribution dump, and no longer arms the recorder.
 #
-# No flag is emitted when there is no dump, rather than naming a strategy: a
-# literal `--kt-expert-placement-strategy uniform` here read as a deliberate
-# choice and quietly produced a quality-wrong run whenever a dump was absent.
-# A measurement phase that must hold placement constant across rows sets
-# K3_PLACE=off -- overriding the strategy flag alone is NOT enough, because
-# --init-expert-location would still be passed and it is a generic sglang arg,
-# not a kt one.
-PLACE=()
-DUMP=""
-if [ "${K3_PLACE:-auto}" != "off" ]; then
-  DUMP=$(ls -t $WS/runs/edr/*.pt 2>/dev/null | head -1)
-  [ -n "$DUMP" ] && PLACE=(--kt-expert-placement-strategy frequency --init-expert-location "$DUMP")
-fi
+# Frequency placement did measure better than uniform (SPEC-MARGIN-ROUTING F2:
+# exact-routing parity at 99.0% gsm8k), so this is not a claim the feature did
+# nothing. It is a claim it does not pay for itself in production:
+#
+#  - Capturing a profile needs a DEDICATED run. The recorder cannot be turned
+#    on later (unset, it is a Noop whose start_record() raises), and arming it
+#    trips _disable_tc_piecewise_cudagraph_if_incompatible -- so the capture run
+#    has a different cuda-graph configuration from the run it is meant to tune.
+#  - A profile is workload-specific and goes stale as the served domain shifts,
+#    which in production it does continuously. The cost is paid per capture; the
+#    benefit decays from the moment it is taken.
+#  - Expert SWAPPING (--kt-expert-swap-interval) already adapts the resident set
+#    at runtime from live insist/override counters. That is the same objective
+#    pursued continuously instead of frozen at capture time, so a static profile
+#    is redundant next to it, not merely stale.
+#  - Under --kt-expert-split-prefill, placement does not affect prefill at all:
+#    every one of the 896 experts is computed regardless of where it lives. Its
+#    entire remaining influence was on decode.
+#
+# sglang's own --kt-expert-placement-strategy / --init-expert-location are
+# untouched and can still be passed explicitly as trailing args; what is gone is
+# this launcher discovering a *.pt and applying it behind your back. With no
+# flag emitted, sglang uses its default (uniform) placement.
 
 # The routing skeleton. Everything the campaign varies lives here and nowhere
 # else, so a row's identity is one word rather than a flag list to diff.
@@ -147,39 +151,7 @@ case "$PROFILE" in
   *) echo "FATAL: unknown K3_PROFILE '$PROFILE' (prod|prod01|margin10|ceiling|bare)" | tee -a $LOG >&2; exit 2 ;;
 esac
 
-# The recorder is OPT-IN, and both halves of that matter:
-#  - it cannot be turned on later. With the mode unset the recorder is a Noop
-#    whose start_record() raises, so /start_expert_distribution_record fails in
-#    the scheduler loop. Regenerating a placement profile therefore needs a
-#    RELAUNCH with K3_RECORD=1 -- which is the whole reason the *.pt dumps are
-#    safe to leave off the mirror.
-#  - arming it is not free: expert_distribution_recorder_mode being set trips
-#    _disable_tc_piecewise_cudagraph_if_incompatible, so a recording run has a
-#    different cuda-graph configuration from a measurement run. Never arm it on
-#    a row whose throughput you intend to quote.
-RECORD=()
-if [ "${K3_RECORD:-0}" = "1" ]; then
-  RECORD=(--expert-distribution-recorder-mode stat)
-  echo "[launch] recorder ARMED: this disables tc-piecewise cuda graph; do not quote throughput from this run" | tee -a $LOG >&2
-fi
-
-# A `prod` row without a placement dump is the dangerous case: it starts fine,
-# serves fine, and is quality-wrong -- frequency placement is what closes the
-# gap to exact routing, and swapping promotes into the rows it assigned. Refuse
-# rather than produce a plausible number. The recording run that CREATES a dump
-# legitimately has none, hence the K3_RECORD exemption.
-if [ -z "$DUMP" ] && [ "$PROFILE" = "prod" ] && [ "${K3_RECORD:-0}" != "1" ]; then
-  echo "FATAL: profile prod needs an expert-distribution dump in $WS/runs/edr (none found).
-  Frequency placement is the shipping recipe and uniform placement was the whole
-  quality gap, so this would serve a wrong configuration that looks healthy.
-  Either record one:   K3_RECORD=1 K3_PROFILE=bare launch.sh REC ...
-                       then /start_expert_distribution_record + a workload + dump
-  or state the intent: K3_PROFILE=bare (or margin10 / ceiling)" | tee -a $LOG >&2
-  exit 3
-fi
-[ -z "$DUMP" ] && echo "[launch] no placement dump; sglang will use its default (uniform) placement" | tee -a $LOG >&2
-
-echo "[launch] $NAME profile=$PROFILE place=${PLACE[*]:-none} record=${K3_RECORD:-0}" >> $LOG
+echo "[launch] $NAME profile=$PROFILE placement=sglang-default(uniform)" >> $LOG
 
 # Every flag below can be overridden by passing it again in the extra args:
 # argparse keeps the last value (store_true flags excepted -- see the warning
@@ -190,8 +162,6 @@ exec python -m sglang.launch_server \
   --kt-num-gpu-experts 620 \
   --kt-threadpool-count $NUMAN --kt-cpuinfer $((PHYS * 85 / 100)) \
   --kt-transport doorbell \
-  "${PLACE[@]}" "${ROUTING[@]}" "${RECORD[@]}" \
+  "${ROUTING[@]}" \
   --moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4 \
-  --mem-fraction-static 0.90 --context-length 32768 \
-  --chunked-prefill-size 16384 \
   "$@" >> $LOG 2>&1
