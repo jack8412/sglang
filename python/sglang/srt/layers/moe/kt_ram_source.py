@@ -89,11 +89,20 @@ class KtRamExpertSource:
             )
         self.per_gpu = self.intermediate // self.tp_size
 
-        # logical id -> physical slot in kt's buffers.
-        self._slot_of: Dict[int, int] = (
-            {int(lid): slot for slot, lid in enumerate(physical_to_logical)}
+        # Which map-values kt actually wrote. kt's loader indexes its buffer
+        # by the MAPPED value, not the loop slot:
+        #     expert_id = expert_map(map, slot)
+        #     dst = buf + expert_id * stride        (fp4-moe.hpp load_weights)
+        # so the expert whose map-value is V sits at offset V, and reading is
+        # buf[V] directly -- no inversion. The map is kept only to check
+        # membership: an id kt never wrote reads zeros, not an error. (An
+        # earlier version inverted the map here; under an identity map the two
+        # are indistinguishable, which is why the bitwise gate alone could not
+        # have caught it.)
+        self._present = (
+            {int(v) for v in physical_to_logical}
             if physical_to_logical is not None
-            else {}
+            else None
         )
 
         wec = self.per_numa * self.hidden  # elements per expert per partition
@@ -130,12 +139,17 @@ class KtRamExpertSource:
         Returns ``{"w13", "w13_scale", "w2", "w2_scale"}`` matching what
         ``build_expert_bytes`` produces, so the GPU-side swizzle is unchanged.
         """
-        slot = self._slot_of.get(int(logical_id), int(logical_id))
+        slot = int(logical_id)
+        if self._present is not None and slot not in self._present:
+            raise KeyError(
+                f"expert {logical_id} was never loaded into kt's buffers "
+                "(not in the physical-to-logical map); reading it would "
+                "return zeros, not weights"
+            )
         if not 0 <= slot < self.experts:
             raise KeyError(
-                f"expert {logical_id} maps to slot {slot}, outside kt's "
-                f"{self.experts} resident slots (cold-only allocates only the "
-                "cold experts)"
+                f"expert {logical_id} is outside kt's {self.experts} buffer "
+                "slots"
             )
 
         h2 = self.hidden // 2
