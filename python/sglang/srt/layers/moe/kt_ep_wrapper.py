@@ -6760,43 +6760,105 @@ def maybe_run_expert_swap_window(
 
     store = _KT_SPLIT_PREFILL_STATE["store"]
 
+    # Batched move state. run_swap_window applies a layer's swaps in one
+    # consecutive run (kt_expert_swap.py:386-391), so "the layer changed" is a
+    # sufficient flush trigger, and no interface change is needed.
+    _pending = {"layer": None, "layer_idx": None, "items": []}
+
+    def _flush_moves():
+        """Apply one layer's staged swaps as a handful of bulk copies.
+
+        WHY THIS EXISTS. The per-expert version issued, for every swap, four
+        `.to("cpu", non_blocking=False)` reads -- a BLOCKING D2H each. At 8
+        swaps x 4 tensors x 92 layers that is 2,944 synchronising round trips,
+        and it is what made a measured swap window cost 36-78 s against a
+        bandwidth model predicting ~116 ms. The traffic was never the problem:
+        3.2 GB at 27.9 GB/s is a tenth of a second. The stalls were.
+
+        This mirrors ColdExpertPipeline, which streams a layer as four bulk
+        copies (one per weight name) rather than one per expert. Per layer:
+        4 gathers + 4 async D2H + ONE sync + 4 scatters, instead of 32 copies
+        and 32 syncs.
+
+        The read-before-write rule is preserved and in fact widened: every
+        promoted row was cloned out of the store by stage_row at record time,
+        and every demoted row is gathered off the GPU here BEFORE any promoted
+        row is written back, so a promote and a demote trading the same places
+        cannot destroy each other's source.
+        """
+        pend = _pending
+        items = pend["items"]
+        if not items:
+            return
+        layer, layer_idx = pend["layer"], pend["layer_idx"]
+        pend["items"] = []
+
+        rows = [it["dst_row"] for it in items]
+        dev = getattr(layer, _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]).data.device
+        idx = torch.tensor(rows, dtype=torch.long, device=dev)
+
+        # READ: gather every demoted row, one kernel per weight name, and pull
+        # them down asynchronously into pinned staging.
+        staged = {}
+        for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
+            gathered = getattr(layer, name).data.index_select(0, idx)
+            host = torch.empty(
+                gathered.shape, dtype=gathered.dtype, device="cpu", pin_memory=True
+            )
+            host.copy_(gathered, non_blocking=True)
+            staged[name] = host
+        # The one sync for the whole layer. Everything above must land before
+        # the writes below overwrite the rows it read.
+        torch.cuda.synchronize()
+
+        # WRITE: scatter every promoted row back, again one kernel per name.
+        for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
+            stacked = torch.stack([it["promoted"][name] for it in items])
+            getattr(layer, name).data.index_copy_(
+                0, idx, stacked.to(dev, non_blocking=True)
+            )
+
+        # The store is authoritative for the cold set, so the demoted rows go
+        # back into the slots the promoted experts vacated. Slices of the
+        # pinned staging are already on CPU, so write_row's .to("cpu") is free.
+        for i, it in enumerate(items):
+            store.write_row(
+                layer_idx,
+                it["slot"],
+                {n: staged[n][i] for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES},
+                logical_id=it["demoted_id"],
+            )
+
     def _move(layer, dst_row, logical_id, demoted_id):
-        """Write expert ``logical_id`` into resident row ``dst_row``.
+        """Record expert ``logical_id`` -> resident row ``dst_row``.
 
-        With split-prefill armed the cold store already holds that expert's
-        shard in exactly this layout, so the move is four pinned copies rather
-        than a checkpoint read + TP slice + swizzle.  The store is then
-        updated in the same window, because it is authoritative for the cold
-        set: a stale row would be promoted into a resident row on some later
-        swap and silently serve every decode step after it.
-
-        Ordering is load-bearing and mirrors run_swap_window's own rule.  The
-        promoted expert vacates a cold slot that the demoted expert then
-        takes, so the promoted row is staged BEFORE anything is written back.
+        Records rather than applies: the copies are batched per layer by
+        _flush_moves. The promoted shard is cloned out of the cold store HERE,
+        at record time, because the slot it comes from is the slot the demoted
+        expert will later take.
         """
         layer_idx = layer.layer_id
         slot = None if store is None else store.slot_of(layer_idx, logical_id)
         if slot is None:
-            # No store, or the expert is not in the cold set (a re-promotion
-            # inside one window). Fall back to the checkpoint path.
+            # No store, or the expert left the cold set (a re-promotion inside
+            # one window). The checkpoint path writes the GPU row immediately,
+            # so drain anything staged for this layer first -- otherwise a
+            # queued scatter could land on top of it.
+            _flush_moves()
             mover.move(layer, dst_row, logical_id)
             return
 
-        # Both reads happen before either write: the promoted expert's shard
-        # out of the cold slot, and the demoted expert's weights out of the
-        # resident row. Either write would otherwise destroy the other's
-        # source, since promotion and demotion trade exactly these two places.
-        promoted = store.stage_row(layer_idx, slot)
-        demoted = {
-            name: getattr(layer, name).data[dst_row].to("cpu", non_blocking=False)
-            for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
-        }
-
-        for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
-            getattr(layer, name).data[dst_row].copy_(
-                promoted[name], non_blocking=True
-            )
-        store.write_row(layer_idx, slot, demoted, logical_id=demoted_id)
+        if _pending["layer_idx"] != layer_idx:
+            _flush_moves()
+            _pending["layer"], _pending["layer_idx"] = layer, layer_idx
+        _pending["items"].append(
+            {
+                "dst_row": dst_row,
+                "slot": slot,
+                "demoted_id": demoted_id,
+                "promoted": store.stage_row(layer_idx, slot),
+            }
+        )
 
     def _verify_install_once(entry):
         """SGLANG_KT_VERIFY_CPU_INSTALL=1: prove the demotion install bitwise.
@@ -6869,12 +6931,18 @@ def maybe_run_expert_swap_window(
             promote_id, demote_id, *[t.data_ptr() for t in tensors]
         )
 
-    result = run_swap_window(
-        entries,
-        move_weights=_move,
-        install_cpu_expert=_install_cpu,
-        quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
-    )
+    try:
+        result = run_swap_window(
+            entries,
+            move_weights=_move,
+            install_cpu_expert=_install_cpu,
+            quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
+        )
+    finally:
+        # Drain the last layer. In a finally because staged items surviving a
+        # failed window would be applied during the NEXT one -- writing a stale
+        # layer's rows, which is silent and unattributable.
+        _flush_moves()
     _KT_SWAP_STATE["windows"] += 1
     _KT_SWAP_STATE["swaps"] += result.swaps_applied
     if _KT_DOORBELL["inited"]:
