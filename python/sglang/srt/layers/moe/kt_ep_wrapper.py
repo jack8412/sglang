@@ -7455,6 +7455,21 @@ def finalize_split_prefill(server_args) -> bool:
         # The plan builder falls back rather than guessing, so honour that here
         # too: without it, `dynamic` would size the store by a None shape map.
         dynamic = dynamic and swizzle_plan is not None and raw_shapes is not None
+        if dynamic and anchor.kt_config.expert_swap_interval > 0:
+            # The swap path shares these rows and assumes GPU layout on BOTH
+            # sides: _move scatters stage_row() straight into a resident row,
+            # and _flush_moves write_row()s bytes gathered off the GPU. Against
+            # a raw store that mixes layouts silently -- right shapes, right
+            # sizes, wrong experts, no crash. Refuse rather than serve that.
+            raise ValueError(
+                "SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE stores the cold set in "
+                "checkpoint layout, but --kt-expert-swap-interval "
+                f"{anchor.kt_config.expert_swap_interval} makes the swap path "
+                "read and write those same rows as GPU-layout bytes. Run with "
+                "--kt-expert-swap-interval 0, or leave dynamic swizzle off, "
+                "until promotion swizzles and demotion unswizzles across that "
+                "boundary."
+            )
         store = build_cold_store(
             layer_indices=layer_indices,
             gpu_experts_mask=anchor.gpu_experts_mask,
