@@ -134,11 +134,22 @@ class ColdExpertPipeline:
         device: torch.device,
         per_expert_shapes: Dict[str, tuple],
         moe_layer_indices: Sequence[int],
+        swizzle_plan=None,
+        raw_shapes: Optional[Dict[str, tuple]] = None,
     ):
         self._store = store
         self._device = device
         self._layers = sorted(moe_layer_indices)
         self._pos = {layer: i for i, layer in enumerate(self._layers)}
+        # Dynamic-swizzle mode: the store holds CHECKPOINT-layout bytes and the
+        # trtllm layout is produced here, once per layer, on device.
+        #
+        # The point of doing it per layer is measured, not stylistic: one
+        # expert's TP8 shard swizzles in ~52 us -- launch-bound, only ~42 GB/s
+        # for 2.19 MB -- so 276 cold experts x 92 layers issued per expert is
+        # ~1.32 s per forward against a ~2.07 s copy floor. Issued once per
+        # layer it is ~1.0 ms, ~0.092 s per forward. Same bytes, 14x apart.
+        self._swizzle_plan = swizzle_plan
 
         self._buffers: List[Dict[str, torch.Tensor]] = [
             {
@@ -149,6 +160,23 @@ class ColdExpertPipeline:
             }
             for _ in range(self.NUM_SLOTS)
         ]
+        # Raw landing buffers, only in dynamic-swizzle mode. One per slot, so a
+        # layer's raw block can land while the previous layer's swizzled block
+        # is still being read.
+        self._raw_buffers: Optional[List[Dict[str, torch.Tensor]]] = (
+            [
+                {
+                    n: torch.empty(
+                        (store.num_cold,) + tuple(shape), dtype=dtype, device=device
+                    )
+                    for n, (shape, dtype) in raw_shapes.items()
+                }
+                for _ in range(self.NUM_SLOTS)
+            ]
+            if swizzle_plan is not None and raw_shapes is not None
+            else None
+        )
+
         # Which layer currently occupies each slot (None = never filled).
         self._slot_layer: List[Optional[int]] = [None] * self.NUM_SLOTS
 
@@ -200,14 +228,46 @@ class ColdExpertPipeline:
             if self._probe is not None:
                 self._probe.copy_begin(self._pos[layer_idx], self._copy_stream)
             dst = self._buffers[slot]
-            for name in WEIGHT_NAMES:
-                dst[name].copy_(
-                    self._store.layer_rows(layer_idx, name), non_blocking=True
-                )
+            if self._raw_buffers is None:
+                for name in WEIGHT_NAMES:
+                    dst[name].copy_(
+                        self._store.layer_rows(layer_idx, name), non_blocking=True
+                    )
+            else:
+                # Land the checkpoint-layout bytes, then swizzle the whole
+                # layer into the resident-layout buffer. Both stay on the copy
+                # stream, so the existing prefetch event still means exactly
+                # "this layer's weights are ready to read" and wait_prefetch
+                # needs no change.
+                self._swizzle_into(slot, layer_idx, dst)
             if self._probe is not None:
                 self._probe.copy_end(self._pos[layer_idx], self._copy_stream)
             self._prefetch_events[slot].record(self._copy_stream)
         self._slot_layer[slot] = layer_idx
+
+    def _swizzle_into(
+        self, slot: int, layer_idx: int, dst: Dict[str, torch.Tensor]
+    ) -> None:
+        """H2D the raw block, then swizzle it into ``dst`` in four gathers."""
+        from sglang.srt.layers.moe.kt_mxfp4_export import apply_batched_swizzle
+
+        raw = self._raw_buffers[slot]
+        for name in WEIGHT_NAMES:
+            raw[name].copy_(
+                self._store.layer_rows(layer_idx, name), non_blocking=True
+            )
+        out = apply_batched_swizzle(
+            plan=self._swizzle_plan,
+            raw_w13=raw[WEIGHT_NAMES[0]],
+            raw_w13_scale=raw[WEIGHT_NAMES[1]],
+            raw_w2=raw[WEIGHT_NAMES[2]],
+            raw_w2_scale=raw[WEIGHT_NAMES[3]],
+        )
+        for name, produced in zip(WEIGHT_NAMES, out):
+            target = dst[name]
+            target.view(torch.uint8).reshape(-1).copy_(
+                produced.reshape(-1).view(torch.uint8)
+            )
 
     def wait_prefetch(self, layer_idx: int) -> Dict[str, torch.Tensor]:
         """Block the compute stream until this layer's weights have landed.

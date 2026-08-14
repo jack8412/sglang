@@ -200,6 +200,106 @@ def trtllm_permute_indices(
     )
 
 
+class TrtllmBatchedSwizzle(msgspec.Struct):
+    """Forward swizzle for a WHOLE LAYER's experts, in four indexed gathers.
+
+    Granularity is the entire point. Measured on this node, one expert's TP8
+    shard swizzles in ~52 us, which is launch-bound rather than
+    bandwidth-bound: at 2.19 MB per expert that is only ~42 GB/s. Issued once
+    per expert, split prefill's 276 cold experts x 92 layers would cost ~1.32 s
+    per forward against a ~2.07 s copy floor -- +64%, which is not affordable.
+    Issued once per LAYER over all its experts it costs ~1.0 ms per layer,
+    ~0.092 s per forward, +4.4%. Same bytes, 14x apart.
+
+    Both parts are expressed as plain index maps so a layer is four gathers:
+
+      weights  out[e] = raw[e][rows]                 -> raw[:, rows, :]
+      scales   out[e] = interleave(raw[e][rows])     -> raw.view(E,-1)[:, map]
+
+    The scale map folds the row permutation and the interleave together, so
+    ``nvfp4_block_scale_interleave`` is never called on the hot path -- it has
+    no batched form, and calling it per expert is exactly the cost being
+    avoided. The fold is exact because the interleave is a pure byte
+    permutation (:func:`recover_interleave_map` asserts that).
+    """
+
+    w13_rows: torch.Tensor
+    w2_rows: torch.Tensor
+    w13_scale_map: torch.Tensor
+    w2_scale_map: torch.Tensor
+    w13_scale_out_shape: tuple
+    w2_scale_out_shape: tuple
+
+
+def _fold_permute_into_interleave(
+    row_indices: torch.Tensor, scale_shape, device
+) -> tuple:
+    """Flat map for ``interleave(x[row_indices])``, plus the output shape.
+
+    ``interleave(y).flat[q] == y.flat[src[q]]`` and
+    ``y.flat[j] == x.flat[row_indices[j // C] * C + j % C]``, so composing them
+    gives one gather over the raw expert.
+    """
+    src = recover_interleave_map(scale_shape, device)
+    cols = int(scale_shape[1])
+    rows_for = row_indices.to(device)[torch.div(src, cols, rounding_mode="floor")]
+    folded = rows_for * cols + (src % cols)
+    return folded, (int(src.numel()),)
+
+
+def trtllm_batched_swizzle(
+    indices: TrtllmPermuteIndices,
+    *,
+    w13_scale_shape,
+    w2_scale_shape,
+    device,
+) -> TrtllmBatchedSwizzle:
+    """Build the per-layer swizzle maps. Shape-derived, so cache per shape."""
+    w13_map, w13_out = _fold_permute_into_interleave(
+        indices.w13_scale, w13_scale_shape, device
+    )
+    w2_map, w2_out = _fold_permute_into_interleave(
+        indices.w2_scale, w2_scale_shape, device
+    )
+    return TrtllmBatchedSwizzle(
+        w13_rows=indices.w13_weight.to(device),
+        w2_rows=indices.w2_weight.to(device),
+        w13_scale_map=w13_map,
+        w2_scale_map=w2_map,
+        w13_scale_out_shape=w13_out,
+        w2_scale_out_shape=w2_out,
+    )
+
+
+def apply_batched_swizzle(
+    *,
+    plan: TrtllmBatchedSwizzle,
+    raw_w13: torch.Tensor,
+    raw_w13_scale: torch.Tensor,
+    raw_w2: torch.Tensor,
+    raw_w2_scale: torch.Tensor,
+) -> tuple:
+    """Swizzle ``[num_experts, ...]`` raw stacks. Four gathers, no per-expert loop.
+
+    Returns tensors shaped like the resident device buffers the MoE kernel
+    reads, in ``WEIGHT_NAMES`` order.
+    """
+    e = raw_w13.shape[0]
+    w13 = raw_w13.view(torch.uint8)[:, plan.w13_rows, :].contiguous()
+    w2 = raw_w2.view(torch.uint8)[:, plan.w2_rows, :].contiguous()
+    w13_scale = (
+        raw_w13_scale.reshape(e, -1).view(torch.uint8)[:, plan.w13_scale_map]
+        .reshape((e,) + plan.w13_scale_out_shape)
+        .contiguous()
+    )
+    w2_scale = (
+        raw_w2_scale.reshape(e, -1).view(torch.uint8)[:, plan.w2_scale_map]
+        .reshape((e,) + plan.w2_scale_out_shape)
+        .contiguous()
+    )
+    return w13, w13_scale, w2, w2_scale
+
+
 class TrtllmInverseIndices(msgspec.Struct):
     """The inverse of :class:`TrtllmPermuteIndices`, for reading a slot back.
 

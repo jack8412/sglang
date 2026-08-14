@@ -347,6 +347,17 @@ RUN mkdir -p /opt/trtllm_gen_moe_cubin_pool \
 # container run exactly as it mirrors a bare-node run.
 RUN mkdir -p ${WS}/runs/status ${WS}/runs/probes ${WS}/runs/logs ${WS}/runs/meta ${WS}/runs/edr \
     && . ${VENV}/bin/activate \
+    # The base image carries its OWN sglang (0.5.16, editable, exposed through
+    # __editable__.sglang-0.5.16.pth in system dist-packages). It is invisible
+    # here only because `uv venv --seed` builds an isolated venv and the base
+    # leaves PYTHONPATH unset. Both are load-bearing and neither is obvious, so
+    # assert rather than trust: if the venv ever gains system site-packages, the
+    # server would silently run the BASE's 0.5.16 instead of this branch, and
+    # every measurement would be attributed to the wrong code.
+    && grep -q '^include-system-site-packages *= *false' ${VENV}/pyvenv.cfg \
+       || { echo "FATAL: venv sees system site-packages -- base sglang can leak" >&2; exit 4; } \
+    && python -c "import sglang,os;p=os.path.dirname(sglang.__file__);assert p.startswith('${WS}/sglang/python/'),'sglang resolved to '+p+' -- the base image 0.5.16 leaked into the venv';print('sglang from  :',p)" \
+    && python -c "import kt_kernel,os;print('kt_kernel from:',os.path.dirname(kt_kernel.__file__))" \
     && python -c "import torch, flashinfer, sgl_kernel, kt_kernel, sglang; print('ENV-OK', torch.__version__, flashinfer.__version__, sglang.__version__)" \
     && rm -rf /root/.cargo/registry
 

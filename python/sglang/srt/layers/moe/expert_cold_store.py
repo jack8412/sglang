@@ -177,8 +177,21 @@ def build_cold_store(
     per_expert_shapes: Dict[str, Tuple[Tuple[int, ...], torch.dtype]],
     device: torch.device,
     progress_every: int = 10,
+    raw_layout: bool = False,
 ) -> ColdExpertStore:
-    """Read, TP-slice and swizzle every layer's cold experts into pinned rows.
+    """Read, TP-slice and (unless ``raw_layout``) swizzle cold experts into
+    pinned rows.
+
+    ``raw_layout`` stores CHECKPOINT-layout bytes instead of trtllm-swizzled
+    ones, leaving the swizzle to ColdExpertPipeline, which does it once per
+    layer on device. That is the shape the design needs if the pinned copy is
+    ever to be dropped in favour of streaming out of kt's own buffers: those
+    hold checkpoint layout too (fp4-moe.hpp loads by plain memcpy), so a raw
+    store is the same bytes in the same layout, and proving the pipeline
+    against it is the step before removing the store entirely.
+
+    ``per_expert_shapes`` must describe whichever layout is being stored --
+    raw shapes for ``raw_layout``, resident-buffer shapes otherwise.
 
     Cold slots are assigned in ascending logical order at build time -- the
     mirror of how residents get their dense slots (``torch.where`` +
@@ -209,10 +222,14 @@ def build_cold_store(
     store.allocate()
 
     reader = CheckpointExpertReader(weight_path)
-    scratch = {
-        n: torch.empty(tuple(shape), dtype=dtype, device=device)
-        for n, (shape, dtype) in per_expert_shapes.items()
-    }
+    scratch = (
+        None
+        if raw_layout
+        else {
+            n: torch.empty(tuple(shape), dtype=dtype, device=device)
+            for n, (shape, dtype) in per_expert_shapes.items()
+        }
+    )
     indices = None
 
     t_start = time.perf_counter()
@@ -222,6 +239,17 @@ def build_cold_store(
             raw = build_expert_bytes(
                 reader, prefix, logical_id, tp_rank=tp_rank, tp_size=tp_size
             )
+            if raw_layout:
+                # Store the checkpoint-layout bytes untouched; the swizzle is
+                # deferred to the pipeline, once per layer on device. Nothing
+                # here touches the GPU at all, which is also why a raw store
+                # builds faster than a swizzled one.
+                for n, t in zip(
+                    WEIGHT_NAMES,
+                    (raw.w13, raw.w13_scale_e8m0, raw.w2, raw.w2_scale_e8m0),
+                ):
+                    store.layer_rows(layer_idx, n)[slot].copy_(t)
+                continue
             on_dev = type(raw)(
                 w13=raw.w13.to(device),
                 w13_scale_e8m0=raw.w13_scale_e8m0.to(device),

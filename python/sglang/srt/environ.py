@@ -1387,6 +1387,13 @@ class Envs:
     # which is identical on every rank. Still opt-in until measured against the
     # checkpoint path on a live server.
     SGLANG_KT_SWAP_GPU_READBACK = EnvBool(False)
+    # Hold the split-prefill cold store in CHECKPOINT layout and swizzle each
+    # layer on device as it is prefetched, instead of storing pre-swizzled
+    # bytes. Costs ~1.0 ms per layer (~+4.4% of the ~2.07 s/forward copy floor)
+    # and is the step toward dropping the pinned store altogether in favour of
+    # streaming out of kt's own buffers, which hold checkpoint layout too.
+    # Off until the batched swizzle is proved bitwise on a live server.
+    SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE = EnvBool(False)
     # Per-forward slot-accounting check for split-slice full-expert prefill:
     # assert the resident and cold expert slices claim every routed slot
     # exactly once. Costs a device sync per layer, so it is a debug gate, not

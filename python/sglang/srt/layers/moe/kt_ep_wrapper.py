@@ -7448,6 +7448,13 @@ def finalize_split_prefill(server_args) -> bool:
                    getattr(anchor_layer, name).dtype)
             for name in WEIGHT_NAMES
         }
+        dynamic = envs.SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE.get()
+        raw_shapes, swizzle_plan = (
+            _build_dynamic_swizzle_plan(anchor, device) if dynamic else (None, None)
+        )
+        # The plan builder falls back rather than guessing, so honour that here
+        # too: without it, `dynamic` would size the store by a None shape map.
+        dynamic = dynamic and swizzle_plan is not None and raw_shapes is not None
         store = build_cold_store(
             layer_indices=layer_indices,
             gpu_experts_mask=anchor.gpu_experts_mask,
@@ -7457,14 +7464,19 @@ def finalize_split_prefill(server_args) -> bool:
             expert_prefix_for_layer=lambda li: (
                 f"language_model.model.layers.{li}.block_sparse_moe.experts"
             ),
-            per_expert_shapes=per_expert_shapes,
+            # In dynamic mode the store holds checkpoint-layout bytes, so it is
+            # sized by the RAW shapes, not the resident-buffer ones.
+            per_expert_shapes=raw_shapes if dynamic else per_expert_shapes,
             device=device,
+            raw_layout=dynamic,
         )
         pipeline = ColdExpertPipeline(
             store=store,
             device=device,
             per_expert_shapes=per_expert_shapes,
             moe_layer_indices=layer_indices,
+            swizzle_plan=swizzle_plan,
+            raw_shapes=raw_shapes,
         )
     except Exception:
         logger.exception(
@@ -7562,6 +7574,85 @@ def _start_demotion_prefetch(anchor, entries):
     logger.info(
         "[kt-swap] prefetching %d demoted experts off the critical path", len(plan)
     )
+
+
+def _build_dynamic_swizzle_plan(anchor, device):
+    """Raw per-expert shapes and the per-layer swizzle maps, from one sample.
+
+    Both are shape-derived, so a single expert read settles them for every
+    layer. Returns ``(raw_shapes, plan)`` in ColdExpertStore's WEIGHT_NAMES
+    order, or ``(None, None)`` if anything is missing -- in which case the
+    caller falls back to the pre-swizzled store rather than guessing.
+    """
+    from sglang.srt.layers.moe.expert_cold_store import WEIGHT_NAMES
+    from sglang.srt.layers.moe.kt_expert_mover import (
+        CheckpointExpertReader,
+        build_expert_bytes,
+    )
+    from sglang.srt.layers.moe.kt_mxfp4_export import (
+        trtllm_batched_swizzle,
+        trtllm_permute_indices,
+    )
+
+    try:
+        cold = torch.where(~anchor.gpu_experts_mask)[0].tolist()
+        if not cold:
+            return None, None
+        reader = CheckpointExpertReader(anchor.kt_config.weight_path)
+        try:
+            li = anchor.kt_config.layer_idx
+            sample = build_expert_bytes(
+                reader,
+                f"language_model.model.layers.{li}.block_sparse_moe.experts",
+                cold[0],
+                tp_rank=get_parallel().tp_rank,
+                tp_size=get_parallel().tp_size,
+            )
+        finally:
+            reader.close()
+        on_dev = type(sample)(
+            w13=sample.w13.to(device),
+            w13_scale_e8m0=sample.w13_scale_e8m0.to(device),
+            w2=sample.w2.to(device),
+            w2_scale_e8m0=sample.w2_scale_e8m0.to(device),
+        )
+        raw_shapes = {
+            n: (tuple(t.shape), t.dtype)
+            for n, t in zip(
+                WEIGHT_NAMES,
+                (
+                    on_dev.w13,
+                    on_dev.w13_scale_e8m0,
+                    on_dev.w2,
+                    on_dev.w2_scale_e8m0,
+                ),
+            )
+        }
+        indices = trtllm_permute_indices(
+            w13_sample=on_dev.w13,
+            w13_scale_sample=on_dev.w13_scale_e8m0,
+            w2_sample=on_dev.w2,
+            w2_scale_sample=on_dev.w2_scale_e8m0,
+            w13_gate_up_halves=True,
+        )
+        plan = trtllm_batched_swizzle(
+            indices,
+            w13_scale_shape=tuple(on_dev.w13_scale_e8m0.shape),
+            w2_scale_shape=tuple(on_dev.w2_scale_e8m0.shape),
+            device=device,
+        )
+        logger.info(
+            "[split-prefill] dynamic swizzle armed: raw w13 %s, w2 %s",
+            tuple(on_dev.w13.shape),
+            tuple(on_dev.w2.shape),
+        )
+        return raw_shapes, plan
+    except Exception:
+        logger.exception(
+            "[split-prefill] could not build the dynamic swizzle plan; using "
+            "the pre-swizzled cold store"
+        )
+        return None, None
 
 
 def _get_or_create_gpu_reader():
