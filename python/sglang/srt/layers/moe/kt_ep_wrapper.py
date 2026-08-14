@@ -6766,7 +6766,12 @@ def maybe_run_expert_swap_window(
     # flipped, so a failed write left the tables advertising experts whose rows
     # still held the previous occupants, and the error was reported against the
     # following layer. The layer-change flush below is now only a safety net.
-    _pending = {"layer": None, "layer_idx": None, "items": [], "row_of": {}}
+    _pending = {
+        "layer": None,
+        "layer_idx": None,
+        "items": [],
+        "prefetched": {},
+    }
     gpu_reader = _get_or_create_gpu_reader()
 
     def _flush_moves():
@@ -6796,11 +6801,9 @@ def maybe_run_expert_swap_window(
             return
         layer, layer_idx = pend["layer"], pend["layer_idx"]
         pend["items"] = []
-        # Past this point the recorded rows hold PROMOTED experts, so no
-        # demotion may read them back. row_of names only rows not yet written;
-        # dropping it here is what keeps that true no matter what triggered the
-        # flush (layer change, or the checkpoint fallback mid-layer).
-        pend["row_of"].clear()
+        # Past this point the recorded rows hold PROMOTED experts. Demotions
+        # never read them back: _begin_layer took every demoted row for this
+        # layer before its first move ran.
 
         rows = [it["dst_row"] for it in items]
         dev = getattr(layer, _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]).data.device
@@ -6878,11 +6881,6 @@ def maybe_run_expert_swap_window(
         if _pending["layer_idx"] != layer_idx:
             _flush_moves()
             _pending["layer"], _pending["layer_idx"] = layer, layer_idx
-            _pending["row_of"].clear()
-        # install_cpu_expert runs immediately after this call and is given only
-        # the logical ids, so the row the demoted expert still occupies is
-        # recorded here for it to read back from.
-        _pending["row_of"][demoted_id] = dst_row
         _pending["items"].append(
             {
                 "dst_row": dst_row,
@@ -6963,6 +6961,34 @@ def maybe_run_expert_swap_window(
             promote_id, demote_id, *[t.data_ptr() for t in tensors]
         )
 
+    def _begin_layer(entry, swaps, rows):
+        """Read this layer's demoted experts off the GPU, before any move.
+
+        Runs once per layer with the whole plan, so the collectives inside are
+        keyed to the plan -- identical on every rank -- rather than to per-swap
+        conditions. It also guarantees read-before-write unconditionally: no
+        move has run yet, so every row still holds its demoted occupant even on
+        the checkpoint-fallback path that writes its row immediately.
+        """
+        _pending["prefetched"] = {}
+        method = entry.get("method")
+        if (
+            gpu_reader is None
+            or _KT_SWAP_STATE.get("gpu_readback_off")
+            or method is None
+            or not method.kt_config.cold_only_cpu_experts
+            or method.wrapper is None
+        ):
+            return
+        # Not wrapped: absorbing here on one rank would drop it out of the
+        # collectives the others are running, which is the failure this hook
+        # exists to prevent.
+        got = gpu_reader.read_full_experts(entry["layer"], rows)
+        _pending["prefetched"] = {
+            s.demote: [t.to("cpu") for t in tensors]
+            for s, tensors in zip(swaps, got)
+        }
+
     def _read_demoted_expert(entry, demote_id):
         """The demoted expert's full bytes, from the GPU if that is proven.
 
@@ -6972,18 +6998,12 @@ def maybe_run_expert_swap_window(
         on this process's first demotion, and any failure falls back rather
         than installing bytes nobody has checked.
         """
-        row = _pending["row_of"].get(demote_id)
-        # Decided from configuration alone, so identically on every rank, and
-        # BEFORE the GPU route is entered: that route contains an all_gather,
-        # and one rank opting out while the others block on the collective is a
-        # hang, not a fallback.
-        if gpu_reader is None or row is None or _KT_SWAP_STATE.get("gpu_readback_off"):
+        # Prefetched by _begin_layer, before any of this layer's moves ran, in
+        # one collective per tensor. Nothing here is per-rank data: either the
+        # whole layer was prefetched on every rank or on none.
+        got = _pending["prefetched"].get(demote_id)
+        if got is None:
             return mover.read_full_expert(entry["layer"], demote_id)
-
-        # Deliberately not wrapped in try/except. Absorbing a failure here on
-        # one rank would drop it out of the collectives the other ranks are
-        # still running -- the same reason SwapInstallError is never absorbed.
-        got = [t.to("cpu") for t in gpu_reader.read_full_expert(entry["layer"], row)]
 
         if not _KT_SWAP_STATE.get("gpu_readback_verified"):
             # Every rank reaches this on the same demotion, so the consensus
@@ -7024,6 +7044,7 @@ def maybe_run_expert_swap_window(
             entries,
             move_weights=_move,
             install_cpu_expert=_install_cpu,
+            begin_layer=_begin_layer,
             finish_layer=_flush_moves,
             quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
         )
@@ -7136,15 +7157,81 @@ class _GpuResidentExpertReader:
         self._by_shape[key] = prepared
         return prepared
 
+    def read_full_experts(self, layer, dst_rows):
+        """Every expert in ``dst_rows``, in one collective per tensor.
+
+        This is the shape the swap window must use. Reading rows one at a time
+        issues six all-gathers per expert and, worse, does so from inside the
+        per-swap install where the decision to read at all is per-rank data --
+        ranks then disagree on how many collectives to run and the window
+        deadlocks in NCCL instead of falling back. Called once per layer with
+        the layer's whole plan, the collective count is a pure function of that
+        plan, which is identical on every rank by construction.
+
+        Returns one ``(gate, up, down, gate_s, up_s, down_s)`` tuple per row, in
+        the same order and layout ``CheckpointExpertMover.read_full_expert``
+        returns, so the two are interchangeable.
+
+        Every row must still hold its DEMOTED occupant: call before any move.
+        """
+        from sglang.srt.layers.moe.kt_mxfp4_export import unswizzle_trtllm_expert
+
+        inverse, w13_scale_shape, w2_scale_shape = self._prepare(layer)
+        w13_n, w13_s_n, w2_n, w2_s_n = self.param_names
+
+        # The unswizzle is local work with no collective in it, so it stays
+        # per-expert; only the gathers are batched.
+        shards = [
+            unswizzle_trtllm_expert(
+                w13=getattr(layer, w13_n).data[r],
+                w13_scale=getattr(layer, w13_s_n).data[r],
+                w2=getattr(layer, w2_n).data[r],
+                w2_scale=getattr(layer, w2_s_n).data[r],
+                inverse=inverse,
+                w13_scale_shape=w13_scale_shape,
+                w2_scale_shape=w2_scale_shape,
+            )
+            for r in dst_rows
+        ]
+
+        per = shards[0].w13.shape[0] // 2
+        per_s = shards[0].w13_scale_e8m0.shape[0] // 2
+        # (name, per-expert concat dim). Stacking prepends an expert axis, so
+        # the concat dim shifts by one inside _all_gather_batched.
+        plan = [
+            ([s.w13[:per] for s in shards], 0),
+            ([s.w13[per:] for s in shards], 0),
+            ([s.w2 for s in shards], 1),
+            ([s.w13_scale_e8m0[:per_s] for s in shards], 0),
+            ([s.w13_scale_e8m0[per_s:] for s in shards], 0),
+            ([s.w2_scale_e8m0 for s in shards], 1),
+        ]
+        gathered = [
+            self._all_gather_batched(torch.stack(parts), dim) for parts, dim in plan
+        ]
+        return [tuple(g[i].contiguous() for g in gathered) for i in range(len(dst_rows))]
+
+    def _all_gather_batched(self, stacked: torch.Tensor, dim: int) -> torch.Tensor:
+        """Gather ``[experts, ...]`` shards from every rank; concat along ``dim``.
+
+        One collective for the whole layer instead of one per expert.
+        """
+        tp_size = get_parallel().tp_size
+        if tp_size == 1:
+            return stacked.contiguous()
+        stacked = stacked.contiguous()
+        out = torch.empty(
+            (tp_size,) + tuple(stacked.shape), dtype=stacked.dtype, device=stacked.device
+        )
+        dist.all_gather_into_tensor(out, stacked, group=get_tp_group().device_group)
+        # out is [rank, expert, ...]; the per-expert concat axis is dim + 1.
+        return torch.cat(list(out.unbind(0)), dim=dim + 1)
+
     def read_full_expert(self, layer, dst_row: int):
-        """The full unsliced expert at resident row ``dst_row``.
+        """Single-row convenience wrapper. Prefer :meth:`read_full_experts`.
 
-        Returns ``(gate, up, down, gate_s, up_s, down_s)``, contiguous uint8 --
-        the same tuple and order ``CheckpointExpertMover.read_full_expert``
-        returns, so the two are drop-in interchangeable.
-
-        Must be called while ``dst_row`` still holds the DEMOTED expert, i.e.
-        before the promoted row is written back.
+        Kept for the offline verifier and for tp_size == 1, where there is no
+        collective and therefore no symmetry requirement.
         """
         from sglang.srt.layers.moe.kt_mxfp4_export import unswizzle_trtllm_expert
 

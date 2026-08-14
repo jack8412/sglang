@@ -345,6 +345,7 @@ def run_swap_window(
     *,
     move_weights: MoveWeightsFn,
     install_cpu_expert: Optional[Callable[[dict, int, int], None]] = None,
+    begin_layer: Optional[Callable[[dict, list, list], None]] = None,
     finish_layer: Optional[Callable[[], None]] = None,
     quiesce: Optional[Callable[[], None]] = None,
 ) -> SwapWindowResult:
@@ -366,6 +367,16 @@ def run_swap_window(
     advertise an expert as GPU-resident while its row still held the previous
     occupant's weights -- every token routed there would silently compute with
     the wrong expert. Nothing crashes; the answers are just wrong.
+
+    ``begin_layer(entry, swaps, rows)`` runs once per layer, before the first
+    move, with the layer's whole plan in hand. Two properties follow, and both
+    are load-bearing for a mover that reads demoted weights back off the GPU:
+    every row it names still holds its DEMOTED occupant (no move has run yet),
+    and any collective it issues is keyed to the plan rather than to per-swap
+    conditions. A read-back that instead decided per swap -- skipping when an
+    expert had no cold-store slot, or when its row had already been written --
+    made ranks disagree on how many collectives to run, and the window
+    deadlocked in NCCL rather than falling back.
 
     ``finish_layer`` exists for movers that BATCH their writes: they treat
     ``move_weights`` as a record step and apply a layer's copies in bulk, so
@@ -395,6 +406,8 @@ def run_swap_window(
             rows = [
                 int(tables.logical_to_gpu_index[s.demote].item()) for s in swaps
             ]
+            if begin_layer is not None:
+                begin_layer(entry, swaps, rows)
             for s, row in zip(swaps, rows):
                 move_weights(entry["layer"], row, s.promote, s.demote)
                 if install_cpu_expert is not None:
