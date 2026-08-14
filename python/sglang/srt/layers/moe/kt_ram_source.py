@@ -8,7 +8,16 @@ for K3's cold set across 8 ranks. kt's buffers are checkpoint layout
 (``fp4-moe.hpp::load_weights`` fills them with plain ``memcpy``: nibble-packed
 FP4 weights, raw uint8 E8M0 scales), which is exactly what the GPU-side swizzle
 consumes, so the duplicate exists only because the addresses were not reachable.
-``expert_buffer_pointers()`` now exposes them.
+
+Two access modes, one layout:
+
+- ``KtRamExpertSource`` wraps the ABSOLUTE addresses that
+  ``expert_buffer_pointers()`` exports. Valid only in the process that owns the
+  kt engine (TP rank 0).
+- ``KtArenaExpertSource`` indexes OFFSETS into memfd-backed arenas
+  (``expert_buffer_arenas()``, KT_BUFFER_B_MEMFD=1). Offsets are address-space
+  independent, so any rank that maps the fds gets the same bytes --
+  ``kt_arena_share`` does the fd passing and mapping.
 
 Deliberately NOT via ``write_weight_scale_to_buffer``: that exports rather than
 lends, and it expands the E8M0 scales to bf16 on the CPU -- ~38.7 ms of a
@@ -25,14 +34,16 @@ by GPU rank, and it partitions the two projections on different axes. With
     down scale     [hidden, per_numa/group]    COLUMN-blocked
 
 Concatenating the partitions along those axes rebuilds the full expert, and
-slicing that for the GPU rank reproduces ``build_expert_bytes`` exactly. Doing
-it that way, rather than reimplementing kt's own cpu_tp/gpu_tp branch logic,
-means the two only have to agree about the checkpoint's layout -- which is the
-thing both of them are already derived from.
+slicing that for the GPU rank reproduces ``build_expert_bytes`` exactly. The
+implementation slices each partition's block FIRST and concatenates only the
+touched pieces -- identical bytes (slice and concat commute along one axis),
+but it copies the rank's 2.19 MB instead of materializing the full 17.5 MB
+expert per call, which matters at ~370 promotions per swap window.
 
-EXPERT IDS ARE PHYSICAL. Under ``cold_only_cpu_experts`` kt allocates only the
-cold experts, so a logical expert id must be resolved through the
-physical-to-logical map before it indexes these buffers.
+EXPERT IDS ARE BUFFER SLOTS. The ``bb_`` arrays are indexed by the same ids the
+swap window and ``swap_expert_slot`` use; no physical/logical translation
+happens here. ``verify_against_checkpoint`` is where the physical-to-logical
+map matters, because the CHECKPOINT is indexed by logical id.
 """
 
 from __future__ import annotations
@@ -45,12 +56,14 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Index into a (partition, expert) pointer row from expert_buffer_pointers():
-# weight base then scale base for gate/up/down. These point into the PERSISTENT
-# per-expert BufferB objects -- the same ones write_weights_to_buffer and
-# swap_expert_slot use -- not the layer-shared staging arena (exporting that
-# was the F2 segfault).
+# Index into a (partition, expert) row from expert_buffer_pointers() /
+# expert_buffer_arenas(): weight base then scale base for gate/up/down. These
+# point into the PERSISTENT per-expert BufferB objects -- the same ones
+# write_weights_to_buffer and swap_expert_slot use -- not the layer-shared
+# staging arena (exporting that was the F2 segfault).
 _GATE_B, _UP_B, _DOWN_B, _GATE_D, _UP_D, _DOWN_D = range(6)
+
+_WEIGHT_KINDS = (_GATE_B, _UP_B, _DOWN_B)
 
 # Index into the geometry vector.
 _NUMA, _EXPERTS, _HIDDEN, _INTER_PER_NUMA, _GROUP = range(5)
@@ -100,20 +113,63 @@ class KtRamExpertSource:
             )
         # rows are [partition * experts + expert]; ints, wrapped lazily so a
         # source over 896 experts does not build ~5k tensors up front.
-        self._ptrs = [[int(v) for v in row] for row in pointers]
+        self._rows = [[int(v) for v in row] for row in pointers]
         del physical_to_logical  # bb_ arrays are indexed by the ids swap uses
 
         wec = self.per_numa * self.hidden  # elements per expert per partition
         self._w_bytes = wec // 2
         self._s_bytes = (self.hidden // self.group) * self.per_numa
 
+    # -- mode-specific access ------------------------------------------------
+
+    def _absent(self, expert: int) -> bool:
+        """No buffers here (cold-only leaves non-resident experts without)."""
+        return self._rows[expert][_GATE_B] == 0
+
+    def _block(self, part: int, which: int, expert: int) -> torch.Tensor:
+        """One partition's whole block for one expert, as flat uint8."""
+        nbytes = self._w_bytes if which in _WEIGHT_KINDS else self._s_bytes
+        return _wrap(self._rows[part * self.experts + expert][which], nbytes)
+
     # -- per-expert assembly ------------------------------------------------
 
-    def _partition_2d(self, part: int, which: int, expert: int, rows: int, cols: int):
-        """One partition's block for one expert, viewed as ``[rows, cols]``."""
-        row = self._ptrs[part * self.experts + expert]
-        nbytes = self._w_bytes if which in (_GATE_B, _UP_B, _DOWN_B) else self._s_bytes
-        return _wrap(row[which], nbytes).view(rows, cols)
+    def _row_pieces(self, which: int, expert: int, cols: int) -> List[torch.Tensor]:
+        """This rank's rows of a row-blocked matrix, one piece per partition hit.
+
+        Global rows ``[lo, hi)`` of the partition-concatenated matrix; each
+        partition contributes its intersection, in partition order, so
+        concatenating the pieces equals slicing the concatenation.
+        """
+        lo, hi = self.tp_rank * self.per_gpu, (self.tp_rank + 1) * self.per_gpu
+        pieces = []
+        for p in range(self.numa):
+            p0 = p * self.per_numa
+            s, e = max(lo, p0), min(hi, p0 + self.per_numa)
+            if s >= e:
+                continue
+            block = self._block(p, which, expert).view(self.per_numa, cols)
+            pieces.append(block[s - p0 : e - p0])
+        return pieces
+
+    def _col_pieces(
+        self, which: int, expert: int, cols_per_part: int, unit: int
+    ) -> List[torch.Tensor]:
+        """This rank's columns of a column-blocked matrix (the down matrices).
+
+        ``unit`` converts intermediate elements to columns: 2 for the
+        nibble-packed weights, ``group`` for the scales.
+        """
+        lo_c = self.tp_rank * self.per_gpu // unit
+        hi_c = (self.tp_rank + 1) * self.per_gpu // unit
+        pieces = []
+        for p in range(self.numa):
+            p0 = p * cols_per_part
+            s, e = max(lo_c, p0), min(hi_c, p0 + cols_per_part)
+            if s >= e:
+                continue
+            block = self._block(p, which, expert).view(self.hidden, cols_per_part)
+            pieces.append(block[:, s - p0 : e - p0])
+        return pieces
 
     def raw_shard(self, logical_id: int) -> Dict[str, torch.Tensor]:
         """This rank's TP shard of one expert, in checkpoint layout.
@@ -127,7 +183,7 @@ class KtRamExpertSource:
                 f"expert {logical_id} is outside kt's {self.experts} buffer "
                 "slots"
             )
-        if self._ptrs[slot][_GATE_B] == 0:
+        if self._absent(slot):
             raise KeyError(
                 f"expert {logical_id} is not CPU-resident here (null BufferB); "
                 "under cold-only residency only cold experts have buffers"
@@ -136,51 +192,74 @@ class KtRamExpertSource:
         h2 = self.hidden // 2
         hg = self.hidden // self.group
 
-        # gate/up: partitions stack along the intermediate axis.
-        gate = torch.cat(
-            [self._partition_2d(p, _GATE_B, slot, self.per_numa, h2) for p in range(self.numa)],
+        # gate/up: partitions stack along the intermediate axis (rows), and
+        # w13 = [gate rows; up rows], so one concat builds it from the pieces.
+        w13 = torch.cat(
+            self._row_pieces(_GATE_B, slot, h2) + self._row_pieces(_UP_B, slot, h2),
             dim=0,
         )
-        up = torch.cat(
-            [self._partition_2d(p, _UP_B, slot, self.per_numa, h2) for p in range(self.numa)],
-            dim=0,
-        )
-        gate_s = torch.cat(
-            [self._partition_2d(p, _GATE_D, slot, self.per_numa, hg) for p in range(self.numa)],
-            dim=0,
-        )
-        up_s = torch.cat(
-            [self._partition_2d(p, _UP_D, slot, self.per_numa, hg) for p in range(self.numa)],
+        w13_scale = torch.cat(
+            self._row_pieces(_GATE_D, slot, hg) + self._row_pieces(_UP_D, slot, hg),
             dim=0,
         )
         # down: partitions stack along the INTERMEDIATE axis too, but that axis
         # is the columns here, which is what "column-blocked" means.
-        down = torch.cat(
-            [
-                self._partition_2d(p, _DOWN_B, slot, self.hidden, self.per_numa // 2)
-                for p in range(self.numa)
-            ],
+        w2 = torch.cat(
+            self._col_pieces(_DOWN_B, slot, self.per_numa // 2, 2), dim=1
+        ).contiguous()
+        w2_scale = torch.cat(
+            self._col_pieces(_DOWN_D, slot, self.per_numa // self.group, self.group),
             dim=1,
-        )
-        down_s = torch.cat(
-            [
-                self._partition_2d(
-                    p, _DOWN_D, slot, self.hidden, self.per_numa // self.group
-                )
-                for p in range(self.numa)
-            ],
-            dim=1,
-        )
-
-        # Now slice the full expert for this GPU rank, exactly as
-        # build_expert_bytes does from the checkpoint.
-        lo, hi = self.tp_rank * self.per_gpu, (self.tp_rank + 1) * self.per_gpu
+        ).contiguous()
         return {
-            "w13": torch.cat([gate[lo:hi], up[lo:hi]], dim=0).contiguous(),
-            "w13_scale": torch.cat([gate_s[lo:hi], up_s[lo:hi]], dim=0).contiguous(),
-            "w2": down[:, lo // 2 : hi // 2].contiguous(),
-            "w2_scale": down_s[:, lo // self.group : hi // self.group].contiguous(),
+            "w13": w13,
+            "w13_scale": w13_scale,
+            "w2": w2,
+            "w2_scale": w2_scale,
         }
+
+
+class KtArenaExpertSource(KtRamExpertSource):
+    """The offset form: rows index into mapped arenas instead of addresses.
+
+    ``arenas`` are flat uint8 views of the per-partition memfd mappings -- in
+    rank 0 wrapped straight over kt's own mapping, in every other rank over
+    that rank's mmap of the shipped fd. Offsets came from
+    ``expert_buffer_arenas()`` and are valid in ANY mapping of the same fd,
+    which is the entire reason this subclass exists.
+    """
+
+    def __init__(
+        self,
+        *,
+        arenas: Sequence[torch.Tensor],
+        offsets: Sequence[Sequence[int]],
+        geometry: Sequence[int],
+        tp_rank: int,
+        tp_size: int,
+        physical_to_logical: Optional[Sequence[int]] = None,
+    ):
+        super().__init__(
+            pointers=offsets,
+            geometry=geometry,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            physical_to_logical=physical_to_logical,
+        )
+        if len(arenas) != self.numa:
+            raise ValueError(
+                f"expected {self.numa} arenas (one per partition), got "
+                f"{len(arenas)}"
+            )
+        self._arenas = [a.view(torch.uint8).reshape(-1) for a in arenas]
+
+    def _absent(self, expert: int) -> bool:
+        return self._rows[expert][_GATE_B] < 0
+
+    def _block(self, part: int, which: int, expert: int) -> torch.Tensor:
+        nbytes = self._w_bytes if which in _WEIGHT_KINDS else self._s_bytes
+        off = self._rows[part * self.experts + expert][which]
+        return self._arenas[part][off : off + nbytes]
 
 
 def verify_against_checkpoint(
@@ -191,6 +270,7 @@ def verify_against_checkpoint(
     expert_ids: Sequence[int],
     tp_rank: int,
     tp_size: int,
+    physical_to_logical: Optional[Sequence[int]] = None,
 ) -> bool:
     """Bitwise: do kt's buffers reproduce the checkpoint, shard for shard?
 
@@ -198,6 +278,11 @@ def verify_against_checkpoint(
     mapping can be wrong -- partition concat axis, physical vs logical ids, the
     TP slice -- yields right-shaped wrong bytes, so equality is demonstrated
     against ``build_expert_bytes`` rather than argued.
+
+    ``expert_ids`` are buffer SLOTS (physical): they feed ``raw_shard``
+    directly, and the map translates them for the CHECKPOINT side only --
+    kt fills slot ``s`` with checkpoint expert ``map[s]``, so that pairing is
+    the identity being verified.
     """
     from sglang.srt.layers.moe.kt_expert_mover import (
         CheckpointExpertReader,
@@ -215,13 +300,17 @@ def verify_against_checkpoint(
     ok = True
     try:
         for eid in expert_ids:
+            slot = int(eid)
+            logical = (
+                slot if physical_to_logical is None else int(physical_to_logical[slot])
+            )
             want = build_expert_bytes(
-                reader, prefix, int(eid), tp_rank=tp_rank, tp_size=tp_size
+                reader, prefix, logical, tp_rank=tp_rank, tp_size=tp_size
             )
             try:
-                got = source.raw_shard(int(eid))
+                got = source.raw_shard(slot)
             except Exception:
-                logger.exception("[kt-ram] raw_shard(%d) failed", eid)
+                logger.exception("[kt-ram] raw_shard(%d) failed", slot)
                 ok = False
                 continue
             for mine, theirs in pairs:
@@ -229,10 +318,11 @@ def verify_against_checkpoint(
                 b = getattr(want, theirs).reshape(-1).to(torch.uint8)
                 if a.shape != b.shape or not torch.equal(a, b):
                     logger.error(
-                        "[kt-ram] layer %d expert %d %s DIFFERS from the "
-                        "checkpoint (%s vs %s, %s bytes differ)",
+                        "[kt-ram] layer %d slot %d (logical %d) %s DIFFERS "
+                        "from the checkpoint (%s vs %s, %s bytes differ)",
                         layer_idx,
-                        eid,
+                        slot,
+                        logical,
                         mine,
                         tuple(got[mine].shape),
                         tuple(getattr(want, theirs).shape),
@@ -274,4 +364,32 @@ def build_kt_ram_source(method, *, tp_rank: int, tp_size: int):
         tp_rank=tp_rank,
         tp_size=tp_size,
         physical_to_logical=method._kt_physical_to_logical,
+    )
+
+
+def export_kt_arenas(method):
+    """Rank 0: one layer's arena export, or None when not in memfd mode.
+
+    Returns ``(fds, sizes, bases, offsets, geometry)`` exactly as
+    ``expert_buffer_arenas()`` hands them over, with plain-int contents.
+    """
+    wrapper = getattr(method, "wrapper", None)
+    moe = getattr(wrapper, "moe", None) if wrapper is not None else None
+    target = moe if moe is not None else wrapper
+    getter = getattr(target, "expert_buffer_arenas", None)
+    if getter is None:
+        return None
+    try:
+        fds, sizes, bases, offsets, geometry = getter()
+    except Exception:
+        logger.exception("[kt-ram] expert_buffer_arenas() failed")
+        return None
+    if not fds:
+        return None  # KT_BUFFER_B_MEMFD off, or memfd fell back to malloc
+    return (
+        [int(f) for f in fds],
+        [int(s) for s in sizes],
+        [int(b) for b in bases],
+        [[int(v) for v in row] for row in offsets],
+        [int(g) for g in geometry],
     )

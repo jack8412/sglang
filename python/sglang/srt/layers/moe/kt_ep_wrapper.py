@@ -5076,34 +5076,46 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             }
             _register_split_prefill_layer(self, layer)
 
-        # 2. Load CPU weights using KT wrapper
+        # 2. Expert location map, on EVERY rank. Swap-plan ids are kt buffer
+        # SLOTS (physical); the checkpoint is logical; this map is the bridge,
+        # and every rank owns checkpoint reads (promotion fallback), so every
+        # rank needs it -- computed locally from process-global metadata, NOT
+        # shipped over the arena share channel, because the ranks that fall
+        # back to the checkpoint are exactly the ranks that channel failed.
+        from sglang.srt.eplb.expert_location_dispatch import (
+            get_global_expert_location_metadata,
+        )
+
+        metadata = get_global_expert_location_metadata()
+        if (
+            metadata is not None
+            and getattr(metadata, "physical_to_logical_map_cpu", None) is not None
+        ):
+            physical_to_logical_map_cpu = (
+                metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx]
+                .contiguous()
+            )
+        else:
+            # Fallback for setups without EPLB metadata: identity mapping.
+            physical_to_logical_map_cpu = torch.arange(
+                layer.num_experts, dtype=torch.int64, device="cpu"
+            )
+        self._kt_physical_to_logical = physical_to_logical_map_cpu.tolist()
+
+        # 3. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
             torch.cuda.synchronize()
-
-            # Get expert location metadata for CPU expert mapping
-            from sglang.srt.eplb.expert_location_dispatch import (
-                get_global_expert_location_metadata,
-            )
-
-            metadata = get_global_expert_location_metadata()
-            if (
-                metadata is not None
-                and getattr(metadata, "physical_to_logical_map_cpu", None) is not None
-            ):
-                physical_to_logical_map_cpu = (
-                    metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx]
-                    .contiguous()
-                )
-            else:
-                # Fallback for setups without EPLB metadata: identity mapping.
-                physical_to_logical_map_cpu = torch.arange(
-                    layer.num_experts, dtype=torch.int64, device="cpu"
-                )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
-            # For the kt-RAM expert source: buffer indices are PHYSICAL slots,
-            # and this map is what turns a logical id into one.
-            self._kt_physical_to_logical = physical_to_logical_map_cpu.tolist()
             self._maybe_verify_kt_ram_source()
+
+        # 4. KT_BUFFER_B_MEMFD: hand every rank a read-only mapping of this
+        # layer's kt expert buffers (rank 0 exports memfds, peers map them),
+        # so swap-window promotions read kt RAM instead of the checkpoint.
+        # Deliberately OUTSIDE the rank-0 gate -- the share is a rendezvous
+        # every rank participates in, in the same per-layer order.
+        from sglang.srt.layers.moe.kt_arena_share import share_layer_arenas
+
+        share_layer_arenas(method=self)
 
     def _maybe_verify_kt_ram_source(self):
         """SGLANG_KT_VERIFY_RAM_SOURCE=1: prove kt's buffers match the checkpoint.
@@ -5134,14 +5146,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
             return
         n = source.experts
+        # SLOT ids: raw_shard is slot-indexed and verify translates only the
+        # checkpoint side. Pre-mapping the ids here compared raw_shard(p2l[s])
+        # against checkpoint p2l[s] -- wrong on both sides of a non-identity
+        # map, and invisible under the identity maps it was written against.
         ids = sorted({0, n // 3, (2 * n) // 3, n - 1})
-        if self._kt_physical_to_logical is not None:
-            ids = [int(self._kt_physical_to_logical[i]) for i in ids]
         verify_against_checkpoint(
             source,
             weight_path=self.kt_config.weight_path,
             layer_idx=self.kt_config.layer_idx,
             expert_ids=ids,
+            physical_to_logical=self._kt_physical_to_logical,
             tp_rank=self.tp_rank,
             tp_size=get_parallel().tp_size,
         )
@@ -6754,6 +6769,7 @@ def maybe_run_expert_swap_window(
     forward has completed, including the host nodes that enqueue CPU expert
     work, so nothing is mid-flight while weights and masks change.
     """
+    from sglang.srt.layers.moe.kt_arena_share import arena_source_for
     from sglang.srt.layers.moe.kt_expert_swap import (
         ExpertSwapPolicy,
         run_swap_window,
@@ -6828,6 +6844,18 @@ def maybe_run_expert_swap_window(
 
     store = _KT_SPLIT_PREFILL_STATE["store"]
 
+    # Per-layer physical-to-logical maps for _checkpoint_id: _move only has
+    # the layer module in hand, everything else here has an entry.
+    p2l_by_layer = {
+        e["layer_idx"]: e["method"]._kt_physical_to_logical for e in entries
+    }
+
+    # Arena promotion (full-kt + KT_BUFFER_B_MEMFD): promoted bytes come from
+    # this rank's read-only mapping of kt's own buffers instead of the
+    # checkpoint. The batched swizzle plan it feeds is armed lazily here
+    # because without split prefill nothing else builds one.
+    _maybe_arm_arena_swizzle_plan(entries)
+
     # Batched move state, flushed through run_swap_window's finish_layer hook.
     # Flushing lazily on "the layer changed" instead looks equivalent and is
     # not: the next layer's first move runs AFTER this layer's tables have been
@@ -6839,6 +6867,10 @@ def maybe_run_expert_swap_window(
         "layer_idx": None,
         "items": [],
         "prefetched": {},
+        # True while the staged items' "promoted" bytes came from the arena
+        # source (checkpoint layout, no cold-store slot behind them). A batch
+        # is never mixed: arena staging happens only when there is no store.
+        "arena": False,
     }
     gpu_reader = _get_or_create_gpu_reader()
 
@@ -6866,9 +6898,12 @@ def maybe_run_expert_swap_window(
         pend = _pending
         items = pend["items"]
         if not items:
+            pend["arena"] = False
             return
         layer, layer_idx = pend["layer"], pend["layer_idx"]
         pend["items"] = []
+        arena_batch = pend["arena"]
+        pend["arena"] = False
         # Past this point the recorded rows hold PROMOTED experts. Demotions
         # never read them back: _begin_layer took every demoted row for this
         # layer before its first move ran.
@@ -6892,18 +6927,22 @@ def maybe_run_expert_swap_window(
         }
 
         # READ: gather every demoted row, one kernel per weight name, and pull
-        # them down asynchronously into pinned staging.
+        # them down asynchronously into pinned staging. Only a store needs the
+        # demoted bytes back -- an arena batch runs under full kt residency,
+        # where the demoted expert never lost its CPU buffers, so there is
+        # nothing to read and nothing to synchronize before the writes.
         staged = {}
-        for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
-            gathered = _bytes(getattr(layer, name).data).index_select(0, idx)
-            host = torch.empty(
-                gathered.shape, dtype=torch.uint8, device="cpu", pin_memory=True
-            )
-            host.copy_(gathered, non_blocking=True)
-            staged[name] = host
-        # The one sync for the whole layer. Everything above must land before
-        # the writes below overwrite the rows it read.
-        torch.cuda.synchronize()
+        if store is not None:
+            for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
+                gathered = _bytes(getattr(layer, name).data).index_select(0, idx)
+                host = torch.empty(
+                    gathered.shape, dtype=torch.uint8, device="cpu", pin_memory=True
+                )
+                host.copy_(gathered, non_blocking=True)
+                staged[name] = host
+            # The one sync for the whole layer. Everything above must land
+            # before the writes below overwrite the rows it read.
+            torch.cuda.synchronize()
 
         # WRITE: scatter every promoted row back, again one kernel per name.
         promoted = {
@@ -6912,11 +6951,12 @@ def maybe_run_expert_swap_window(
             )
             for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
         }
-        if store is not None and getattr(store, "raw_layout", False):
-            # The store holds checkpoint-layout bytes, so the resident row's
-            # trtllm layout is produced HERE, on the GPU, rather than by asking
-            # the CPU for it. Same four-gather form split prefill uses, just
-            # over this layer's swaps instead of its whole cold set.
+        if arena_batch or (store is not None and getattr(store, "raw_layout", False)):
+            # The source holds checkpoint-layout bytes (raw store or arena
+            # mapping alike), so the resident row's trtllm layout is produced
+            # HERE, on the GPU, rather than by asking the CPU for it. Same
+            # four-gather form split prefill uses, just over this layer's
+            # swaps instead of its whole cold set.
             promoted = _swizzle_promoted_rows(promoted)
         for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
             _bytes(getattr(layer, name).data).index_copy_(
@@ -6927,20 +6967,23 @@ def maybe_run_expert_swap_window(
         # back into the slots the promoted experts vacated. Slices of the
         # pinned staging are already on CPU, so write_row's .to("cpu") is free;
         # they are handed back in the param's own dtype, which write_row checks.
-        if store is not None and getattr(store, "raw_layout", False):
-            # Mirror of the promotion side: the rows gathered off the GPU are
-            # in trtllm layout, and a raw store must not be given those.
-            staged = _unswizzle_demoted_rows(staged, dtypes)
-        for i, it in enumerate(items):
-            store.write_row(
-                layer_idx,
-                it["slot"],
-                {
-                    n: staged[n][i].view(dtypes[n])
-                    for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
-                },
-                logical_id=it["demoted_id"],
-            )
+        # An arena batch has no store: full kt residency means the demoted
+        # expert's bytes never left the CPU, so nothing is written anywhere.
+        if store is not None:
+            if getattr(store, "raw_layout", False):
+                # Mirror of the promotion side: the rows gathered off the GPU
+                # are in trtllm layout, and a raw store must not be given those.
+                staged = _unswizzle_demoted_rows(staged, dtypes)
+            for i, it in enumerate(items):
+                store.write_row(
+                    layer_idx,
+                    it["slot"],
+                    {
+                        n: staged[n][i].view(dtypes[n])
+                        for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+                    },
+                    logical_id=it["demoted_id"],
+                )
 
     def _move(layer, dst_row, logical_id, demoted_id):
         """Record expert ``logical_id`` -> resident row ``dst_row``.
@@ -6953,12 +6996,43 @@ def maybe_run_expert_swap_window(
         layer_idx = layer.layer_id
         slot = None if store is None else store.slot_of(layer_idx, logical_id)
         if slot is None:
+            # Storeless promotion, preferred source first: this rank's mapping
+            # of kt's resident buffers -- a ~2.2 MB RAM read instead of a
+            # checkpoint read. Requires the swizzle plan (checkpoint layout
+            # cannot land in a resident row without it). Kept out of any batch
+            # with store-backed items by construction: this branch only runs
+            # when there is no store at all.
+            if store is None and _KT_SPLIT_PREFILL_STATE.get("swizzle_plan") is not None:
+                src = arena_source_for(layer_idx)
+                if src is not None:
+                    t0 = time.perf_counter()
+                    staged_row = _arena_stage_row(src, logical_id)
+                    _timing["read_s"] += time.perf_counter() - t0
+                    if staged_row is not None:
+                        if _pending["layer_idx"] != layer_idx:
+                            _flush_moves()
+                            _pending["layer"] = layer
+                            _pending["layer_idx"] = layer_idx
+                        _pending["items"].append(
+                            {
+                                "dst_row": dst_row,
+                                "slot": None,
+                                "demoted_id": demoted_id,
+                                "promoted": staged_row,
+                            }
+                        )
+                        _pending["arena"] = True
+                        return
             # No store, or the expert left the cold set (a re-promotion inside
             # one window). The checkpoint path writes the GPU row immediately,
             # so drain anything staged for this layer first -- otherwise a
             # queued scatter could land on top of it.
             _flush_moves()
-            mover.move(layer, dst_row, logical_id)
+            mover.move(
+                layer,
+                dst_row,
+                _checkpoint_id(p2l_by_layer.get(layer_idx), logical_id),
+            )
             return
 
         if _pending["layer_idx"] != layer_idx:
@@ -7003,7 +7077,10 @@ def maybe_run_expert_swap_window(
             return
         eid = resident[len(resident) // 2]
         try:
-            tensors = mover.read_full_expert(entry["layer"], eid)
+            # Checkpoint read translated; the kt-side slot id stays physical.
+            tensors = mover.read_full_expert(
+                entry["layer"], _checkpoint_id(method._kt_physical_to_logical, eid)
+            )
             ok = method.wrapper.verify_install_against_loaded(
                 eid, *[t.data_ptr() for t in tensors]
             )
@@ -7120,13 +7197,19 @@ def maybe_run_expert_swap_window(
         #    data: either the whole layer was prefetched on every rank or none.
         got = _pending["prefetched"].get(demote_id)
         if got is None:
-            return mover.read_full_expert(entry["layer"], demote_id)
+            return mover.read_full_expert(
+                entry["layer"],
+                _checkpoint_id(entry["method"]._kt_physical_to_logical, demote_id),
+            )
 
         if not _KT_SWAP_STATE.get("gpu_readback_verified"):
             # Every rank reaches this on the same demotion, so the consensus
             # below is symmetric.
             _KT_SWAP_STATE["gpu_readback_verified"] = True
-            want = mover.read_full_expert(entry["layer"], demote_id)
+            want = mover.read_full_expert(
+                entry["layer"],
+                _checkpoint_id(entry["method"]._kt_physical_to_logical, demote_id),
+            )
             bad = [
                 i
                 for i, (a, b) in enumerate(zip(got, want))
@@ -7628,7 +7711,14 @@ def _start_demotion_prefetch(anchor, entries):
         except Exception:
             continue
         for s in swaps:
-            plan.append((entry["layer"], entry["layer_idx"], s.demote))
+            plan.append(
+                (
+                    entry["layer"],
+                    entry["layer_idx"],
+                    entry["method"]._kt_physical_to_logical,
+                    s.demote,
+                )
+            )
     if not plan:
         return
 
@@ -7639,10 +7729,12 @@ def _start_demotion_prefetch(anchor, entries):
     def _work():
         t0 = time.perf_counter()
         try:
-            for layer, layer_idx, demote_id in plan:
+            for layer, layer_idx, p2l, demote_id in plan:
                 try:
+                    # Cache key stays the PLAN id (that is what the window
+                    # looks up); only the checkpoint read arg translates.
                     data[(layer_idx, demote_id)] = mover.read_full_expert(
-                        layer, demote_id
+                        layer, _checkpoint_id(p2l, demote_id)
                     )
                 except Exception:
                     pass  # a miss just costs a synchronous read later
@@ -7655,6 +7747,86 @@ def _start_demotion_prefetch(anchor, entries):
     ).start()
     logger.info(
         "[kt-swap] prefetching %d demoted experts off the critical path", len(plan)
+    )
+
+
+def _checkpoint_id(p2l, plan_id):
+    """Swap-plan ids are kt buffer SLOTS (physical); the checkpoint is logical.
+
+    Every checkpoint read keyed by a plan id goes through this, so the arena
+    source (slot-indexed by construction) and the checkpoint fallback name the
+    SAME expert for one plan id. Identity map -> no-op, which is why the gap
+    was invisible until now; a frequency-placement seed makes it real.
+    """
+    return int(plan_id) if p2l is None else int(p2l[plan_id])
+
+
+def _arena_stage_row(source, expert_id):
+    """One promoted expert's checkpoint-layout shard, keyed for _flush_moves.
+
+    The keys are the resident param names because that is how _flush_moves
+    stacks a batch; the VALUES are raw_shard's checkpoint-layout tensors, the
+    exact shapes apply_batched_swizzle takes. Returns None on failure so the
+    caller can fall back to the checkpoint path for this expert alone.
+    """
+    try:
+        shard = source.raw_shard(expert_id)
+    except Exception:
+        logger.exception(
+            "[kt-arena] raw_shard(%d) failed; this promotion falls back to "
+            "the checkpoint",
+            expert_id,
+        )
+        return None
+    names = _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+    return {
+        names[0]: shard["w13"],
+        names[1]: shard["w13_scale"],
+        names[2]: shard["w2"],
+        names[3]: shard["w2_scale"],
+    }
+
+
+def _maybe_arm_arena_swizzle_plan(entries):
+    """Build the batched swizzle plan when arena promotion will need it.
+
+    Split prefill arms _KT_SPLIT_PREFILL_STATE at store-build time; the
+    full-kt config has no store, so the first acting window pays for the plan
+    here instead -- one 2.2 MB checkpoint read, shape-derived, serves every
+    layer for the process lifetime. Purely local: no collective, and a failure
+    only means promotions keep the checkpoint path.
+    """
+    from sglang.srt.layers.moe.kt_arena_share import arena_source_for
+
+    if _KT_SPLIT_PREFILL_STATE.get("swizzle_plan") is not None:
+        return
+    if _KT_SPLIT_PREFILL_STATE.get("arena_swizzle_failed"):
+        return
+    if not any(
+        arena_source_for(e["layer_idx"]) is not None for e in entries
+    ):
+        return
+    anchor = entries[0]["method"]
+    device = anchor.gpu_experts_mask_cuda.device
+    raw_shapes, plan = _build_dynamic_swizzle_plan(anchor, device)
+    if plan is None or raw_shapes is None:
+        _KT_SPLIT_PREFILL_STATE["arena_swizzle_failed"] = True
+        logger.error(
+            "[kt-arena] could not build a swizzle plan; promotions keep the "
+            "checkpoint path"
+        )
+        return
+    _KT_SPLIT_PREFILL_STATE["swizzle_plan"] = plan
+    _KT_SPLIT_PREFILL_STATE["swizzle_inverse"] = None
+    _KT_SPLIT_PREFILL_STATE["raw_scale_shapes"] = (
+        tuple(raw_shapes["w13_weight_scale"][0]),
+        tuple(raw_shapes["w2_weight_scale"][0]),
+    )
+    from sglang.srt.layers.moe.kt_arena_share import arena_sources_summary
+
+    logger.info(
+        "[kt-arena] promotion from kt RAM armed on this rank (%s)",
+        arena_sources_summary(),
     )
 
 
