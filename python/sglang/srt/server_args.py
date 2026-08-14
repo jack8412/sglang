@@ -3020,7 +3020,7 @@ class ServerArgs:
     ] = False
     kt_expert_swap_interval: A[
         int,
-        "Run an expert-swap window every N eager forwards (0 disables). At the window the pipeline is briefly quiesced, high-demand offloaded experts are promoted into the GPU rows of low-use resident experts, and both sides of each pair are re-sourced from the checkpoint. Requires --kt-routing-margin.",
+        "Run an expert-swap window every N/10 prefill->decode transitions (0 disables). At the window the pipeline is briefly quiesced, high-demand offloaded experts are promoted into the GPU rows of low-use resident experts, and both sides of each pair are re-sourced from the checkpoint. Counted in transitions rather than seconds because every TP rank must reach the same decision -- a wall-clock gate lets ranks straddling the threshold disagree and diverge their expert membership. Does NOT require --kt-routing-margin: the demand it acts on is a function of the routed ids and the residency mask alone (SPEC-SWAP-DEMAND).",
         NS("exec.moe"),
     ] = 0
     kt_expert_swap_max: A[

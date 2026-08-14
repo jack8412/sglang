@@ -6600,17 +6600,22 @@ def _kt_swap_tables(method) -> "object":
 # Phase-3 boundary state (SPEC-SWAP-DEMAND). Module-level for the same reason
 # _KT_SWAP_STATE is: the driver is a free function over the registered wrappers,
 # not a method on any one of them.
-# Minimum wall-clock seconds between boundary windows. Sized from the swap
-# cost model in SPEC-SWAP-DEMAND: one unit of --kt-expert-swap-max moves
-# 92 layers x 4.39 MB = 403.6 MB/rank, ~14.5 ms at the measured 27.9 GB/s.
-# At the default budget that is ~58 ms, so a 30 s floor holds the window
-# under ~0.2% of serving time even before the budget is raised.
-_KT_SWAP_MIN_SECONDS = 30.0
+# Act on one boundary in every interval/_KT_BOUNDARY_DIVISOR.
+#
+# MUST BE DETERMINISTIC ACROSS TP RANKS. Every rank runs its own scheduler
+# process and calls this independently, and all ranks hold the same resident
+# expert SET (TP shards the hidden dim, not the expert index), so they must
+# reach the SAME swap decision or membership diverges and each rank computes a
+# different model -- silently. A wall-clock rate limit does exactly that: two
+# ranks straddling the threshold disagree. A counter over prefill->decode
+# transitions cannot, because every rank sees the same batches in the same
+# order. This is why the original gate counted eager forwards rather than
+# seconds, and the reason survives the move to the scheduler.
+_KT_BOUNDARY_DIVISOR = 10
 
 _KT_BOUNDARY_STATE = {
     "last_was_extend": False,
-    "last_swap_ts": 0.0,
-    "observed": False,
+    "transitions": 0,
 }
 
 
@@ -6649,17 +6654,14 @@ def maybe_run_expert_swap_at_decode_boundary(is_decode: bool, is_extend: bool) -
     if not crossed:
         return
 
-    now = time.monotonic()
-    if now - _KT_BOUNDARY_STATE["last_swap_ts"] < _KT_SWAP_MIN_SECONDS:
-        return
-    _KT_BOUNDARY_STATE["last_swap_ts"] = now
-
-    first = not _KT_BOUNDARY_STATE["observed"]
-    _KT_BOUNDARY_STATE["observed"] = True
+    _KT_BOUNDARY_STATE["transitions"] += 1
+    n = _KT_BOUNDARY_STATE["transitions"]
+    every = max(1, cfg.expert_swap_interval // _KT_BOUNDARY_DIVISOR)
+    # Observe on every transition, act on every `every`-th, and never on the
+    # first: a cumulative counter's first delta is the whole launch history,
+    # so acting on it is acting on a baseline.
     try:
-        # First transition observes only: the EMA needs history before a
-        # decision rests on it.
-        maybe_run_expert_swap_window(anchor, force=True, act=not first)
+        maybe_run_expert_swap_window(anchor, force=True, act=(n > 1 and n % every == 0))
     except Exception:
         logger.exception("[kt-swap] boundary window failed; serving continues")
 
