@@ -1374,6 +1374,16 @@ class Envs:
     # the loader produced. Read-only; the gate the mover must pass before it
     # is trusted to rewrite resident weights.
     SGLANG_KT_VERIFY_EXPERT_MOVER = EnvBool(False)
+    # Install a demoted expert's CPU weights from its GPU row (unswizzle + a TP
+    # all-gather) instead of re-reading the checkpoint, which costs ~12.9 GB per
+    # swap window. The layout inverse is proved bitwise
+    # (runs/meta/verify_unswizzle.py) and re-checked against the checkpoint on
+    # the first demotion, but the all-gather is the problem: the install path
+    # has data-dependent early-outs, so ranks can disagree on how many
+    # collectives to run and the window deadlocks (observed: NCCL
+    # _ALLGATHER_BASE timing out after 600 s, watchdog killing the group).
+    # OFF until the collective count is made a pure function of the swap plan.
+    SGLANG_KT_SWAP_GPU_READBACK = EnvBool(False)
     # Per-forward slot-accounting check for split-slice full-expert prefill:
     # assert the resident and cold expert slices claim every routed slot
     # exactly once. Costs a device sync per layer, so it is a debug gate, not

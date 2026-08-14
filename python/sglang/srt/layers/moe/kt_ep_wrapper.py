@@ -7336,7 +7336,19 @@ def finalize_split_prefill(server_args) -> bool:
 
 
 def _get_or_create_gpu_reader():
-    """Process-wide reader for demoted experts; None if it cannot be built."""
+    """Process-wide reader for demoted experts; None if disabled or unbuildable.
+
+    Off by default. The read-back itself is proved bitwise, but it reaches the
+    full expert through a TP all-gather, and the install path it lives in has
+    data-dependent early-outs (no cold-store slot, a row already written, a
+    disabled route). Ranks that disagree on how many collectives to run
+    deadlock the window rather than falling back -- observed as an
+    _ALLGATHER_BASE timing out after 600 s with the NCCL watchdog killing the
+    process group. Re-enable once the collective count is a pure function of
+    the per-layer swap plan rather than of those early-outs.
+    """
+    if not envs.SGLANG_KT_SWAP_GPU_READBACK.get():
+        return None
     reader = _KT_SWAP_STATE.get("gpu_reader")
     if reader is None:
         try:
