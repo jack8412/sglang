@@ -1,4 +1,4 @@
-# Build context for docker/k3_hybrid/k3_hybrid.Dockerfile.
+# Build context for docker/k3-split-prefill/k3-split-prefill.Dockerfile.
 #
 # BuildKit reads <dockerfile-path>.dockerignore in preference to the context
 # root's .dockerignore, so this file governs THIS build only and leaves the

@@ -1,4 +1,4 @@
-# k3-hybrid serving image -- Kimi-K3 on 8xB200 with kt-kernel CPU experts.
+# k3-split-prefill serving image -- Kimi-K3 on 8xB200 with kt-kernel CPU experts.
 #
 # Built from THIS repo's working tree (the branch you are on), not a clone of
 # upstream. That is the difference from docker/kimi_k3/kimi_k3_cu13.Dockerfile,
@@ -12,18 +12,16 @@
 # own torch dependency (see BUILD TRAP 1).
 #
 #   BR=$(git branch --show-current | tr '/' '-')
-#   DOCKER_BUILDKIT=1 docker build -f docker/k3_hybrid/k3_hybrid.Dockerfile \
+#   DOCKER_BUILDKIT=1 docker build -f docker/k3-split-prefill/k3-split-prefill.Dockerfile \
 #     -t "k3:${BR}" \
 #     --build-arg SGLANG_BUILD_COMMIT=$(git rev-parse HEAD) \
 #     --build-arg SGLANG_BUILD_BRANCH="${BR}" .
 #
-# Tag from the BRANCH, not a fixed name: this tree moves between work branches
-# (k3-hybrid -> k3-wip -> k3-split-prefill), and an image whose tag does not
-# say which branch produced it cannot be told apart from the last one on a
-# host that holds several. The directory and filename stay fixed on purpose --
-# they name the image VARIANT (hybrid CPU/GPU expert serving), which outlives
-# any one branch. `tr '/' '-'` because a slash in a branch name is legal in git
-# and not in a docker tag.
+# Tag from the BRANCH: this tree moves between work branches, and an image whose
+# tag does not say which branch produced it cannot be told apart from the last
+# one on a host that holds several. The directory and filename carry the branch
+# name for the same reason. `tr '/' '-'` because a slash in a branch name is
+# legal in git and not in a docker tag.
 #
 # Run it (weights and results stay on the host; they outlive the image):
 #
@@ -383,6 +381,34 @@ RUN mkdir -p /opt/trtllm_gen_moe_cubin_pool \
     && test "$(find /opt/trtllm_gen_moe_cubin_pool/${POOL_VER} -type f -name '*.cubin' | wc -l)" -eq 1696 \
     && echo "cubin pool OK (1696 cubins)"
 
+# Declare the pool location in the IMAGE, not just in whatever launches it.
+# With --moe-runner-backend flashinfer_mxfp4 on Blackwell, K3's override
+# provider RAISES at config time when this is unset -- the pool being present
+# on disk is not enough. k3ops/launch.sh exports it by probing /opt and
+# /workspace, so a launch.sh-driven run works; anything invoking the server
+# directly (docker compose, a bare `sglang serve`) does not, and fails before
+# loading a single weight. Setting it here makes the image correct either way,
+# and launch.sh's own export simply overrides it with the same value.
+# Points at the VERSIONED subdirectory -- the parent is not a valid pool.
+ENV SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL="/opt/trtllm_gen_moe_cubin_pool/${POOL_VER}"
+
+# --- 6b. mooncake transfer engine (hierarchical/radix KV cache backend) -----
+# Needed by --hicache-storage-backend mooncake. The base image HAS this in its
+# system dist-packages, but the venv is deliberately isolated from those (the
+# same isolation that keeps the base's sglang 0.5.16 out), so it must be
+# installed into the venv explicitly or the server dies at
+# init_shared_mooncake_transfer_engine with a bare ImportError.
+# Version is pinned to the base image's (0.3.11.post1) because the
+# mooncake-master / mooncake-store containers alongside this one run that same
+# image -- client and store must agree on the wire protocol.
+ARG MOONCAKE_VERSION=0.3.11.post1
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    . ${VENV}/bin/activate \
+    && uv pip install "mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}" \
+    && cd / \
+    && python -c "import torch; assert torch.__version__.startswith('${TORCH_PIN}'), 'mooncake moved torch: '+torch.__version__" \
+    && python -c "import mooncake,os; print('mooncake from:', os.path.dirname(mooncake.__file__))"
+
 # --- 7. results tree + final gate ------------------------------------------
 # Same five directories as the node, so the documented rsync mirrors a
 # container run exactly as it mirrors a bare-node run.
@@ -412,7 +438,9 @@ RUN mkdir -p ${WS}/runs/status ${WS}/runs/probes ${WS}/runs/logs ${WS}/runs/meta
     && export LD_LIBRARY_PATH=/tmp/cudastub${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}} \
     && python -c "import sglang,os;assert sglang.__file__ is not None,'sglang imported as a NAMESPACE package -- a repo dir on sys.path shadowed the install (wrong cwd)';p=os.path.dirname(sglang.__file__);assert p.startswith('${WS}/sglang/python/'),'sglang resolved to '+p+' -- the base image 0.5.16 leaked into the venv';print('sglang from  :',p)" \
     && python -c "import kt_kernel,os;print('kt_kernel from:',os.path.dirname(kt_kernel.__file__))" \
-    && python -c "import torch, flashinfer, sgl_kernel, kt_kernel, sglang; print('ENV-OK', torch.__version__, flashinfer.__version__, sglang.__version__)" \
+    && python -c "import torch, flashinfer, sgl_kernel, kt_kernel, sglang, mooncake; print('ENV-OK', torch.__version__, flashinfer.__version__, sglang.__version__)" \
+    && test -d "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" \
+       || { echo "FATAL: SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL points at a missing dir" >&2; exit 5; } \
     && rm -rf /tmp/cudastub /root/.cargo/registry
 
 # Put the venv first so an interactive shell gets the right python without
@@ -450,5 +478,19 @@ LABEL ai.sglang.k3.sglang_commit="${SGLANG_BUILD_COMMIT}" \
       ai.sglang.k3.kt_commit="${KT_COMMIT}" \
       ai.sglang.k3.kt_cpu_variant="${KT_CPU_VARIANT}" \
       ai.sglang.k3.torch_pin="${TORCH_PIN}"
+
+# Override the OCI labels INHERITED from the base image. Left alone, this image
+# reports org.opencontainers.image.source=sgl-project/sglang and .revision=
+# <some upstream CI sha> -- i.e. `docker inspect` attributes it to a commit that
+# is not in it, which is exactly the provenance error the ai.sglang.k3.* labels
+# exist to prevent. Whoever reads the generic labels must get the same answer as
+# whoever reads the specific ones.
+LABEL org.opencontainers.image.title="k3-split-prefill" \
+      org.opencontainers.image.description="Kimi-K3 on 8xB200 with kt-kernel CPU experts, built from the k3 working branch" \
+      org.opencontainers.image.source="https://github.com/jack8412/sglang" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_BUILD_BRANCH}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      org.opencontainers.image.url=""
 
 CMD ["/bin/bash"]
