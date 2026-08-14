@@ -6972,13 +6972,24 @@ def maybe_run_expert_swap_window(
         """
         _pending["prefetched"] = {}
         method = entry.get("method")
-        if (
-            gpu_reader is None
-            or _KT_SWAP_STATE.get("gpu_readback_off")
-            or method is None
-            or not method.kt_config.cold_only_cpu_experts
-            or method.wrapper is None
-        ):
+        want = (
+            gpu_reader is not None
+            and not _KT_SWAP_STATE.get("gpu_readback_off")
+            and method is not None
+            and method.kt_config.cold_only_cpu_experts
+        )
+        # NOT part of `want`: whether THIS rank has a kt wrapper to install
+        # into. Only some ranks do, and gating the gather on it is what
+        # deadlocked M9 and M11 -- rank 0 entered the collective alone and the
+        # other seven, having nothing to install, never called it and sailed on
+        # through all 92 layers. A rank that will not consume the result still
+        # has to contribute its shard.
+        #
+        # Agreed across ranks rather than assumed: this all_reduce runs on every
+        # layer whether or not the gather does, so it is symmetric by
+        # construction, and any residual disagreement degrades to "no rank uses
+        # the GPU route here" instead of hanging.
+        if not _all_tp_ranks_succeeded(want):
             return
         # Not wrapped: absorbing here on one rank would drop it out of the
         # collectives the others are running, which is the failure this hook
