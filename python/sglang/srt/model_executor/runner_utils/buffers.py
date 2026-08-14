@@ -69,6 +69,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
+    kt_routing_margin: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
     custom_mask: torch.Tensor
@@ -114,6 +115,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
+            # Per-request --kt-routing-margin overrides, one per token.
+            # Initialised to the -1.0 sentinel, not 0.0: zero is a
+            # MEANINGFUL margin (count-only -- record what would override,
+            # route exactly), so a never-written lane must stay
+            # distinguishable from a request that asked for zero.
+            kt_routing_margin = torch.full(
+                (max_num_token,), -1.0, dtype=torch.float32
+            )
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             custom_mask = torch.ones(
@@ -204,6 +213,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
             positions=positions,
+            kt_routing_margin=kt_routing_margin,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
             custom_mask=custom_mask,
