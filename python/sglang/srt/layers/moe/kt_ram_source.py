@@ -45,8 +45,12 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Index into the per-partition pointer row returned by expert_buffer_pointers().
-_GATE, _UP, _DOWN, _GATE_S, _UP_S, _DOWN_S = range(6)
+# Index into a (partition, expert) pointer row from expert_buffer_pointers():
+# weight base then scale base for gate/up/down. These point into the PERSISTENT
+# per-expert BufferB objects -- the same ones write_weights_to_buffer and
+# swap_expert_slot use -- not the layer-shared staging arena (exporting that
+# was the F2 segfault).
+_GATE_B, _UP_B, _DOWN_B, _GATE_D, _UP_D, _DOWN_D = range(6)
 
 # Index into the geometry vector.
 _NUMA, _EXPERTS, _HIDDEN, _INTER_PER_NUMA, _GROUP = range(5)
@@ -89,49 +93,27 @@ class KtRamExpertSource:
             )
         self.per_gpu = self.intermediate // self.tp_size
 
-        # Which map-values kt actually wrote. kt's loader indexes its buffer
-        # by the MAPPED value, not the loop slot:
-        #     expert_id = expert_map(map, slot)
-        #     dst = buf + expert_id * stride        (fp4-moe.hpp load_weights)
-        # so the expert whose map-value is V sits at offset V, and reading is
-        # buf[V] directly -- no inversion. The map is kept only to check
-        # membership: an id kt never wrote reads zeros, not an error. (An
-        # earlier version inverted the map here; under an identity map the two
-        # are indistinguishable, which is why the bitwise gate alone could not
-        # have caught it.)
-        self._present = (
-            {int(v) for v in physical_to_logical}
-            if physical_to_logical is not None
-            else None
-        )
+        if len(pointers) != self.numa * self.experts:
+            raise ValueError(
+                f"expected {self.numa} x {self.experts} pointer rows, got "
+                f"{len(pointers)}"
+            )
+        # rows are [partition * experts + expert]; ints, wrapped lazily so a
+        # source over 896 experts does not build ~5k tensors up front.
+        self._ptrs = [[int(v) for v in row] for row in pointers]
+        del physical_to_logical  # bb_ arrays are indexed by the ids swap uses
 
         wec = self.per_numa * self.hidden  # elements per expert per partition
-        sec = (self.hidden // self.group) * self.per_numa
         self._w_bytes = wec // 2
-        self._s_bytes = sec
-
-        # Whole-buffer uint8 views, one per partition per tensor. Wrapping is
-        # free: these alias kt's memory rather than copying it.
-        self._views: List[Dict[int, torch.Tensor]] = []
-        for row in pointers:
-            self._views.append(
-                {
-                    k: _wrap(int(row[k]), self.experts * self._w_bytes)
-                    for k in (_GATE, _UP, _DOWN)
-                }
-                | {
-                    k: _wrap(int(row[k]), self.experts * self._s_bytes)
-                    for k in (_GATE_S, _UP_S, _DOWN_S)
-                }
-            )
+        self._s_bytes = (self.hidden // self.group) * self.per_numa
 
     # -- per-expert assembly ------------------------------------------------
 
-    def _partition_2d(self, part: int, which: int, slot: int, rows: int, cols: int):
+    def _partition_2d(self, part: int, which: int, expert: int, rows: int, cols: int):
         """One partition's block for one expert, viewed as ``[rows, cols]``."""
-        per = self._w_bytes if which in (_GATE, _UP, _DOWN) else self._s_bytes
-        flat = self._views[part][which]
-        return flat[slot * per : (slot + 1) * per].view(rows, cols)
+        row = self._ptrs[part * self.experts + expert]
+        nbytes = self._w_bytes if which in (_GATE_B, _UP_B, _DOWN_B) else self._s_bytes
+        return _wrap(row[which], nbytes).view(rows, cols)
 
     def raw_shard(self, logical_id: int) -> Dict[str, torch.Tensor]:
         """This rank's TP shard of one expert, in checkpoint layout.
@@ -140,16 +122,15 @@ class KtRamExpertSource:
         ``build_expert_bytes`` produces, so the GPU-side swizzle is unchanged.
         """
         slot = int(logical_id)
-        if self._present is not None and slot not in self._present:
-            raise KeyError(
-                f"expert {logical_id} was never loaded into kt's buffers "
-                "(not in the physical-to-logical map); reading it would "
-                "return zeros, not weights"
-            )
         if not 0 <= slot < self.experts:
             raise KeyError(
                 f"expert {logical_id} is outside kt's {self.experts} buffer "
                 "slots"
+            )
+        if self._ptrs[slot][_GATE_B] == 0:
+            raise KeyError(
+                f"expert {logical_id} is not CPU-resident here (null BufferB); "
+                "under cold-only residency only cold experts have buffers"
             )
 
         h2 = self.hidden // 2
@@ -157,26 +138,26 @@ class KtRamExpertSource:
 
         # gate/up: partitions stack along the intermediate axis.
         gate = torch.cat(
-            [self._partition_2d(p, _GATE, slot, self.per_numa, h2) for p in range(self.numa)],
+            [self._partition_2d(p, _GATE_B, slot, self.per_numa, h2) for p in range(self.numa)],
             dim=0,
         )
         up = torch.cat(
-            [self._partition_2d(p, _UP, slot, self.per_numa, h2) for p in range(self.numa)],
+            [self._partition_2d(p, _UP_B, slot, self.per_numa, h2) for p in range(self.numa)],
             dim=0,
         )
         gate_s = torch.cat(
-            [self._partition_2d(p, _GATE_S, slot, self.per_numa, hg) for p in range(self.numa)],
+            [self._partition_2d(p, _GATE_D, slot, self.per_numa, hg) for p in range(self.numa)],
             dim=0,
         )
         up_s = torch.cat(
-            [self._partition_2d(p, _UP_S, slot, self.per_numa, hg) for p in range(self.numa)],
+            [self._partition_2d(p, _UP_D, slot, self.per_numa, hg) for p in range(self.numa)],
             dim=0,
         )
         # down: partitions stack along the INTERMEDIATE axis too, but that axis
         # is the columns here, which is what "column-blocked" means.
         down = torch.cat(
             [
-                self._partition_2d(p, _DOWN, slot, self.hidden, self.per_numa // 2)
+                self._partition_2d(p, _DOWN_B, slot, self.hidden, self.per_numa // 2)
                 for p in range(self.numa)
             ],
             dim=1,
@@ -184,7 +165,7 @@ class KtRamExpertSource:
         down_s = torch.cat(
             [
                 self._partition_2d(
-                    p, _DOWN_S, slot, self.hidden, self.per_numa // self.group
+                    p, _DOWN_D, slot, self.hidden, self.per_numa // self.group
                 )
                 for p in range(self.numa)
             ],
