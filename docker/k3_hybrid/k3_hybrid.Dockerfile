@@ -138,6 +138,19 @@
 #    bit-identical to the node's own build -- they are the portable
 #    equivalent, and they cross-build correctly from a host with no AVX512/AMX
 #    of its own (the compiler emits instructions it need not execute).
+#
+# 4. NOTHING THAT LINKS libcuda.so.1 CAN BE IMPORTED DURING A BUILD. That is
+#    the NVIDIA *driver* library; the container runtime injects it at
+#    `docker run --gpus`, and `docker build` has no --gpus, so `import
+#    sgl_kernel` fails with "libcuda.so.1: cannot open shared object file"
+#    even when the install is perfectly good. Every build-time import check
+#    below therefore runs with /usr/local/cuda/lib64/stubs/libcuda.so linked
+#    under the driver's SONAME into a temp dir on LD_LIBRARY_PATH, and that
+#    temp dir is deleted IN THE SAME RUN -- a stub left in the image would
+#    shadow the real driver at serve time and every CUDA call would fail.
+#    Consequence for reading build logs: these checks prove the extensions
+#    LOAD, not that they can talk to a GPU. Only a `docker run --gpus` can
+#    show that; see the post-build verification in the run instructions.
 
 # Default to an image already cached on the build host. Override for a lean,
 # self-contained build on a host that has neither:
@@ -150,8 +163,17 @@ FROM ${BASE_IMAGE}
 ARG KT_REPO=https://github.com/jack8412/ktransformers.git
 ARG KT_REF=feat/mxfp4-kimi-k3
 # Pinned so a rebuild is reproducible; pass KT_COMMIT= (empty) to track the
-# branch tip instead. This is the sha recorded in CLAUDE.md as the wheel source.
-ARG KT_COMMIT=ab677cb43c9c2998694dc8d5e18fb6c34231b7b8
+# branch tip instead.
+#
+# This is the sha the NODE actually runs (k3.sh doctor, 2026-08-14:
+# "kt efb25f1 staging: let the host-node path dispatch from the packed buffer").
+# It is deliberately NOT the sha in CLAUDE.md's Pins section
+# (ab677cb43c9c2998694dc8d5e18fb6c34231b7b8) -- that records the Session-1
+# wheel and PREDATES packed staging: `submit_forward_packed` does not appear
+# anywhere in it. Building against it produces a kt_kernel that installs and
+# imports cleanly and then cannot serve this branch's doorbell transport.
+# The packed-staging assert in step 5 is what caught it; leave that assert in.
+ARG KT_COMMIT=efb25f1bf4ffef3461a963e23dfb69c09e4987ba
 ARG KT_CPU_VARIANT=all
 ARG KT_CUDA_ARCHS=
 ARG TORCH_PIN=2.13.0
@@ -254,7 +276,20 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
        else \
          echo "SKIPPING flashinfer-jit-cache (-1.48 GB); kernels will JIT-compile on first launch"; \
        fi \
-    && python -c "import torch, flashinfer, sgl_kernel; print('STEP2 sgl_kernel+flashinfer OK', flashinfer.__version__)"
+    # BUILD TRAP 4: sgl_kernel links libcuda.so.1 -- the DRIVER library, which
+    # the nvidia container runtime injects at `docker run --gpus` and which
+    # therefore does not exist during `docker build` (there is no --gpus for
+    # builds). Importing it here fails with
+    #   ImportError: libcuda.so.1: cannot open shared object file
+    # even though the install is perfectly good. The CUDA image ships a link
+    # stub for exactly this case; point the loader at it under the driver's
+    # SONAME just long enough to prove the extension loads, then delete it IN
+    # THE SAME LAYER so it can never shadow the real driver at run time.
+    && mkdir -p /tmp/cudastub \
+    && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cudastub/libcuda.so.1 \
+    && LD_LIBRARY_PATH=/tmp/cudastub${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}} \
+       python -c "import torch, flashinfer, sgl_kernel; print('STEP2 sgl_kernel+flashinfer OK', flashinfer.__version__)" \
+    && rm -rf /tmp/cudastub
 
 # --- 4. ktransformers checkout (trap 2: submodules) ------------------------
 # --depth is deliberately absent on the submodule update: kt pins submodule
@@ -307,6 +342,11 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     && cd ${WS}/ktransformers/kt-kernel \
     # Trap 1: --no-deps --no-build-isolation is not optional.
     && pip install . --no-deps --no-build-isolation \
+    # Driver stub for the build-time import checks below -- see BUILD TRAP 4.
+    # Removed in this same RUN so it never reaches the final image.
+    && mkdir -p /tmp/cudastub \
+    && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cudastub/libcuda.so.1 \
+    && export LD_LIBRARY_PATH=/tmp/cudastub${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}} \
     # ...and prove it did not happen anyway.
     && python -c "import torch; assert torch.__version__.startswith('${TORCH_PIN}'), 'kt downgraded torch: '+torch.__version__; print('torch still', torch.__version__)" \
     # packed-staging is the API this branch's doorbell transport needs, and the
@@ -323,7 +363,8 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
          find "$(python -c 'import kt_kernel,os;print(os.path.dirname(kt_kernel.__file__))')" \
                -name '_kt_kernel_ext_*.so' -printf '  %f\n'; \
          [ "$n" -eq 6 ] || { echo "FATAL: expected 6 ISA variants, got $n" >&2; exit 3; }; \
-       fi
+       fi \
+    && rm -rf /tmp/cudastub
 
 # --- 6. trtllm-gen MoE cubin pool ------------------------------------------
 # NOT optional for this config: with --moe-runner-backend flashinfer_mxfp4 on
@@ -356,10 +397,23 @@ RUN mkdir -p ${WS}/runs/status ${WS}/runs/probes ${WS}/runs/logs ${WS}/runs/meta
     # every measurement would be attributed to the wrong code.
     && grep -q '^include-system-site-packages *= *false' ${VENV}/pyvenv.cfg \
        || { echo "FATAL: venv sees system site-packages -- base sglang can leak" >&2; exit 4; } \
-    && python -c "import sglang,os;p=os.path.dirname(sglang.__file__);assert p.startswith('${WS}/sglang/python/'),'sglang resolved to '+p+' -- the base image 0.5.16 leaked into the venv';print('sglang from  :',p)" \
+    # BUILD TRAP 5: this RUN inherits cwd=/workspace (the WORKDIR set before the
+    # COPY), and `python -c` puts cwd on sys.path -- so /workspace/sglang/, the
+    # REPO DIRECTORY, is picked up as a NAMESPACE PACKAGE and shadows the
+    # editable install. sglang.__file__ then comes back None and every submodule
+    # "does not exist". This is the failure CLAUDE.md records as having silently
+    # emptied a phase's benchmark rows; it reproduces inside the build. Verify
+    # from / where nothing can shadow. (The image's final WORKDIR is
+    # /workspace/sglang, which is safe -- there is no ./sglang beneath it.)
+    && cd / \
+    # Driver stub for the GPU-extension imports below -- see BUILD TRAP 4.
+    && mkdir -p /tmp/cudastub \
+    && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cudastub/libcuda.so.1 \
+    && export LD_LIBRARY_PATH=/tmp/cudastub${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}} \
+    && python -c "import sglang,os;assert sglang.__file__ is not None,'sglang imported as a NAMESPACE package -- a repo dir on sys.path shadowed the install (wrong cwd)';p=os.path.dirname(sglang.__file__);assert p.startswith('${WS}/sglang/python/'),'sglang resolved to '+p+' -- the base image 0.5.16 leaked into the venv';print('sglang from  :',p)" \
     && python -c "import kt_kernel,os;print('kt_kernel from:',os.path.dirname(kt_kernel.__file__))" \
     && python -c "import torch, flashinfer, sgl_kernel, kt_kernel, sglang; print('ENV-OK', torch.__version__, flashinfer.__version__, sglang.__version__)" \
-    && rm -rf /root/.cargo/registry
+    && rm -rf /tmp/cudastub /root/.cargo/registry
 
 # Put the venv first so an interactive shell gets the right python without
 # sourcing anything. launch.sh still activates it itself, which is harmless.
