@@ -6760,9 +6760,12 @@ def maybe_run_expert_swap_window(
 
     store = _KT_SPLIT_PREFILL_STATE["store"]
 
-    # Batched move state. run_swap_window applies a layer's swaps in one
-    # consecutive run (kt_expert_swap.py:386-391), so "the layer changed" is a
-    # sufficient flush trigger, and no interface change is needed.
+    # Batched move state, flushed through run_swap_window's finish_layer hook.
+    # Flushing lazily on "the layer changed" instead looks equivalent and is
+    # not: the next layer's first move runs AFTER this layer's tables have been
+    # flipped, so a failed write left the tables advertising experts whose rows
+    # still held the previous occupants, and the error was reported against the
+    # following layer. The layer-change flush below is now only a safety net.
     _pending = {"layer": None, "layer_idx": None, "items": [], "row_of": {}}
     gpu_reader = _get_or_create_gpu_reader()
 
@@ -6803,13 +6806,27 @@ def maybe_run_expert_swap_window(
         dev = getattr(layer, _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]).data.device
         idx = torch.tensor(rows, dtype=torch.long, device=dev)
 
+        # index_select/index_copy_ have no fp8 CUDA kernels and the scale
+        # params are Float8_e4m3fn, so the bulk moves run on byte views. The
+        # view is exact -- fp8 and uint8 are both one byte and the rows are
+        # contiguous -- and costs nothing. Doing this on the raw params instead
+        # is what made every layer fail with "index_copy_cuda not implemented
+        # for 'Float8_e4m3fn'".
+        def _bytes(t):
+            return t if t.dtype == torch.uint8 else t.view(torch.uint8)
+
+        dtypes = {
+            n: getattr(layer, n).data.dtype
+            for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+        }
+
         # READ: gather every demoted row, one kernel per weight name, and pull
         # them down asynchronously into pinned staging.
         staged = {}
         for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
-            gathered = getattr(layer, name).data.index_select(0, idx)
+            gathered = _bytes(getattr(layer, name).data).index_select(0, idx)
             host = torch.empty(
-                gathered.shape, dtype=gathered.dtype, device="cpu", pin_memory=True
+                gathered.shape, dtype=torch.uint8, device="cpu", pin_memory=True
             )
             host.copy_(gathered, non_blocking=True)
             staged[name] = host
@@ -6820,18 +6837,22 @@ def maybe_run_expert_swap_window(
         # WRITE: scatter every promoted row back, again one kernel per name.
         for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
             stacked = torch.stack([it["promoted"][name] for it in items])
-            getattr(layer, name).data.index_copy_(
-                0, idx, stacked.to(dev, non_blocking=True)
+            _bytes(getattr(layer, name).data).index_copy_(
+                0, idx, _bytes(stacked.to(dev, non_blocking=True))
             )
 
         # The store is authoritative for the cold set, so the demoted rows go
         # back into the slots the promoted experts vacated. Slices of the
-        # pinned staging are already on CPU, so write_row's .to("cpu") is free.
+        # pinned staging are already on CPU, so write_row's .to("cpu") is free;
+        # they are handed back in the param's own dtype, which write_row checks.
         for i, it in enumerate(items):
             store.write_row(
                 layer_idx,
                 it["slot"],
-                {n: staged[n][i] for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES},
+                {
+                    n: staged[n][i].view(dtypes[n])
+                    for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+                },
                 logical_id=it["demoted_id"],
             )
 
@@ -6952,18 +6973,21 @@ def maybe_run_expert_swap_window(
         than installing bytes nobody has checked.
         """
         row = _pending["row_of"].get(demote_id)
+        # Decided from configuration alone, so identically on every rank, and
+        # BEFORE the GPU route is entered: that route contains an all_gather,
+        # and one rank opting out while the others block on the collective is a
+        # hang, not a fallback.
         if gpu_reader is None or row is None or _KT_SWAP_STATE.get("gpu_readback_off"):
             return mover.read_full_expert(entry["layer"], demote_id)
-        try:
-            got = [t.to("cpu") for t in gpu_reader.read_full_expert(entry["layer"], row)]
-        except Exception:
-            logger.exception(
-                "[kt-swap] GPU read-back failed; falling back to the checkpoint"
-            )
-            _KT_SWAP_STATE["gpu_readback_off"] = True
-            return mover.read_full_expert(entry["layer"], demote_id)
+
+        # Deliberately not wrapped in try/except. Absorbing a failure here on
+        # one rank would drop it out of the collectives the other ranks are
+        # still running -- the same reason SwapInstallError is never absorbed.
+        got = [t.to("cpu") for t in gpu_reader.read_full_expert(entry["layer"], row)]
 
         if not _KT_SWAP_STATE.get("gpu_readback_verified"):
+            # Every rank reaches this on the same demotion, so the consensus
+            # below is symmetric.
             _KT_SWAP_STATE["gpu_readback_verified"] = True
             want = mover.read_full_expert(entry["layer"], demote_id)
             bad = [
@@ -6974,13 +6998,20 @@ def maybe_run_expert_swap_window(
             if bad:
                 logger.error(
                     "[kt-swap] GPU read-back DIFFERS from the checkpoint on "
-                    "tensor(s) %s (expert %d, layer %s) — disabling it and "
-                    "reading the checkpoint instead",
+                    "tensor(s) %s (expert %d, layer %s)",
                     bad,
                     demote_id,
                     entry.get("layer_idx"),
                 )
+            # The verdict must be unanimous: a rank that kept the GPU route
+            # while another dropped it would desynchronise every later
+            # all_gather.
+            if not _all_tp_ranks_succeeded(not bad):
                 _KT_SWAP_STATE["gpu_readback_off"] = True
+                logger.error(
+                    "[kt-swap] GPU read-back disabled on every rank; demotions "
+                    "read the checkpoint instead"
+                )
                 return want
             logger.info(
                 "[kt-swap] GPU read-back verified bitwise against the "
@@ -6993,6 +7024,7 @@ def maybe_run_expert_swap_window(
             entries,
             move_weights=_move,
             install_cpu_expert=_install_cpu,
+            finish_layer=_flush_moves,
             quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
         )
     finally:
@@ -7046,19 +7078,22 @@ class _GpuResidentExpertReader:
 
     def __init__(self, param_names):
         self.param_names = param_names
-        self._inverse = None
-        self._shapes = None
+        self._by_shape = {}
 
     def _prepare(self, layer):
-        """Derive the exported shard shapes and the inverse indices, once.
+        """Inverse indices and scale shapes for this layer, cached per shape.
+
+        Keyed by shape, not computed once: one reader serves every MoE layer,
+        and a layer of a different shape reusing another's indices would
+        produce wrong bytes of the right size -- exactly the failure the
+        bitwise gate cannot catch once it has already passed on some other
+        shape.
 
         The permutations depend only on shapes, so a sample of the right shape
         is enough and no checkpoint read is needed to build them. Scales carry
         one E8M0 code per 32 values while weights pack two values per byte, so
         a scale tensor is exactly 1/16 the columns of its weight.
         """
-        if self._inverse is not None:
-            return
         from sglang.srt.layers.moe.kt_mxfp4_export import (
             trtllm_inverse_indices,
             trtllm_permute_indices,
@@ -7073,6 +7108,11 @@ class _GpuResidentExpertReader:
         w13_scale_shape = (w13_shape[0], w13_shape[1] // 16)
         w2_scale_shape = (w2_shape[0], w2_shape[1] // 16)
 
+        key = (w13_shape, w2_shape, str(dev))
+        prepared = self._by_shape.get(key)
+        if prepared is not None:
+            return prepared
+
         def sample(shape):
             return torch.empty(shape, dtype=torch.uint8, device=dev)
 
@@ -7083,13 +7123,18 @@ class _GpuResidentExpertReader:
             w2_scale_sample=sample(w2_scale_shape),
             w13_gate_up_halves=True,
         )
-        self._inverse = trtllm_inverse_indices(
-            indices,
-            w13_scale_shape=w13_scale_shape,
-            w2_scale_shape=w2_scale_shape,
-            device=dev,
+        prepared = (
+            trtllm_inverse_indices(
+                indices,
+                w13_scale_shape=w13_scale_shape,
+                w2_scale_shape=w2_scale_shape,
+                device=dev,
+            ),
+            w13_scale_shape,
+            w2_scale_shape,
         )
-        self._shapes = (w13_scale_shape, w2_scale_shape)
+        self._by_shape[key] = prepared
+        return prepared
 
     def read_full_expert(self, layer, dst_row: int):
         """The full unsliced expert at resident row ``dst_row``.
@@ -7103,16 +7148,15 @@ class _GpuResidentExpertReader:
         """
         from sglang.srt.layers.moe.kt_mxfp4_export import unswizzle_trtllm_expert
 
-        self._prepare(layer)
+        inverse, w13_scale_shape, w2_scale_shape = self._prepare(layer)
         w13_n, w13_s_n, w2_n, w2_s_n = self.param_names
-        w13_scale_shape, w2_scale_shape = self._shapes
 
         shard = unswizzle_trtllm_expert(
             w13=getattr(layer, w13_n).data[dst_row],
             w13_scale=getattr(layer, w13_s_n).data[dst_row],
             w2=getattr(layer, w2_n).data[dst_row],
             w2_scale=getattr(layer, w2_s_n).data[dst_row],
-            inverse=self._inverse,
+            inverse=inverse,
             w13_scale_shape=w13_scale_shape,
             w2_scale_shape=w2_scale_shape,
         )

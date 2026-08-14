@@ -293,6 +293,51 @@ class TestSwapWindow(CustomTestCase):
         self.assertEqual(int(entry["tables"].gpu_index_to_logical[2]), 2)
         self.assertTrue(bool(entry["tables"].gpu_experts_mask[2]))
 
+    def test_finish_layer_runs_after_moves_but_before_the_flip(self):
+        """The hook batched movers flush through must land inside the window.
+
+        A mover that only RECORDS in move_weights and applies the copies in
+        bulk has to be given a point to flush before the tables flip. Flushing
+        lazily on the next layer's first move instead put the write after the
+        flip, so a failure left the tables advertising experts whose rows still
+        held the previous occupants.
+        """
+        from sglang.srt.layers.moe.kt_expert_swap import run_swap_window
+
+        entry = self._entry()
+        seq = []
+
+        run_swap_window(
+            [entry],
+            move_weights=lambda l, r, e, d: seq.append("move"),
+            finish_layer=lambda: seq.append(
+                f"flush@{int(entry['tables'].gpu_index_to_logical[2])}"
+            ),
+        )
+        # flushed after the move, while the row still reads as its old occupant
+        self.assertEqual(seq, ["move", "flush@2"])
+        self.assertEqual(int(entry["tables"].gpu_index_to_logical[2]), 6)
+
+    def test_failing_finish_layer_leaves_the_tables_alone(self):
+        from sglang.srt.layers.moe.kt_expert_swap import run_swap_window
+
+        entry = self._entry()
+
+        def boom():
+            raise RuntimeError("bulk copy failed")
+
+        res = run_swap_window(
+            [entry],
+            move_weights=lambda l, r, e, d: None,
+            finish_layer=boom,
+        )
+        self.assertEqual(res.swaps_applied, 0)
+        self.assertEqual(res.skipped_layers, 1)
+        # The whole point: a failed bulk write must NOT leave row 2 advertised
+        # as expert 6 while it still holds expert 2.
+        self.assertEqual(int(entry["tables"].gpu_index_to_logical[2]), 2)
+        self.assertTrue(bool(entry["tables"].gpu_experts_mask[2]))
+
     def test_quiesce_runs_before_any_mutation(self):
         from sglang.srt.layers.moe.kt_expert_swap import run_swap_window
 

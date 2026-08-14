@@ -345,6 +345,7 @@ def run_swap_window(
     *,
     move_weights: MoveWeightsFn,
     install_cpu_expert: Optional[Callable[[dict, int, int], None]] = None,
+    finish_layer: Optional[Callable[[], None]] = None,
     quiesce: Optional[Callable[[], None]] = None,
 ) -> SwapWindowResult:
     """Apply pending swaps for every layer, at an already-paused point.
@@ -365,6 +366,14 @@ def run_swap_window(
     advertise an expert as GPU-resident while its row still held the previous
     occupant's weights -- every token routed there would silently compute with
     the wrong expert. Nothing crashes; the answers are just wrong.
+
+    ``finish_layer`` exists for movers that BATCH their writes: they treat
+    ``move_weights`` as a record step and apply a layer's copies in bulk, so
+    without a hook they would flush lazily on the next layer's first move --
+    that is, AFTER this layer's tables had already flipped, which is exactly
+    the inversion described above. It is called after the layer's last move and
+    before the flip, inside the same try, so a failure leaves the tables
+    untouched and is attributed to the layer that actually failed.
 
     Eager demotion: the demoted expert stays computable on the CPU side, so at
     no point is an expert resident nowhere. This is why the tables can be
@@ -402,6 +411,8 @@ def run_swap_window(
                             f"promote={s.promote} on layer "
                             f"{entry.get('layer_idx')}"
                         ) from exc
+            if finish_layer is not None:
+                finish_layer()
             apply_swaps_to_tables(tables, swaps)
             assert_tables_consistent(tables, entry["num_gpu_experts"])
         except SwapInstallError:
