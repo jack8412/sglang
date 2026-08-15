@@ -6959,9 +6959,20 @@ def maybe_run_expert_swap_window(
             # swaps instead of its whole cold set.
             promoted = _swizzle_promoted_rows(promoted)
         for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
-            _bytes(getattr(layer, name).data).index_copy_(
-                0, idx, _bytes(promoted[name])
+            dst = _bytes(getattr(layer, name).data)
+            # The swizzle emits scales FLAT per expert (the interleave map is
+            # flat by construction) while the resident scale params are 3-D;
+            # the byte ORDER is already the resident order, so reshaping to
+            # the destination row shape is exact -- and reshape raises on any
+            # numel mismatch, which is the failure mode this wants. A1's first
+            # windows died here 2-D-vs-3-D AFTER w13_weight scattered, leaving
+            # rows with new weights and old scales; the reshape must therefore
+            # happen for EVERY name before ANY scatter runs.
+            promoted[name] = _bytes(promoted[name]).reshape(
+                (len(items),) + tuple(dst.shape[1:])
             )
+        for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
+            _bytes(getattr(layer, name).data).index_copy_(0, idx, promoted[name])
 
         # The store is authoritative for the cold set, so the demoted rows go
         # back into the slots the promoted experts vacated. Slices of the
