@@ -7199,29 +7199,35 @@ def maybe_run_expert_swap_window(
             # anything moved, so the irreversible step is only taken once the
             # write is known to be possible.
             #
-            # No raising: run_swap_window re-raises SwapInstallError out of
-            # the whole window, which on ONE rank sends it to the window-end
-            # barrier while seven peers keep issuing per-layer all_reduces --
-            # the M11/M12 split. Failures are recorded and turned into a
-            # UNANIMOUS abort by the per-layer consensus in _finish_layer.
-            try:
-                if method.wrapper is not None:
-                    method.wrapper.move_expert_slot(promote_id, demote_id)
-                # Every rank mirrors the move kt just made, wrapper or not:
-                # the arena is shared, so a rank that misses one is silently a
-                # swap behind for the rest of the process's life.
-                writer.commit_move(entry["layer_idx"], promote_id, demote_id)
-                if not writer.write(entry["layer_idx"], promote_id, demote_id):
-                    raise RuntimeError("write refused after validation")
-            except Exception:
-                logger.exception(
-                    "[kt-rankwrite] install failed for demote=%s promote=%s on "
-                    "layer %s; the layer will abort on every rank",
-                    demote_id,
-                    promote_id,
-                    entry.get("layer_idx"),
+            # THERE IS NO ABORT PATH HERE, DELIBERATELY. Round 2 tried to make
+            # a failure recoverable and made it worse: move_slot_only nulls
+            # gate/up/down_bb_[promote] irreversibly, so a layer that aborts
+            # after it leaves the promoted expert advertised as CPU-served
+            # (the tables never flipped) with a null BufferB -- the next token
+            # routed there null-derefs inside the AMX GEMM. The mirror image,
+            # writing before the move, corrupts that expert's live weights
+            # instead. Neither ordering has a safe unwind.
+            #
+            # And unwinding is not even available: kt's move runs on a
+            # CPUInfer worker thread whose loop has no try/catch, so a C++
+            # precondition throw terminates the PROCESS -- Python never sees
+            # it. Safety therefore has to come from never entering the region
+            # unless it will succeed, which is what validate() establishes at
+            # _begin_layer (it mirrors kt's own checks on every partition) and
+            # what the arming capability probe establishes once per process.
+            # Anything that still raises here is a bug, and it propagates.
+            if method.wrapper is not None:
+                method.wrapper.move_expert_slot(promote_id, demote_id)
+            # Every rank mirrors the move kt just made, wrapper or not: the
+            # arena is shared, so a rank that misses one is silently a swap
+            # behind for the rest of the process's life.
+            writer.commit_move(entry["layer_idx"], promote_id, demote_id)
+            if not writer.write(entry["layer_idx"], promote_id, demote_id):
+                raise SwapInstallError(
+                    f"rank-write demotion refused AFTER validation for "
+                    f"demote={demote_id} on layer {entry.get('layer_idx')} -- "
+                    "this is a bug in validate(), not a runtime condition"
                 )
-                _pending["install_failed"] = True
             _timing["install_s"] += time.perf_counter() - t0
             return
 
@@ -7360,7 +7366,6 @@ def maybe_run_expert_swap_window(
         armed = bool(_KT_SWAP_STATE.get("rank_write_armed"))
         writer = _KT_SWAP_STATE.get("rank_writer") if armed else None
         captured = False
-        _pending["install_failed"] = False
         if writer is not None and swaps:
             t0 = time.perf_counter()
             captured = writer.capture(
@@ -7464,8 +7469,19 @@ def maybe_run_expert_swap_window(
             )
 
         if not _KT_SWAP_STATE.get("gpu_readback_verified"):
-            # Every rank reaches this on the same demotion, so the consensus
-            # below is symmetric.
+            # NO COLLECTIVE HERE. The comment that used to sit at this line
+            # claimed every rank reaches it; that is false, and it was M11
+            # rebuilt: _read_demoted_expert's only caller sits AFTER
+            # `if method.wrapper is None: return`, and the wrapper exists on
+            # rank 0 alone, so an all_reduce here is issued by one rank while
+            # seven march into the next layer -- a permanent one-collective
+            # skew on the gloo group that ends in the watchdog.
+            #
+            # The verdict does not need a collective anyway: turning the
+            # route off is rank-local, and the per-layer
+            # `_all_tp_ranks_succeeded(want)` in _begin_layer is a MIN, so
+            # rank 0's False propagates to every rank on the very next layer
+            # through a consensus that IS symmetric.
             _KT_SWAP_STATE["gpu_readback_verified"] = True
             want = mover.read_full_expert(
                 entry["layer"],
@@ -7484,14 +7500,14 @@ def maybe_run_expert_swap_window(
                     demote_id,
                     entry.get("layer_idx"),
                 )
-            # The verdict must be unanimous: a rank that kept the GPU route
-            # while another dropped it would desynchronise every later
-            # all_gather.
-            if not _all_tp_ranks_succeeded(not bad):
+            if bad:
+                # Local flag only; _begin_layer's MIN consensus carries it to
+                # every rank at the next layer.
                 _KT_SWAP_STATE["gpu_readback_off"] = True
                 logger.error(
-                    "[kt-swap] GPU read-back disabled on every rank; demotions "
-                    "read the checkpoint instead"
+                    "[kt-swap] GPU read-back disabled; the next layer's "
+                    "consensus drops it on every rank and demotions read the "
+                    "checkpoint instead"
                 )
                 return want
             logger.info(
@@ -7512,29 +7528,6 @@ def maybe_run_expert_swap_window(
             return
         for s in swaps:
             dma_src.window_release(entry["layer_idx"], s.promote)
-
-    def _finish_layer():
-        """Apply the layer's batched GPU moves, then agree on the outcome.
-
-        The second half is what makes an install failure survivable. A
-        rank-local raise out of the window is the M11/M12 split -- one rank at
-        the window-end barrier, seven still issuing per-layer all_reduces --
-        so the rank-write install records failures instead of raising, and
-        this ONE consensus turns any rank's failure into the SAME abort on
-        every rank. run_swap_window then leaves the layer's tables unflipped
-        everywhere, which is the state it is designed to recover from.
-
-        Called once per layer with swaps, on every rank, from the same hook:
-        symmetric by construction.
-        """
-        _flush_moves()
-        if not _KT_SWAP_STATE.get("rank_write_armed"):
-            return
-        if not _all_tp_ranks_succeeded(not _pending.get("install_failed")):
-            raise SwapInstallError(
-                "rank-write install failed on at least one rank; every rank "
-                "aborts this layer with its tables unflipped"
-            )
 
     def _on_layer_abort(entry):
         # The layer failed after _begin_layer: tables never flipped, its
@@ -7561,7 +7554,7 @@ def maybe_run_expert_swap_window(
             move_weights=_move,
             install_cpu_expert=_install_cpu,
             begin_layer=_begin_layer,
-            finish_layer=_finish_layer,
+            finish_layer=_flush_moves,
             after_flip=_after_flip,
             on_layer_abort=_on_layer_abort,
             quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
@@ -8973,6 +8966,22 @@ def _get_or_create_rank_writer(entry):
                 SlotOffsets,
             )
             from sglang.srt.layers.moe.kt_direct_dma import ArenaExpertRanges
+
+            # CAPABILITY PROBE, once, before anything can move. The install
+            # region is infallible by construction only if kt actually
+            # exposes the bookkeeping-only slot move; a kt built before
+            # c68d1ce raises NotImplementedError from inside the region, and
+            # a kt-side C++ throw runs on a CPUInfer worker whose loop has no
+            # try/catch -- it terminates the process rather than surfacing as
+            # an exception. So this is checked while refusing is still free.
+            for m in _KT_EP_METHODS:
+                if m.wrapper is not None and not hasattr(
+                    m.wrapper, "move_expert_slot"
+                ):
+                    raise RuntimeError(
+                        "this kt build has no move_expert_slot (needs kt "
+                        "c68d1ce or later); rank-write cannot arm"
+                    )
 
             layers = [m.kt_config.layer_idx for m in _KT_EP_METHODS]
             # The WRITE registry: under cold-only the read one stays empty by
