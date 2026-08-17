@@ -1413,6 +1413,12 @@ class Envs:
     # added to the hot path -- but the summary log is per forward, so this is
     # a triage knob rather than a production default.
     SGLANG_DEBUG_KT_PIPELINE_OVERLAP = EnvBool(False)
+    # Gate for flipping the probe above (and future probes) AT RUNTIME via
+    # /set_internal_state. Snapshotted at scheduler startup: a server launched
+    # without it can NEVER have probing enabled remotely -- production stays
+    # unprobeable by construction, test servers launch with it and toggle
+    # freely without reboots.
+    SGLANG_DEBUG_KT_RUNTIME_PROBING = EnvBool(False)
     # P0 ablation for the doorbell-transport design: skip ONLY the two
     # cudaLaunchHostFunc submissions (submit/sync) while keeping the staging
     # D2H, the result H2D and the merge-add. Differencing this against the

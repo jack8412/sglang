@@ -337,6 +337,9 @@ def _prewarm_hccl_group(device, group, device_module):
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
+# Snapshot at import (= launch): flipping the env later must not open the
+# runtime-probing door on a server that started with it closed.
+KT_RUNTIME_PROBING_ALLOWED = envs.SGLANG_DEBUG_KT_RUNTIME_PROBING.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
@@ -4277,6 +4280,13 @@ class Scheduler(
         for k, v in server_args_dict.items():
             if k not in args_allow_update:
                 logging.warning(f"Updating {k} is not supported.")
+                if_success = False
+                break
+            elif k == "kt_pipeline_overlap_probe" and not KT_RUNTIME_PROBING_ALLOWED:
+                logging.warning(
+                    "kt_pipeline_overlap_probe rejected: this server was "
+                    "launched without SGLANG_DEBUG_KT_RUNTIME_PROBING=1"
+                )
                 if_success = False
                 break
             elif k == "pp_max_micro_batch_size" and (
