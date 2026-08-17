@@ -7882,10 +7882,10 @@ def _try_build_direct_dma(
         # rc=2 while every host-wide metric looks healthy (D2: 22,901
         # memory.max hits during boot).
         from sglang.srt.layers.moe.kt_direct_dma import (
-            reclaim_headroom_for_registration,
+            reclaim_checkpoint_cache,
         )
 
-        reclaim_headroom_for_registration(
+        reclaim_checkpoint_cache(
             weight_path=anchor.kt_config.weight_path,
             floor_bytes=250 << 30,
         )
@@ -8143,6 +8143,31 @@ def finalize_split_prefill(server_args) -> bool:
             # here too: without it, `dynamic` would size the store by a None
             # shape map.
             dynamic = dynamic and swizzle_plan is not None and raw_shapes is not None
+            # Make room BEFORE allocating, and do not let eight ranks race.
+            # MEASURED (S1): kt's full residency (1,454 GiB) plus eight
+            # 51.1 GiB stores is 1,863 GiB against a 1,916 GiB cgroup -- it
+            # fits in steady state, but allocating 409 GiB of unreclaimable
+            # pinned memory from eight processes at once, with ~530 GiB of
+            # checkpoint cache still to reclaim, got rank 0 OOM-killed
+            # (memory.events oom_kill 6). Dropping the cache first turns the
+            # reclaim race into plain free memory; the stagger keeps the
+            # remaining allocations from arriving as one 409 GiB burst.
+            from sglang.srt.layers.moe.kt_direct_dma import (
+                cgroup_headroom_bytes,
+                reclaim_checkpoint_cache,
+            )
+
+            reclaim_checkpoint_cache(
+                weight_path=anchor.kt_config.weight_path,
+                floor_bytes=600 << 30,
+            )
+            head = cgroup_headroom_bytes()
+            if head is not None:
+                logger.info(
+                    "[cold-store] cgroup headroom before allocation: %.0f GB",
+                    head / 1e9,
+                )
+            time.sleep(3.0 * get_parallel().tp_rank)
             # Swapping used to be refused here: the swap path reads and writes
             # these same rows, and against a raw store that mixed layouts
             # silently. It no longer does -- _flush_moves swizzles a promotion

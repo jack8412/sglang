@@ -905,17 +905,20 @@ def cgroup_headroom_bytes() -> Optional[int]:
         return None
 
 
-def reclaim_headroom_for_registration(
-    *, weight_path: str, floor_bytes: int
-) -> None:
+def reclaim_checkpoint_cache(*, weight_path: str, floor_bytes: int) -> None:
     """Best-effort: drop checkpoint page cache until the cgroup has headroom.
 
-    The registration storm charges kernel memory to the cgroup; if the
-    cgroup is at memory.max the charges fail (rc=2). The checkpoint's file
-    cache is the one big reclaimable charge at this point of boot (the
-    weights themselves are unswappable shmem), and it is pure cache -- the
-    files were fully consumed by the load. POSIX_FADV_DONTNEED is
-    per-inode, immediate, and costs seconds across the whole tree.
+    Two callers, one failure mode. The registration storm charges kernel
+    memory to the cgroup; the pinned-store build allocates ~51 GiB of
+    unreclaimable host memory per rank, eight ranks at once. Either way, if
+    the cgroup is near memory.max the kernel must reclaim page cache to
+    satisfy the request -- and MEASURED (S1, 2026-08-17): with ~530 GiB of
+    checkpoint cache in the way it OOM-killed the rank instead
+    (memory.events oom_kill 6), even though the steady state fits with
+    ~53 GiB to spare. So make the room FIRST: the checkpoint cache is pure
+    cache at this point (the load has consumed the files and released its
+    mmap handles, so DONTNEED is no longer the no-op it is against mapped
+    pages), and dropping it costs seconds.
     """
     import glob as _glob
 
