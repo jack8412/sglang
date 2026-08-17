@@ -4269,6 +4269,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "kt_pipeline_overlap_probe",
             ]
         )
 
@@ -4327,6 +4328,15 @@ class Scheduler(
             # DSpark control keys are worker commands, not server args; route
             # them to the draft worker and keep them out of the override.
             remaining = dict(server_args_dict)
+            # Probe toggle, not a server arg: flips the env this rank's cold
+            # pipeline re-reads at every pass boundary, so the per-layer
+            # copy/export/stall decomposition turns on and off on a RUNNING
+            # server -- it used to cost a full reboot per measurement.
+            #   curl -X POST .../set_internal_state \
+            #        -d '{"server_args": {"kt_pipeline_overlap_probe": 1}}'
+            probe = remaining.pop("kt_pipeline_overlap_probe", None)
+            if probe is not None:
+                envs.SGLANG_DEBUG_KT_PIPELINE_OVERLAP.set(bool(probe))
             frac = remaining.pop("dspark_force_budget_frac", None)
             if "dspark_force_budget_frac" in server_args_dict:
                 self.draft_worker.set_dspark_forced_budget_frac(
