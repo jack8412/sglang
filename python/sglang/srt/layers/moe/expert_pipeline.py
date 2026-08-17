@@ -97,10 +97,16 @@ class ArenaColdSource:
         self._node_cpus = self._arena_node_cpus()
 
         with self._bound_to_arena_node():
+            # device="cpu" is explicit because construction can run under a
+            # cuda default device; a device-less empty would silently build
+            # GPU "staging" and the first gather would die (or worse).
             self._staging: List[Dict[str, torch.Tensor]] = [
                 {
                     n: torch.empty(
-                        (self.num_cold,) + tuple(shape), dtype=dtype, pin_memory=True
+                        (self.num_cold,) + tuple(shape),
+                        dtype=dtype,
+                        device="cpu",
+                        pin_memory=True,
                     )
                     for n, (shape, dtype) in raw_shapes.items()
                 }

@@ -7578,6 +7578,26 @@ def reset_split_prefill() -> None:
     _KT_SPLIT_PREFILL_STATE["pipeline"] = None
 
 
+def _invert_cold_slot_table(
+    l2s: torch.Tensor, num_gpu: int, num_cold: int
+) -> torch.Tensor:
+    """Cold half of ``logical_to_slot``, inverted: row ``j`` -> the expert
+    whose slot is ``num_gpu + j``.
+
+    Runs at gather time, i.e. inside a forward where torch's DEFAULT DEVICE is
+    cuda -- A3's first request died on exactly that (a device-less
+    ``torch.empty`` landed on cuda:0 against the CPU table). Every tensor here
+    is therefore pinned to the table's own device, and the result comes back
+    on CPU, which is what the gather indexes with.
+    """
+    is_cold = l2s >= num_gpu
+    cold = torch.empty(num_cold, dtype=torch.int64, device=l2s.device)
+    cold[(l2s[is_cold] - num_gpu).long()] = torch.nonzero(
+        is_cold, as_tuple=False
+    ).flatten()
+    return cold.cpu()
+
+
 def finalize_split_prefill(server_args) -> bool:
     """Build the cold-expert store and prefetch pipeline, then arm every layer.
 
@@ -7641,13 +7661,9 @@ def finalize_split_prefill(server_args) -> bool:
                 # logical_to_slot -- the table routing reads and swaps
                 # exchange -- never from mask order, which goes stale the
                 # moment a window acts.
-                l2s = methods_by_layer[layer_idx].logical_to_slot
-                is_cold = l2s >= num_gpu
-                cold = torch.empty(num_cold, dtype=torch.int64)
-                cold[(l2s[is_cold] - num_gpu).long()] = torch.nonzero(
-                    is_cold, as_tuple=False
-                ).flatten()
-                return cold
+                return _invert_cold_slot_table(
+                    methods_by_layer[layer_idx].logical_to_slot, num_gpu, num_cold
+                )
 
             source = ArenaColdSource(
                 sources_by_layer=arena_sources,
