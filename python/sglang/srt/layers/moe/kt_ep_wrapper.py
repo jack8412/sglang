@@ -6868,6 +6868,16 @@ def maybe_run_expert_swap_window(
         "install_s": 0.0,
         "prefetch_hits": 0,
         "prefetch_misses": 0,
+        # Phase breakdown of what the window's timing line calls "elsewhere".
+        # Added because two rounds of reasoning about where it goes were both
+        # wrong (the per-layer all_reduces, then the pinned allocations); the
+        # GPU flush measures 0.09 s per window on this node, so the remainder
+        # is CPU-side and has to be attributed rather than guessed.
+        "select_s": 0.0,      # policy.select over 896 experts, per layer
+        "stage_s": 0.0,       # store.stage_row clones (read-before-overwrite)
+        "flush_gpu_s": 0.0,   # gather + D2H + sync + scatter
+        "flush_store_s": 0.0, # store.write_row of the demoted rows
+        "tables_s": 0.0,      # apply_swaps_to_tables + assert_consistent
     }
     _window_t0 = time.perf_counter()
 
@@ -6981,6 +6991,7 @@ def maybe_run_expert_swap_window(
         # demoted bytes back -- an arena batch runs under full kt residency,
         # where the demoted expert never lost its CPU buffers, so there is
         # nothing to read and nothing to synchronize before the writes.
+        _t_gpu = time.perf_counter()
         staged = {}
         if store is not None:
             for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
@@ -7023,6 +7034,7 @@ def maybe_run_expert_swap_window(
             )
         for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
             _bytes(getattr(layer, name).data).index_copy_(0, idx, promoted[name])
+        _timing["flush_gpu_s"] += time.perf_counter() - _t_gpu
 
         # The store is authoritative for the cold set, so the demoted rows go
         # back into the slots the promoted experts vacated. Slices of the
@@ -7035,6 +7047,7 @@ def maybe_run_expert_swap_window(
                 # Mirror of the promotion side: the rows gathered off the GPU
                 # are in trtllm layout, and a raw store must not be given those.
                 staged = _unswizzle_demoted_rows(staged, dtypes)
+            _t_store = time.perf_counter()
             for i, it in enumerate(items):
                 store.write_row(
                     layer_idx,
@@ -7045,6 +7058,7 @@ def maybe_run_expert_swap_window(
                     },
                     logical_id=it["demoted_id"],
                 )
+            _timing["flush_store_s"] += time.perf_counter() - _t_store
 
     def _move(layer, dst_row, logical_id, demoted_id):
         """Record expert ``logical_id`` -> resident row ``dst_row``.
@@ -7101,12 +7115,15 @@ def maybe_run_expert_swap_window(
         if _pending["layer_idx"] != layer_idx:
             _flush_moves()
             _pending["layer"], _pending["layer_idx"] = layer, layer_idx
+        _t = time.perf_counter()
+        _staged_row = store.stage_row(layer_idx, slot)
+        _timing["stage_s"] += time.perf_counter() - _t
         _pending["items"].append(
             {
                 "dst_row": dst_row,
                 "slot": slot,
                 "demoted_id": demoted_id,
-                "promoted": store.stage_row(layer_idx, slot),
+                "promoted": _staged_row,
             }
         )
 
@@ -7561,6 +7578,7 @@ def maybe_run_expert_swap_window(
             finish_layer=_flush_moves,
             after_flip=_after_flip,
             on_layer_abort=_on_layer_abort,
+            phase_timer=lambda k, v: _timing.__setitem__(k, _timing[k] + v),
             quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
         )
     finally:
@@ -7641,6 +7659,23 @@ def maybe_run_expert_swap_window(
             - _timing["install_s"],
             _timing["prefetch_hits"],
             _timing["prefetch_misses"],
+        )
+        # The "elsewhere" term, attributed. Without this the only way to say
+        # where a window's time goes is to guess, and two careful guesses
+        # (the per-layer all_reduces; the pinned staging allocations) were
+        # both wrong -- the GPU flush measures 0.09 s per window on this node.
+        logger.info(
+            "[kt-swap] window %d elsewhere: select %.2fs + stage %.2fs + "
+            "flush_gpu %.2fs + flush_store %.2fs + tables %.2fs = %.2fs "
+            "attributed",
+            _KT_SWAP_STATE["windows"],
+            _timing["select_s"],
+            _timing["stage_s"],
+            _timing["flush_gpu_s"],
+            _timing["flush_store_s"],
+            _timing["tables_s"],
+            _timing["select_s"] + _timing["stage_s"] + _timing["flush_gpu_s"]
+            + _timing["flush_store_s"] + _timing["tables_s"],
         )
 
 

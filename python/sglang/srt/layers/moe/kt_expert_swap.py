@@ -24,6 +24,7 @@ dominates the totals.
 """
 
 import logging
+import time
 from typing import Callable, List, NamedTuple, Optional
 
 import torch
@@ -368,6 +369,7 @@ def run_swap_window(
     after_flip: Optional[Callable[[dict, list], None]] = None,
     on_layer_abort: Optional[Callable[[dict], None]] = None,
     quiesce: Optional[Callable[[], None]] = None,
+    phase_timer: Optional[Callable[[str, float], None]] = None,
 ) -> SwapWindowResult:
     """Apply pending swaps for every layer, at an already-paused point.
 
@@ -441,7 +443,10 @@ def run_swap_window(
     for entry in layers:
         policy: ExpertSwapPolicy = entry["policy"]
         tables: SwapTables = entry["tables"]
+        _t = time.perf_counter()
         swaps = policy.select(tables.gpu_experts_mask)
+        if phase_timer is not None:
+            phase_timer("select_s", time.perf_counter() - _t)
         if not swaps:
             continue
         try:
@@ -473,8 +478,11 @@ def run_swap_window(
                         ) from exc
             if finish_layer is not None:
                 finish_layer()
+            _t = time.perf_counter()
             apply_swaps_to_tables(tables, swaps)
             assert_tables_consistent(tables, entry["num_gpu_experts"])
+            if phase_timer is not None:
+                phase_timer("tables_s", time.perf_counter() - _t)
             if after_flip is not None:
                 try:
                     after_flip(entry, swaps)
