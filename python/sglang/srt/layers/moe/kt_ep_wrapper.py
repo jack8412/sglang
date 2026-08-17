@@ -7877,6 +7877,18 @@ def _try_build_direct_dma(
                 )
                 return None, None, None
 
+        # The registration storm charges kernel memory to the container's
+        # cgroup; give it reclaimable headroom FIRST or the charges fail with
+        # rc=2 while every host-wide metric looks healthy (D2: 22,901
+        # memory.max hits during boot).
+        from sglang.srt.layers.moe.kt_direct_dma import (
+            reclaim_headroom_for_registration,
+        )
+
+        reclaim_headroom_for_registration(
+            weight_path=anchor.kt_config.weight_path,
+            floor_bytes=250 << 30,
+        )
         reg_fn, unreg_fn = cudart_register_fns()
         registrar = IntervalRegistrar(
             register_fn=reg_fn, unregister_fn=unreg_fn

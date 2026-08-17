@@ -96,8 +96,11 @@ class IntervalRegistrar:
     """
 
     # Backoff schedule for transient (rc=2) registration failures; class
-    # attribute so tests can zero the sleeps.
-    RETRY_DELAYS = (0.1, 0.5, 2.0)
+    # attribute so tests can zero the sleeps. D2 measured the at-limit
+    # window lasting minutes, so the schedule reaches ~18 s per unit -- the
+    # pre-registration headroom reclaim (below) is what makes long windows
+    # rare; this is the second line of defense, not the first.
+    RETRY_DELAYS = (0.1, 0.5, 2.0, 5.0, 10.0)
 
     def __init__(
         self,
@@ -879,6 +882,68 @@ class DirectDmaSource:
 
 
 # -- construction ------------------------------------------------------------
+
+
+def cgroup_headroom_bytes() -> Optional[int]:
+    """memory.max - memory.current for this container, or None.
+
+    The decisive metric on a cgroup-limited node: D2's boot had ~500 GB of
+    host MemAvailable while the CGROUP sat at its 1916 GiB memory.max
+    (memory.events counted 22,901 max-limit hits) -- kernel-side charges for
+    each cudaHostRegister then fail intermittently with ENOMEM (rc=2) while
+    every host-wide metric looks healthy.
+    """
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw = f.read().strip()
+        if raw == "max":
+            return None
+        with open("/sys/fs/cgroup/memory.current") as f:
+            cur = int(f.read().strip())
+        return int(raw) - cur
+    except (OSError, ValueError):
+        return None
+
+
+def reclaim_headroom_for_registration(
+    *, weight_path: str, floor_bytes: int
+) -> None:
+    """Best-effort: drop checkpoint page cache until the cgroup has headroom.
+
+    The registration storm charges kernel memory to the cgroup; if the
+    cgroup is at memory.max the charges fail (rc=2). The checkpoint's file
+    cache is the one big reclaimable charge at this point of boot (the
+    weights themselves are unswappable shmem), and it is pure cache -- the
+    files were fully consumed by the load. POSIX_FADV_DONTNEED is
+    per-inode, immediate, and costs seconds across the whole tree.
+    """
+    import glob as _glob
+
+    head = cgroup_headroom_bytes()
+    if head is None or head >= floor_bytes:
+        return
+    t0 = time.perf_counter()
+    dropped = 0
+    for path in sorted(_glob.glob(os.path.join(weight_path, "*.safetensors"))):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                dropped += 1
+            finally:
+                os.close(fd)
+        except OSError:
+            continue
+    after = cgroup_headroom_bytes()
+    logger.info(
+        "[kt-dma] cgroup headroom %.0f GB under the %.0f GB floor: dropped "
+        "%d checkpoint files' cache in %.1f s -> headroom %.0f GB",
+        head / 1e9,
+        floor_bytes / 1e9,
+        dropped,
+        time.perf_counter() - t0,
+        (after or 0) / 1e9,
+    )
 
 
 def boot_acquire_cold_set(
