@@ -219,6 +219,28 @@ class TestIntervalRegistrar(unittest.TestCase):
         self.assertEqual(reg.trim(budget_bytes=0), 3 * PAGE)
         self.assertEqual(reg.registered_bytes(), 0)
 
+    def test_trim_is_fast_at_production_scale(self):
+        """The first trim cut was O(dead x total): 220 s measured at 150k
+        units / 4.4k dead -- a scheduler stall inside the quiesced window.
+        The single-pass version must handle that shape in well under a
+        second (null unregister fn, pure bookkeeping)."""
+        import time
+
+        reg = IntervalRegistrar(
+            register_fn=lambda p, n: 0, unregister_fn=lambda p: 0
+        )
+        n_units = 150_000
+        stride = 4 * PAGE
+        for i in range(n_units):
+            reg.acquire(i, [(i * stride, i * stride + PAGE)])
+        for i in range(0, 3 * 4_416, 3):  # ~4.4k dead, scattered
+            reg.release(i)
+        t0 = time.perf_counter()
+        freed = reg.trim(budget_bytes=reg.live_bytes())
+        dt = time.perf_counter() - t0
+        self.assertGreater(freed, 0)
+        self.assertLess(dt, 1.0, f"trim took {dt:.1f} s at production scale")
+
     def test_close_unregisters_everything(self):
         fake = FakeCuda()
         reg = make_registrar(fake)

@@ -366,6 +366,7 @@ def run_swap_window(
     begin_layer: Optional[Callable[[dict, list, list], None]] = None,
     finish_layer: Optional[Callable[[], None]] = None,
     after_flip: Optional[Callable[[dict, list], None]] = None,
+    on_layer_abort: Optional[Callable[[dict], None]] = None,
     quiesce: Optional[Callable[[], None]] = None,
 ) -> SwapWindowResult:
     """Apply pending swaps for every layer, at an already-paused point.
@@ -410,6 +411,14 @@ def run_swap_window(
     experts' page pins here -- releasing on the proposed plan instead would
     drop pins a skipped pair's still-cold expert needs). Failures are
     logged, never raised: the swap itself completed.
+
+    ``on_layer_abort(entry)`` runs when a layer fails AFTER begin_layer --
+    tables not flipped, layer skipped (or the window re-raising). Whatever
+    begin_layer acquired for this layer's plan must be undone here: without
+    it, a demotion acquire whose expert stays RESIDENT is never released by
+    any future window (no promotion of a resident expert exists), so its
+    pages are live forever and re-attempts stack unreleasable refcounts.
+    Best-effort: failures logged, never raised.
 
     ``finish_layer`` exists for movers that BATCH their writes: they treat
     ``move_weights`` as a record step and apply a layer's copies in bulk, so
@@ -478,6 +487,11 @@ def run_swap_window(
         except SwapInstallError:
             # Never absorbed: see SwapInstallError. Skipping here would leave
             # this rank's placement disagreeing with every other rank's.
+            if on_layer_abort is not None:
+                try:
+                    on_layer_abort(entry)
+                except Exception:
+                    logger.exception("[kt-swap] on_layer_abort failed")
             raise
         except Exception:
             # A layer that fails mid-window is left as it was found: weights
@@ -489,6 +503,11 @@ def run_swap_window(
                 "[kt-swap] layer %s: swap window failed, layer left unchanged",
                 entry.get("layer_idx"),
             )
+            if on_layer_abort is not None:
+                try:
+                    on_layer_abort(entry)
+                except Exception:
+                    logger.exception("[kt-swap] on_layer_abort failed")
             skipped += 1
             continue
         policy.note_swapped(swaps)

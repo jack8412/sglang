@@ -269,28 +269,47 @@ class IntervalRegistrar:
         """Unregister dead units, oldest first, until under budget.
 
         QUIESCED CALLERS ONLY: nothing may be mid-DMA from these arenas.
+
+        Single-pass by construction: one merged-live-index build, one
+        two-pointer sweep classifying every unit, one sort of the dead set.
+        The first cut freed one unit per O(N) rescan, which at the real
+        scale (~150k units, ~4.4k dead per window) was measured at 220 s of
+        pure Python inside the quiesced window -- long enough to trip the
+        watchdog. This version is O(N log N) and sub-second at that scale.
         """
+        total = self.registered_bytes()
+        if total <= budget_bytes:
+            return 0
+        self._rebuild_live_index()
+        live = self._live_index
+        dead: List[int] = []
+        j = 0
+        for i in range(len(self._unit_starts)):
+            s, e = self._unit_starts[i], self._unit_ends[i]
+            while j < len(live) and live[j][1] <= s:
+                j += 1
+            if j < len(live) and live[j][0] < e:
+                continue  # overlaps a live range
+            dead.append(i)
+        dead.sort(key=lambda i: self._unit_seq[i])
         freed = 0
-        while self.registered_bytes() > budget_bytes:
-            oldest = None
-            for i in range(len(self._unit_starts)):
-                if self._unit_is_live(self._unit_starts[i], self._unit_ends[i]):
-                    continue
-                if oldest is None or self._unit_seq[i] < self._unit_seq[oldest]:
-                    oldest = i
-            if oldest is None:
-                break  # everything left is live; budget is simply exceeded
-            rc = self._unregister(self._unit_starts[oldest])
+        dropped: List[int] = []
+        for i in dead:
+            if total - freed <= budget_bytes:
+                break
+            rc = self._unregister(self._unit_starts[i])
             if rc != 0:
                 logger.error(
                     "[kt-dma] cudaHostUnregister(%#x) rc=%d during trim; "
                     "leaving the unit registered",
-                    self._unit_starts[oldest],
+                    self._unit_starts[i],
                     rc,
                 )
                 break
-            freed += self._unit_ends[oldest] - self._unit_starts[oldest]
-            self._drop_unit(oldest)
+            freed += self._unit_ends[i] - self._unit_starts[i]
+            dropped.append(i)
+        for i in sorted(dropped, reverse=True):
+            self._drop_unit(i)
         return freed
 
     def close(self) -> None:
@@ -391,14 +410,44 @@ class CudaCopyLib:
             raise RuntimeError(f"cudaMemcpy2DAsync rc={rc}")
 
 
+_ERROR_CLEAR_LIB: Optional[ctypes.CDLL] = None
+
+
+def _clear_sticky_cuda_error() -> None:
+    """Swallow CUDA's per-thread sticky error after a failed runtime call.
+
+    torch's cudart binding returns the raw rc WITHOUT clearing last-error, so
+    a failed cudaHostRegister -- a case this transport treats as recoverable
+    (arming falls back, a swap pair is skipped) -- would otherwise surface as
+    a phantom 'CUDA error' at the next kernel-launch check on this thread,
+    turning designed degradation into a crash mid-boot or a one-rank crash
+    plus TP hang mid-window. cudaGetLastError is the only call that resets
+    the state; go straight to libcudart for it.
+    """
+    global _ERROR_CLEAR_LIB
+    try:
+        if _ERROR_CLEAR_LIB is None:
+            _ERROR_CLEAR_LIB = CudaCopyLib._load()
+            _ERROR_CLEAR_LIB.cudaGetLastError.restype = ctypes.c_int
+        _ERROR_CLEAR_LIB.cudaGetLastError()
+    except Exception:
+        logger.exception("[kt-dma] could not clear the sticky CUDA error")
+
+
 def cudart_register_fns() -> Tuple[Callable[[int, int], int], Callable[[int], int]]:
     cudart = torch.cuda.cudart()
 
     def reg(ptr: int, nbytes: int) -> int:
-        return int(cudart.cudaHostRegister(ptr, nbytes, 0))
+        rc = int(cudart.cudaHostRegister(ptr, nbytes, 0))
+        if rc != 0:
+            _clear_sticky_cuda_error()
+        return rc
 
     def unreg(ptr: int) -> int:
-        return int(cudart.cudaHostUnregister(ptr))
+        rc = int(cudart.cudaHostUnregister(ptr))
+        if rc != 0:
+            _clear_sticky_cuda_error()
+        return rc
 
     return reg, unreg
 

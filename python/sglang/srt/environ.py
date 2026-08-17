@@ -1387,12 +1387,15 @@ class Envs:
     # which is identical on every rank. Still opt-in until measured against the
     # checkpoint path on a live server.
     SGLANG_KT_SWAP_GPU_READBACK = EnvBool(False)
-    # Minimum free VRAM (GiB) a rank must still have before the direct-DMA
-    # cold transport is allowed to arm. Boot registration materializes GPU
-    # page tables in VRAM AFTER the KV pool was sized (8 B per 4K page,
-    # measured exact on dense ranges), so arming without a floor could hand
-    # a later transient allocation an OOM mid-serving instead of a clean
-    # fallback at boot.
+    # Minimum free VRAM (GiB) a rank must still have, after the projected
+    # page-table cost (8 B per 4K page, measured exact on dense ranges),
+    # before the direct-DMA cold transport is allowed to arm. NOTE the
+    # timing: arming runs inside ModelRunner.initialize, BEFORE the KV pool
+    # is carved, so free VRAM here is pre-pool (tens of GiB) and the pool
+    # sizing that follows measures free memory AFTER registration -- the PTE
+    # cost is absorbed by the pool, not by the serving margin. The floor is
+    # therefore a sanity bound against grossly wrong projections, not the
+    # post-pool-margin guard an operator might assume.
     SGLANG_KT_DMA_FREE_VRAM_FLOOR_GB = EnvFloat(1.0)
     # Hold the split-prefill cold store in CHECKPOINT layout and swizzle each
     # layer on device as it is prefetched, instead of storing pre-swizzled

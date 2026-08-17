@@ -220,11 +220,13 @@ no partial unregister).
      re-demotion of a recently promoted expert free.
   3. **Boot registration** = `acquire` of the initial cold set (from the
      same table), parallel across ranks, ~3–4 s (Probe A rate), before
-     arming. NOTE (review): this runs AFTER the KV pool is sized, so the
-     PTE VRAM (~0.2–0.6 GB) comes out of the post-pool free margin — the
-     arming path measures free VRAM first and falls back unanimously if
-     the margin is below a floor (default 1 GiB), rather than letting a
-     later allocation OOM mid-serving.
+     arming. TIMING (corrected by the implementation review): finalize runs
+     inside ModelRunner.initialize, BEFORE the KV pool is carved — so the
+     PTE VRAM (~0.2–0.6 GB) is absorbed into the pool sizing that follows
+     (the pool measures free memory after registration), NOT taken from the
+     serving margin. The free-VRAM floor check at arming is a sanity bound
+     against grossly wrong projections; the post-pool margin is protected
+     by the pool sizing order itself.
 - Telemetry: registered bytes, PTE estimate, acquire/trim durations per
   window → server log (`kt-dma` prefix), so drift is visible in the
   existing log-mining flow.

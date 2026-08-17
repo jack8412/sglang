@@ -6892,6 +6892,9 @@ def maybe_run_expert_swap_window(
         "items": [],
         "prefetched": {},
         "export_rows": {},
+        # (layer_idx, demote_id) acquires taken by _begin_layer, provisional
+        # until that layer's tables flip; _on_layer_abort releases them.
+        "dma_acquired": [],
         # True while the staged items' "promoted" bytes came from the arena
         # source (checkpoint layout, no cold-store slot behind them). A batch
         # is never mixed: arena staging happens only when there is no store.
@@ -7188,6 +7191,7 @@ def maybe_run_expert_swap_window(
         """
         _pending["prefetched"] = {}
         _pending["export_rows"] = {}
+        _pending["dma_acquired"] = []
         filtered = None
         dma_src = _KT_SPLIT_PREFILL_STATE["direct_source"]
         if dma_src is not None and swaps:
@@ -7213,6 +7217,14 @@ def maybe_run_expert_swap_window(
                 swaps = [s for s, _ in kept]
                 rows = [r for _, r in kept]
                 filtered = (swaps, rows)
+            # The kept pairs' acquires are provisional until the tables flip:
+            # a layer that aborts after this point never flips, its demoted
+            # experts stay RESIDENT, and no future window would ever release
+            # them -- on_layer_abort reconciles via this stash, and
+            # _after_flip clears it once the flip commits the acquires.
+            _pending["dma_acquired"] = [
+                (entry["layer_idx"], int(s.demote)) for s in swaps
+            ]
         # Export-design promotions: ONE batched raw export of this layer's
         # promoted experts into stage 0 of every rank's cold ring. Every rank
         # calls this with the identical plan (rank 0 exports, peers wait the
@@ -7357,12 +7369,33 @@ def maybe_run_expert_swap_window(
         # Direct-DMA bookkeeping keyed to the FLIPPED table: each applied
         # pair's PROMOTED expert just left the cold set, so its page pins go
         # from live to trim-eligible. Releasing on the proposed plan instead
-        # would drop pins a skipped pair's still-cold expert needs.
+        # would drop pins a skipped pair's still-cold expert needs. The flip
+        # also COMMITS this layer's demotion acquires: clear the abort stash.
+        _pending["dma_acquired"] = []
         dma_src = _KT_SPLIT_PREFILL_STATE["direct_source"]
         if dma_src is None:
             return
         for s in swaps:
             dma_src.window_release(entry["layer_idx"], s.promote)
+
+    def _on_layer_abort(entry):
+        # The layer failed after _begin_layer: tables never flipped, its
+        # demoted experts stay resident, and nothing else would ever release
+        # the acquires _begin_layer took for them.
+        dma_src = _KT_SPLIT_PREFILL_STATE["direct_source"]
+        stash = _pending.get("dma_acquired") or []
+        _pending["dma_acquired"] = []
+        if dma_src is None:
+            return
+        for layer_idx, demote in stash:
+            dma_src.window_release(layer_idx, demote)
+        if stash:
+            logger.info(
+                "[kt-dma] layer %s abort: released %d provisional demotion "
+                "acquire(s)",
+                entry.get("layer_idx"),
+                len(stash),
+            )
 
     try:
         result = run_swap_window(
@@ -7372,6 +7405,7 @@ def maybe_run_expert_swap_window(
             begin_layer=_begin_layer,
             finish_layer=_flush_moves,
             after_flip=_after_flip,
+            on_layer_abort=_on_layer_abort,
             quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
         )
     finally:
@@ -7704,8 +7738,22 @@ def _register_split_prefill_layer(method, layer) -> None:
 
 
 def reset_split_prefill() -> None:
-    """Drop all split-prefill state (engine teardown / re-construction)."""
+    """Drop all split-prefill state (engine teardown / re-construction).
+
+    The sources own process-level resources (the export source's rings and
+    worker thread; the direct source's cudaHostRegister'd units and their
+    VRAM page tables) with no finalizers -- dropping the reference without
+    close() would leak them across an in-process engine reconstruction AND
+    make the next direct-DMA arm fail on already-registered pages.
+    """
     _KT_SPLIT_PREFILL_LAYERS.clear()
+    for key in ("export_source", "direct_source"):
+        src = _KT_SPLIT_PREFILL_STATE.get(key)
+        if src is not None:
+            try:
+                src.close()
+            except Exception:
+                logger.exception("[split-prefill] %s teardown failed", key)
     _KT_SPLIT_PREFILL_STATE["store"] = None
     _KT_SPLIT_PREFILL_STATE["pipeline"] = None
     _KT_SPLIT_PREFILL_STATE["export_source"] = None
@@ -7886,6 +7934,11 @@ def finalize_split_prefill(server_args) -> bool:
     layer_indices = [m.kt_config.layer_idx for m, _ in _KT_SPLIT_PREFILL_LAYERS]
     device = anchor_layer.w13_weight.device
 
+    # Bound BEFORE the try so the except handler can tear down whatever was
+    # built before the failure -- a raise after a successful direct-DMA build
+    # (e.g. the pipeline's device buffers OOMing) must not orphan ~110 GB of
+    # registrations and their VRAM page tables for the process lifetime.
+    store = source = pipeline = export_source = direct_source = None
     try:
         per_expert_shapes = {
             name: (tuple(getattr(anchor_layer, name).shape[1:]),
@@ -8098,6 +8151,15 @@ def finalize_split_prefill(server_args) -> bool:
             "[split-prefill] build failed; falling back to the margin-routed "
             "CPU path for every layer"
         )
+        # Release what the failed build already owns -- most importantly the
+        # direct source's registrar (pinned pages + VRAM page tables), which
+        # has no finalizer and would otherwise leak until process exit.
+        for _owned in (direct_source, export_source):
+            if _owned is not None:
+                try:
+                    _owned.close()
+                except Exception:
+                    logger.exception("[split-prefill] teardown after failed build")
         store = source = pipeline = export_source = direct_source = None
 
     # Arming is all-or-nothing ACROSS RANKS. The hot gate is rank-local, and a
