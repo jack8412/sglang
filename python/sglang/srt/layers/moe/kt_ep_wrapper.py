@@ -6873,11 +6873,21 @@ def maybe_run_expert_swap_window(
         # wrong (the per-layer all_reduces, then the pinned allocations); the
         # GPU flush measures 0.09 s per window on this node, so the remainder
         # is CPU-side and has to be attributed rather than guessed.
+        # The first cut of this breakdown left ~0.9 ms per swap outside every
+        # timer, so the spans below now tile the whole per-layer body: nothing
+        # in it is untimed, and "unattributed" in the log line is a real
+        # residue rather than a span nobody thought to measure.
         "select_s": 0.0,      # policy.select over 896 experts, per layer
+        "rows_s": 0.0,        # the demoted rows' l2g lookup, per swap
+        "begin_s": 0.0,       # begin_layer: rank-write capture + validate
+        "move_s": 0.0,        # move_weights (records the move), per swap
         "stage_s": 0.0,       # store.stage_row clones (read-before-overwrite)
         "flush_gpu_s": 0.0,   # gather + D2H + sync + scatter
         "flush_store_s": 0.0, # store.write_row of the demoted rows
-        "tables_s": 0.0,      # apply_swaps_to_tables + assert_consistent
+        "finish_s": 0.0,      # finish_layer: the staged flush
+        "apply_s": 0.0,       # apply_swaps_to_tables (4 tables + 3 H2D)
+        "tables_s": 0.0,      # assert_tables_consistent
+        "after_s": 0.0,       # after_flip bookkeeping
     }
     _window_t0 = time.perf_counter()
 
@@ -7664,18 +7674,22 @@ def maybe_run_expert_swap_window(
         # where a window's time goes is to guess, and two careful guesses
         # (the per-layer all_reduces; the pinned staging allocations) were
         # both wrong -- the GPU flush measures 0.09 s per window on this node.
+        _phases = (
+            "select_s", "rows_s", "begin_s", "move_s", "stage_s",
+            "flush_gpu_s", "flush_store_s", "finish_s", "apply_s",
+            "tables_s", "after_s",
+        )
+        _attributed = sum(_timing[k] for k in _phases)
         logger.info(
-            "[kt-swap] window %d elsewhere: select %.2fs + stage %.2fs + "
-            "flush_gpu %.2fs + flush_store %.2fs + tables %.2fs = %.2fs "
-            "attributed",
+            "[kt-swap] window %d elsewhere: %s = %.2fs attributed, "
+            "%.2fs unattributed",
             _KT_SWAP_STATE["windows"],
-            _timing["select_s"],
-            _timing["stage_s"],
-            _timing["flush_gpu_s"],
-            _timing["flush_store_s"],
-            _timing["tables_s"],
-            _timing["select_s"] + _timing["stage_s"] + _timing["flush_gpu_s"]
-            + _timing["flush_store_s"] + _timing["tables_s"],
+            " + ".join(f"{k[:-2]} {_timing[k]:.2f}s" for k in _phases),
+            _attributed,
+            (time.perf_counter() - _window_t0)
+            - _timing["read_s"]
+            - _timing["install_s"]
+            - _attributed,
         )
 
 

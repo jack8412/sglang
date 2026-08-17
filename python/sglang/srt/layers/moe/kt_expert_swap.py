@@ -120,28 +120,37 @@ def apply_swaps_to_tables(tables: SwapTables, swaps: List[ExpertSwap]) -> List[i
 def assert_tables_consistent(tables: SwapTables, num_gpu_experts: int) -> None:
     """Post-window invariant: every expert resident in exactly one place.
 
-    Cheap enough to run after every swap window, and worth it: the failure
-    mode of a desynced table is a silently wrong answer, not a crash.
+    Worth running after every window: the failure mode of a desynced table is a
+    silently wrong answer, not a crash.
+
+    Whole-tensor on purpose. Written the obvious way -- walk the resident ids in
+    python and ``.item()`` each table entry -- this is ~1,900 scalar extractions
+    per layer, and 92 layers per window measured at 1.75 s INSIDE the scheduler
+    against 0.17 s for the identical code standalone. Python-heavy loops pay for
+    every other thread in the process; whole-tensor ops do not. None of the four
+    invariants needs a python loop, so none of them has one. The per-expert
+    detail is recovered only on the failure path, where its cost cannot matter.
     """
     mask = tables.gpu_experts_mask
     l2g = tables.logical_to_gpu_index
     g2l = tables.gpu_index_to_logical
 
-    resident = torch.nonzero(mask, as_tuple=False).flatten().tolist()
-    if len(resident) != num_gpu_experts:
+    resident = mask.nonzero(as_tuple=False).flatten()
+    if resident.numel() != num_gpu_experts:
         raise AssertionError(
-            f"mask says {len(resident)} residents, expected {num_gpu_experts}"
+            f"mask says {resident.numel()} residents, expected {num_gpu_experts}"
         )
-    rows = sorted(int(l2g[e].item()) for e in resident)
-    if rows != list(range(num_gpu_experts)):
+    rows = l2g[resident].to(torch.int64)
+    if not torch.equal(rows.sort().values, torch.arange(num_gpu_experts)):
         raise AssertionError("resident rows are not a permutation of 0..N-1")
-    for e in resident:
-        row = int(l2g[e].item())
-        if int(g2l[row].item()) != e:
-            raise AssertionError(
-                f"round trip broken: expert {e} -> row {row} -> "
-                f"{int(g2l[row].item())}"
-            )
+    broken = (g2l[rows].to(torch.int64) != resident).nonzero().flatten()
+    if broken.numel():
+        i = int(broken[0].item())
+        expert, row = int(resident[i].item()), int(rows[i].item())
+        raise AssertionError(
+            f"round trip broken: expert {expert} -> row {row} -> "
+            f"{int(g2l[row].item())}"
+        )
     non_resident = (~mask).nonzero(as_tuple=False).flatten()
     if non_resident.numel() and int(l2g[non_resident].max().item()) >= 0:
         raise AssertionError("a non-resident expert still maps to a GPU row")
@@ -450,18 +459,27 @@ def run_swap_window(
         if not swaps:
             continue
         try:
+            _t = time.perf_counter()
             rows = [
                 int(tables.logical_to_gpu_index[s.demote].item()) for s in swaps
             ]
+            if phase_timer is not None:
+                phase_timer("rows_s", time.perf_counter() - _t)
             if begin_layer is not None:
+                _t = time.perf_counter()
                 filtered = begin_layer(entry, swaps, rows)
+                if phase_timer is not None:
+                    phase_timer("begin_s", time.perf_counter() - _t)
                 if filtered is not None:
                     swaps, rows = filtered
                     if not swaps:
                         skipped += 1
                         continue
             for s, row in zip(swaps, rows):
+                _t = time.perf_counter()
                 move_weights(entry["layer"], row, s.promote, s.demote)
+                if phase_timer is not None:
+                    phase_timer("move_s", time.perf_counter() - _t)
                 if install_cpu_expert is not None:
                     # BEFORE the tables flip: the demoted expert must not be
                     # routable on the CPU until its weights are actually
@@ -477,13 +495,20 @@ def run_swap_window(
                             f"{entry.get('layer_idx')}"
                         ) from exc
             if finish_layer is not None:
+                _t = time.perf_counter()
                 finish_layer()
+                if phase_timer is not None:
+                    phase_timer("finish_s", time.perf_counter() - _t)
             _t = time.perf_counter()
             apply_swaps_to_tables(tables, swaps)
+            if phase_timer is not None:
+                phase_timer("apply_s", time.perf_counter() - _t)
+            _t = time.perf_counter()
             assert_tables_consistent(tables, entry["num_gpu_experts"])
             if phase_timer is not None:
                 phase_timer("tables_s", time.perf_counter() - _t)
             if after_flip is not None:
+                _t = time.perf_counter()
                 try:
                     after_flip(entry, swaps)
                 except Exception:
@@ -492,6 +517,8 @@ def run_swap_window(
                         "(bookkeeping only; the swap itself completed)",
                         entry.get("layer_idx"),
                     )
+                if phase_timer is not None:
+                    phase_timer("after_s", time.perf_counter() - _t)
         except SwapInstallError:
             # Never absorbed: see SwapInstallError. Skipping here would leave
             # this rank's placement disagreeing with every other rank's.

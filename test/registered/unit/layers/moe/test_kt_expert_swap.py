@@ -275,6 +275,26 @@ class TestTableUpdate(CustomTestCase):
         with self.assertRaises(AssertionError):
             assert_tables_consistent(t, 4)
 
+    def test_invariant_catches_broken_round_trip(self):
+        """A desync that leaves the resident COUNT and the row PERMUTATION
+        intact, and disagrees only about which expert owns which row: l2g sends
+        2 -> row 2, but g2l says row 2 holds expert 3. That is the state in
+        which a token is computed against the wrong expert's weights.
+
+        Distinct from test_invariant_catches_desync, which trips the count
+        check and so never reaches the round trip. Red if the round-trip check
+        degrades to vacuously true -- the live failure mode when it is written
+        whole-tensor, where a dtype or indexing slip compares the wrong things
+        and passes everything."""
+        from sglang.srt.layers.moe.kt_expert_swap import assert_tables_consistent
+
+        t = _tables()
+        assert_tables_consistent(t, 4)  # consistent to begin with
+        t.gpu_index_to_logical[2] = 3
+        t.gpu_index_to_logical[3] = 2
+        with self.assertRaises(AssertionError):
+            assert_tables_consistent(t, 4)
+
 
 class TestSwapWindow(CustomTestCase):
     """Critical-path bookkeeping for the window driver. Red if weights stop
