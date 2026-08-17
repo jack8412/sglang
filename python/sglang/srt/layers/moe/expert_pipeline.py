@@ -440,6 +440,11 @@ class ColdExpertPipeline:
         for ev in self._consume_events:
             ev.record(cur)
 
+        # Toggleable per PASS, not fixed at boot: reset() re-reads the env, so
+        # `SGLANG_DEBUG_KT_PIPELINE_OVERLAP=1` exported into a running
+        # server's environment... cannot work cross-process -- but the env CAN
+        # be flipped via the /set_envs debug route or a config reload without
+        # a 17-minute reboot. Costing a boot per decomposition was the bug.
         self._probe = (
             _OverlapProbe(len(self._layers))
             if envs.SGLANG_DEBUG_KT_PIPELINE_OVERLAP.get()
@@ -584,6 +589,13 @@ class ColdExpertPipeline:
             if line is not None:
                 logger.info("%s", line)
         self._slot_layer = [None] * self.NUM_SLOTS
+        # Re-evaluate the probe toggle at every pass boundary so enabling the
+        # decomposition never costs a reboot.
+        want_probe = envs.SGLANG_DEBUG_KT_PIPELINE_OVERLAP.get()
+        if want_probe and self._probe is None:
+            self._probe = _OverlapProbe(len(self._layers))
+        elif not want_probe and self._probe is not None:
+            self._probe = None
         # Both streams are idle (synchronized above), so the source can drain
         # its gather threads without racing any in-flight DMA.
         self._store.reset()
