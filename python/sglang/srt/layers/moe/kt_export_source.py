@@ -262,17 +262,21 @@ class ExportColdSource:
 
     def _export_layer(self, gpos: int, layer_idx: int) -> None:
         stage = gpos % NUM_STAGE
-        # WAR: before overwriting a stage, its CURRENT occupant (whatever
-        # each ring's ready says -- occupant-based, so aborted passes and
-        # epoch jumps cannot wedge it) must have been consumed by that ring's
-        # rank. Negative occupants (empty, promotion tokens, poison) need no
-        # gate: promotion rows are cloned out before the window's next layer,
-        # and reset() acknowledges everything at pass boundaries.
+        # WAR: before overwriting a stage, its CURRENT occupant must have
+        # been consumed by that ring's rank -- UNLESS the occupant belongs to
+        # a previous epoch. Prior-epoch bytes can never be read again
+        # (consumers only wait on current-epoch positions), and gating on
+        # them wedged the first smoke: a lookahead export that finished after
+        # its pass ended left ready > consumed with nobody left to consume.
+        # Negative occupants (empty, promotion tokens, poison) need no gate
+        # either: promotion rows are cloned out before the window's next
+        # layer's export.
         deadline = time.monotonic() + _WAIT_TIMEOUT_S
+        gen_floor = (gpos // self._num_pos) * self._num_pos
         for r in self._peer_rings:
             while True:
                 cur = int(r.header[stage])
-                if cur < 0 or int(r.header[NUM_STAGE + stage]) >= cur:
+                if cur < gen_floor or int(r.header[NUM_STAGE + stage]) >= cur:
                     break
                 if time.monotonic() > deadline:
                     raise RuntimeError(
@@ -375,20 +379,16 @@ class ExportColdSource:
     def reset(self) -> None:
         """Pass boundary, called with both streams synchronized.
 
-        Folds pending H2D events, then ACKNOWLEDGES every ready value on this
-        rank's own ring (nothing from the finished/aborted pass will ever be
-        read again -- the streams are drained), so rank 0's occupant-based WAR
-        gate can never wedge on a stage an aborted pass exported but never
-        consumed. Finally bumps the pass epoch; every rank does this at the
-        same plan point, so epochs stay in lockstep with no communication.
+        Folds pending H2D events, then bumps the pass epoch; every rank does
+        this at the same plan point, so epochs stay in lockstep with no
+        communication. No acknowledgment of unconsumed ready values is needed
+        (or safe -- it raced in-flight lookahead exports): the WAR gate skips
+        prior-epoch occupants by construction.
         """
         for stage in range(NUM_STAGE):
             if self._stage_events[stage] is not None:
                 self._ring.header[NUM_STAGE + stage] = self._stage_pending[stage]
                 self._stage_events[stage] = None
-            cur = int(self._ring.header[stage])
-            if cur >= 0 and int(self._ring.header[NUM_STAGE + stage]) < cur:
-                self._ring.header[NUM_STAGE + stage] = cur
         self._pass_gen += 1
 
     def close(self) -> None:
