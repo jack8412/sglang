@@ -6796,6 +6796,7 @@ def maybe_run_expert_swap_window(
     from sglang.srt.layers.moe.kt_arena_share import arena_source_for
     from sglang.srt.layers.moe.kt_expert_swap import (
         ExpertSwapPolicy,
+        SwapInstallError,
         run_swap_window,
     )
 
@@ -7154,6 +7155,42 @@ def maybe_run_expert_swap_window(
         method = entry.get("method")
         if method is None or not method.kt_config.cold_only_cpu_experts:
             return
+
+        # RANK-WRITE PATH. Every rank writes its own slice of the demoted
+        # expert into kt's shared arena; rank 0 additionally does the
+        # bookkeeping move. Deliberately BEFORE the `wrapper is None` return:
+        # the peers have no kt wrapper and still must write, which is the
+        # whole point.
+        #
+        # The move and the writes need no ordering between them. kt's move
+        # only reassigns which expert id owns a BufferB -- it does not touch
+        # the bytes -- so a peer writing at the promoted expert's offset is
+        # writing exactly the address the demoted expert will own. The window
+        # is quiesced, so nothing reads either expert in between. The one
+        # ordering that matters (all writes land before serving resumes) is
+        # the window-end barrier.
+        writer = _KT_SWAP_STATE.get("rank_writer")
+        if writer is not None and _pending.get("rank_write"):
+            t0 = time.perf_counter()
+            ok = True
+            if method.wrapper is not None:
+                try:
+                    method.wrapper.move_expert_slot(promote_id, demote_id)
+                except Exception as exc:
+                    raise SwapInstallError(
+                        f"kt slot move failed for demote={demote_id} "
+                        f"promote={promote_id} on layer {entry.get('layer_idx')}"
+                    ) from exc
+            ok = writer.write(entry["layer_idx"], promote_id, demote_id)
+            _timing["install_s"] += time.perf_counter() - t0
+            if not ok:
+                raise SwapInstallError(
+                    f"rank-write demotion failed for demote={demote_id} on "
+                    f"layer {entry.get('layer_idx')}: the expert would hold a "
+                    "hole where this rank's slice belongs"
+                )
+            return
+
         if method.wrapper is None:
             return
         _verify_install_once(entry)
@@ -7267,12 +7304,46 @@ def maybe_run_expert_swap_window(
                 }
             _timing["read_s"] += time.perf_counter() - t0
         method = entry.get("method")
+
+        # RANK-WRITE DEMOTIONS. Capture this rank's own slice of every
+        # demoted expert BEFORE any move overwrites its GPU row -- purely
+        # local, no collective. Whether it worked then rides the SAME single
+        # per-layer collective below, so the layer is either rank-write on
+        # every rank or on none: a rank that silently skipped its write would
+        # leave a hole in the expert, which is wrong bytes rather than a
+        # crash.
+        _pending["rank_write"] = False
+        writer = _get_or_create_rank_writer(entry)
+        captured = False
+        if writer is not None and swaps:
+            t0 = time.perf_counter()
+            captured = writer.capture(
+                entry["layer"],
+                entry["layer_idx"],
+                rows,
+                [s.demote for s in swaps],
+            )
+            _timing["read_s"] += time.perf_counter() - t0
+
         want = (
             gpu_reader is not None
             and not _KT_SWAP_STATE.get("gpu_readback_off")
             and method is not None
             and method.kt_config.cold_only_cpu_experts
         )
+        if writer is not None:
+            # One collective per layer, still: the rank-write consensus
+            # REPLACES the gather consensus rather than adding to it (the
+            # two paths are alternatives, and the gather is not used when
+            # rank-write is armed).
+            _pending["rank_write"] = _all_tp_ranks_succeeded(captured)
+            if not _pending["rank_write"]:
+                logger.error(
+                    "[kt-rankwrite] layer %s: a rank could not capture its "
+                    "shard; the whole layer falls back to the checkpoint",
+                    entry.get("layer_idx"),
+                )
+            return filtered
         # NOT part of `want`: whether THIS rank has a kt wrapper to install
         # into. Only some ranks do, and gating the gather on it is what
         # deadlocked M9 and M11 -- rank 0 entered the collective alone and the
@@ -7413,6 +7484,18 @@ def maybe_run_expert_swap_window(
         # failed window would be applied during the NEXT one -- writing a stale
         # layer's rows, which is silent and unattributable.
         _flush_moves()
+        # Rank-write demotions: every rank's slices must have LANDED before
+        # serving resumes, or kt computes a demoted expert with another
+        # rank's hole still in it. The natural TP lockstep of the next
+        # forward would mostly cover it, but "mostly" is not a memory
+        # ordering -- one plan-independent barrier here costs ~1 ms and is
+        # symmetric on every path out of the window, including the raising
+        # one.
+        _rw = _KT_SWAP_STATE.get("rank_writer")
+        if _rw is not None:
+            if dist.is_initialized() and get_parallel().tp_size > 1:
+                dist.barrier(group=get_tp_group().cpu_group)
+            logger.info("%s", _rw.end_window())
         # Direct-DMA epilogue, still inside the quiesced window (the finally
         # covers a raising window too -- some layers may have flipped before
         # the failure, and serving must not resume on their stale plans):
@@ -7570,14 +7653,25 @@ class _GpuResidentExpertReader:
 
         Every row must still hold its DEMOTED occupant: call before any move.
         """
+        shards = self.read_own_shards(layer, dst_rows)
+        return self._gather_shards(shards, len(dst_rows))
+
+    def read_own_shards(self, layer, dst_rows):
+        """THIS RANK's unswizzled shards for ``dst_rows`` -- no collective.
+
+        The rank-write demotion path needs exactly this and nothing more: it
+        writes its own slice into kt's shared arena, so it never wants the
+        gathered full expert. Keeping it a separate method means the two
+        paths share one proven unswizzle and one shape cache, and the
+        collective lives only in the caller that actually needs it.
+
+        Every row must still hold its DEMOTED occupant: call before any move.
+        """
         from sglang.srt.layers.moe.kt_mxfp4_export import unswizzle_trtllm_expert
 
         inverse, w13_scale_shape, w2_scale_shape = self._prepare(layer)
         w13_n, w13_s_n, w2_n, w2_s_n = self.param_names
-
-        # The unswizzle is local work with no collective in it, so it stays
-        # per-expert; only the gathers are batched.
-        shards = [
+        return [
             unswizzle_trtllm_expert(
                 w13=getattr(layer, w13_n).data[r],
                 w13_scale=getattr(layer, w13_s_n).data[r],
@@ -7590,6 +7684,7 @@ class _GpuResidentExpertReader:
             for r in dst_rows
         ]
 
+    def _gather_shards(self, shards, n_rows: int):
         per = shards[0].w13.shape[0] // 2
         per_s = shards[0].w13_scale_e8m0.shape[0] // 2
         # (name, per-expert concat dim). Stacking prepends an expert axis, so
@@ -7605,7 +7700,7 @@ class _GpuResidentExpertReader:
         gathered = [
             self._all_gather_batched(torch.stack(parts), dim) for parts, dim in plan
         ]
-        return [tuple(g[i].contiguous() for g in gathered) for i in range(len(dst_rows))]
+        return [tuple(g[i].contiguous() for g in gathered) for i in range(n_rows)]
 
     def _all_gather_batched(self, stacked: torch.Tensor, dim: int) -> torch.Tensor:
         """Gather ``[experts, ...]`` shards from every rank; concat along ``dim``.
@@ -8692,6 +8787,76 @@ def _get_or_create_gpu_reader():
             logger.exception("[kt-swap] could not build the GPU expert reader")
             return None
     return reader
+
+
+def _get_or_create_rank_writer(entry):
+    """Process-wide rank-write demotion writer, or None (checkpoint path).
+
+    Built once, on the first layer of the first window that could use it.
+    Every precondition is uniform across ranks by construction -- the env
+    gate, the launch config, and whether kt exposes the slot move -- EXCEPT
+    the arena mapping, which `kt_arena_share` degrades per rank by design.
+    That last one is why the caller folds the outcome into the per-layer
+    consensus instead of trusting this to agree.
+    """
+    if "rank_writer" in _KT_SWAP_STATE:
+        return _KT_SWAP_STATE["rank_writer"]
+
+    writer = None
+    try:
+        method = entry.get("method")
+        if (
+            envs.SGLANG_KT_DEMOTION_RANK_WRITE.get()
+            and method is not None
+            and method.kt_config.cold_only_cpu_experts
+        ):
+            from sglang.srt.layers.moe.kt_arena_share import arena_source_for
+            from sglang.srt.layers.moe.kt_demotion_writer import (
+                RankShardWriter,
+                SlotOffsets,
+            )
+            from sglang.srt.layers.moe.kt_direct_dma import ArenaExpertRanges
+
+            layers = [m.kt_config.layer_idx for m in _KT_EP_METHODS]
+            sources = {li: arena_source_for(li) for li in layers}
+            missing = [li for li, s in sources.items() if s is None]
+            if missing:
+                raise RuntimeError(
+                    f"no arena mapping for {len(missing)} layer(s) "
+                    f"(first {missing[0]}) -- is KT_BUFFER_B_MEMFD=1 set?"
+                )
+            geom = ArenaExpertRanges(next(iter(sources.values())))
+            writer = RankShardWriter(
+                arena_by_layer={
+                    li: s._arenas[geom.part] for li, s in sources.items()
+                },
+                offsets_by_layer={
+                    li: SlotOffsets(
+                        s._rows, experts=s.experts, part=geom.part
+                    )
+                    for li, s in sources.items()
+                },
+                geometry=geom,
+                shard_reader=_GpuResidentExpertReader(
+                    _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+                ),
+            )
+            logger.info(
+                "[kt-rankwrite] armed on %d layers: this rank writes its own "
+                "slice (partition %d, local rank %d) of every demoted expert "
+                "-- no gather, no checkpoint read",
+                len(sources),
+                geom.part,
+                geom.local_rank,
+            )
+    except Exception:
+        logger.exception(
+            "[kt-rankwrite] could not arm; demotions keep the checkpoint path"
+        )
+        writer = None
+
+    _KT_SWAP_STATE["rank_writer"] = writer
+    return writer
 
 
 def _get_or_create_expert_mover(anchor):

@@ -1387,6 +1387,15 @@ class Envs:
     # which is identical on every rank. Still opt-in until measured against the
     # checkpoint path on a live server.
     SGLANG_KT_SWAP_GPU_READBACK = EnvBool(False)
+    # Rank-write demotions: instead of one process materializing each demoted
+    # expert (12.9 GB off the checkpoint at 0.45 GB/s, measured 28.8 s per
+    # window; or an all-gather that deadlocked three builds), every rank maps
+    # kt's memfd BufferB arena and writes its OWN disjoint slice -- gate/up
+    # contiguous at its row offset, down strided at its column offset. No
+    # collective, no disk, ~1.6 GB per rank in parallel. Requires
+    # KT_BUFFER_B_MEMFD=1 and cold-only residency (with full kt residency a
+    # demotion is already a nop). Falls back per layer to the checkpoint path.
+    SGLANG_KT_DEMOTION_RANK_WRITE = EnvBool(False)
     # Minimum free VRAM (GiB) a rank must still have, after the projected
     # page-table cost (8 B per 4K page, measured exact on dense ranges),
     # before the direct-DMA cold transport is allowed to arm. NOTE the

@@ -59,6 +59,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 # (layer_idx, n_fds, meta_len), little-endian int64s.
@@ -371,7 +373,9 @@ def _receive_layer(*, method, layer_idx: int, tp_rank: int, tp_size: int) -> Non
         # that mode and only in that mode; nothing ever writes by
         # construction.
         prot = mmap.PROT_READ
-        if method.kt_config.cold_transport == "direct-dma":
+        if method.kt_config.cold_transport == "direct-dma" or (
+            envs.SGLANG_KT_DEMOTION_RANK_WRITE.get()
+        ):
             prot |= mmap.PROT_WRITE
         arenas = []
         for fd, size in zip(fds, meta["sizes"]):
@@ -413,12 +417,21 @@ def share_layer_arenas(*, method) -> None:
     tp_rank = get_parallel().tp_rank
     tp_size = get_parallel().tp_size
 
-    # Cold-only residency is arena-incompatible BY CONTRACT: swap_expert_slot
-    # moves BufferB ownership between expert ids, so load-time offsets go
-    # permanently stale after the first acting window and raw_shard would
-    # serve the previous occupant's bytes. kt_config is identical on every
-    # rank, so this return is symmetric and nobody enters the broadcast.
-    if method.kt_config.cold_only_cpu_experts:
+    # Cold-only residency makes the arena's load-time offsets go stale the
+    # moment a swap moves BufferB ownership between expert ids, so the READ
+    # path (raw_shard -> promotions) would serve the previous occupant's
+    # bytes. That is why sharing is refused here by default.
+    #
+    # The rank-write demotion path is the exception, and it is safe for the
+    # opposite reason: it does not read through these sources at all. It
+    # WRITES, through its own SlotOffsets table that replays every move --
+    # plan data, identical on every rank -- so staleness is tracked rather
+    # than assumed away. kt_config and the env gate are identical on every
+    # rank, so this branch is symmetric and nobody enters the broadcast
+    # alone.
+    if method.kt_config.cold_only_cpu_experts and not (
+        envs.SGLANG_KT_DEMOTION_RANK_WRITE.get()
+    ):
         if not _STATE.get("warned_cold_only"):
             _STATE["warned_cold_only"] = True
             logger.info(
