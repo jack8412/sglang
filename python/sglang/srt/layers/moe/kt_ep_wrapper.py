@@ -6875,6 +6875,23 @@ def maybe_run_expert_swap_window(
         e["layer_idx"]: e["method"]._kt_physical_to_logical for e in entries
     }
 
+    # RANK-WRITE ARMING IS DECIDED ONCE PER WINDOW, SYMMETRICALLY. The writer
+    # itself is per-rank fallible -- kt_arena_share degrades a rank that could
+    # not map the arena, by design -- so gating anything directly on "do I
+    # have a writer" splits the ranks, which is precisely the M9/M11/M12
+    # failure class. One MIN all_reduce here, on a call every rank reaches
+    # (entries and act are plan data), and every later branch keys off the
+    # result instead: the barrier, the per-layer capture, and the install.
+    _rank_writer = _get_or_create_rank_writer(entries[0])
+    _KT_SWAP_STATE["rank_write_armed"] = _all_tp_ranks_succeeded(
+        _rank_writer is not None
+    )
+    if _rank_writer is not None and not _KT_SWAP_STATE["rank_write_armed"]:
+        logger.error(
+            "[kt-rankwrite] disarmed for this window: another rank has no "
+            "arena mapping; every rank takes the checkpoint path"
+        )
+
     # Arena promotion (full-kt + KT_BUFFER_B_MEMFD): promoted bytes come from
     # this rank's read-only mapping of kt's own buffers instead of the
     # checkpoint. The batched swizzle plan it feeds is armed lazily here
@@ -7172,26 +7189,41 @@ def maybe_run_expert_swap_window(
         writer = _KT_SWAP_STATE.get("rank_writer")
         if writer is not None and _pending.get("rank_write"):
             t0 = time.perf_counter()
-            ok = True
-            if method.wrapper is not None:
-                try:
-                    method.wrapper.move_expert_slot(promote_id, demote_id)
-                except Exception as exc:
-                    raise SwapInstallError(
-                        f"kt slot move failed for demote={demote_id} "
-                        f"promote={promote_id} on layer {entry.get('layer_idx')}"
-                    ) from exc
+            # WRITE FIRST, MOVE SECOND. The bytes land at the promoted
+            # expert's offsets either way -- kt's move reassigns ownership,
+            # not addresses -- so this ordering costs nothing and makes the
+            # move the commit point: a failed write leaves kt untouched,
+            # where moving first left the slot moved and unrecoverable.
             ok = writer.write(entry["layer_idx"], promote_id, demote_id)
-            _timing["install_s"] += time.perf_counter() - t0
             if not ok:
+                _timing["install_s"] += time.perf_counter() - t0
                 raise SwapInstallError(
                     f"rank-write demotion failed for demote={demote_id} on "
                     f"layer {entry.get('layer_idx')}: the expert would hold a "
                     "hole where this rank's slice belongs"
                 )
+            if method.wrapper is not None:
+                try:
+                    method.wrapper.move_expert_slot(promote_id, demote_id)
+                except Exception as exc:
+                    _timing["install_s"] += time.perf_counter() - t0
+                    raise SwapInstallError(
+                        f"kt slot move failed for demote={demote_id} "
+                        f"promote={promote_id} on layer {entry.get('layer_idx')}"
+                    ) from exc
+            # Every rank mirrors the move kt just made, wrapper or not: the
+            # arena is shared, so a rank that misses one is silently a swap
+            # behind for the rest of the process's life.
+            writer.commit_move(entry["layer_idx"], promote_id, demote_id)
+            _timing["install_s"] += time.perf_counter() - t0
             return
 
+        # CHECKPOINT PATH. It also moves kt's slot (swap_expert_slot routes
+        # through the same move_slot_only), so a writer that exists but is
+        # not driving this layer STILL has to mirror the move.
         if method.wrapper is None:
+            if writer is not None:
+                writer.commit_move(entry["layer_idx"], promote_id, demote_id)
             return
         _verify_install_once(entry)
         t0 = time.perf_counter()
@@ -7200,6 +7232,8 @@ def maybe_run_expert_swap_window(
         method.wrapper.swap_expert_slot(
             promote_id, demote_id, *[t.data_ptr() for t in tensors]
         )
+        if writer is not None:
+            writer.commit_move(entry["layer_idx"], promote_id, demote_id)
         # Timed separately on purpose. The split between "fetching the bytes"
         # and "handing them to kt" was previously inferred by subtracting an
         # ESTIMATED disk rate from the measured window, which is guesswork
@@ -7313,7 +7347,11 @@ def maybe_run_expert_swap_window(
         # leave a hole in the expert, which is wrong bytes rather than a
         # crash.
         _pending["rank_write"] = False
-        writer = _get_or_create_rank_writer(entry)
+        # The WINDOW-scoped consensus, not this rank's writer: every rank
+        # takes the same branch here, so the collective counts below match
+        # even when one rank could not map the arena.
+        armed = bool(_KT_SWAP_STATE.get("rank_write_armed"))
+        writer = _KT_SWAP_STATE.get("rank_writer") if armed else None
         captured = False
         if writer is not None and swaps:
             t0 = time.perf_counter()
@@ -7331,11 +7369,14 @@ def maybe_run_expert_swap_window(
             and method is not None
             and method.kt_config.cold_only_cpu_experts
         )
-        if writer is not None:
+        if armed:
             # One collective per layer, still: the rank-write consensus
             # REPLACES the gather consensus rather than adding to it (the
             # two paths are alternatives, and the gather is not used when
-            # rank-write is armed).
+            # rank-write is armed). Keyed to the WINDOW consensus, so all
+            # eight ranks are in this branch or none are -- a rank taking
+            # the other branch would enter read_full_experts' all-gathers
+            # alone, which is M11 exactly.
             _pending["rank_write"] = _all_tp_ranks_succeeded(captured)
             if not _pending["rank_write"]:
                 logger.error(
@@ -7491,10 +7532,14 @@ def maybe_run_expert_swap_window(
         # ordering -- one plan-independent barrier here costs ~1 ms and is
         # symmetric on every path out of the window, including the raising
         # one.
+        # Keyed to the WINDOW consensus, never to this rank's writer: a
+        # barrier some ranks skip is a hang, and the writer is the one
+        # precondition that is per-rank fallible.
         _rw = _KT_SWAP_STATE.get("rank_writer")
-        if _rw is not None:
+        if _KT_SWAP_STATE.get("rank_write_armed"):
             if dist.is_initialized() and get_parallel().tp_size > 1:
                 dist.barrier(group=get_tp_group().cpu_group)
+        if _rw is not None:
             # After the barrier, so every rank's slice is in: this is the only
             # point where an expert this path built is complete and readable.
             _verify_rank_write_once(entries, _rw, mover)
@@ -8874,7 +8919,9 @@ def _get_or_create_rank_writer(entry):
             and method is not None
             and method.kt_config.cold_only_cpu_experts
         ):
-            from sglang.srt.layers.moe.kt_arena_share import arena_source_for
+            from sglang.srt.layers.moe.kt_arena_share import (
+                arena_write_source_for,
+            )
             from sglang.srt.layers.moe.kt_demotion_writer import (
                 RankShardWriter,
                 SlotOffsets,
@@ -8882,7 +8929,10 @@ def _get_or_create_rank_writer(entry):
             from sglang.srt.layers.moe.kt_direct_dma import ArenaExpertRanges
 
             layers = [m.kt_config.layer_idx for m in _KT_EP_METHODS]
-            sources = {li: arena_source_for(li) for li in layers}
+            # The WRITE registry: under cold-only the read one stays empty by
+            # design, and borrowing from it would hand the promotion path
+            # offsets that go stale at the first swap.
+            sources = {li: arena_write_source_for(li) for li in layers}
             missing = [li for li, s in sources.items() if s is None]
             if missing:
                 raise RuntimeError(

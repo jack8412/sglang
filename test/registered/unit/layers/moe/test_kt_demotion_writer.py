@@ -258,6 +258,84 @@ class TestEightRanksReconstructTheExpert(unittest.TestCase):
                     f"expert {other}'s buffers",
                 )
 
+    def test_write_does_not_move_the_slot_and_commit_does(self):
+        """Write-before-move: a failed write must leave kt's ownership alone.
+
+        The first cut moved the slot first, so a write that failed left the
+        promoted entry nulled and unrecoverable (move_slot_only cannot be
+        undone). The write now targets the PROMOTED expert's offsets -- the
+        same bytes -- and commit_move is the commit point.
+        """
+        full = _full_expert(seed=7)
+        rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1, 2})
+        geom = _Geom(0)
+        offsets = SlotOffsets(rows, experts=EXPERTS, part=0)
+        writer = RankShardWriter(
+            arena_by_layer={7: torch.zeros(EXPERTS * PER_EXPERT, dtype=torch.uint8)},
+            offsets_by_layer={7: offsets},
+            geometry=geom,
+            shard_reader=_FakeReader({0: _rank_shard(full, 0)}),
+        )
+        writer.capture(object(), 7, [0], [4])
+        before = offsets.get(1)
+        self.assertTrue(writer.write(7, 1, 4))
+        # write() alone must not have transferred ownership
+        self.assertEqual(offsets.get(1), before)
+        self.assertIsNone(offsets.get(4))
+        writer.commit_move(7, 1, 4)
+        self.assertEqual(offsets.get(4), before)
+        self.assertIsNone(offsets.get(1))
+
+    def test_failed_write_leaves_the_table_untouched(self):
+        rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1, 2})
+        offsets = SlotOffsets(rows, experts=EXPERTS, part=0)
+        writer = RankShardWriter(
+            arena_by_layer={7: torch.zeros(EXPERTS * PER_EXPERT, dtype=torch.uint8)},
+            offsets_by_layer={7: offsets},
+            geometry=_Geom(0),
+            shard_reader=_FakeReader({}),
+        )
+        # nothing captured for this expert -> write refuses
+        self.assertFalse(writer.write(7, 1, 4))
+        self.assertIsNotNone(offsets.get(1))
+        self.assertIsNone(offsets.get(4))
+
+    def test_a_fallback_move_must_be_committed_or_later_writes_corrupt(self):
+        """The checkpoint fallback moves kt's slot too.
+
+        If a rank misses that move, its table is one swap behind forever and
+        the NEXT write lands in whatever expert now owns those bytes. Here:
+        window 1 installs 1->4 by the fallback (bookkeeping only), window 2
+        rank-writes 2->5. With the commit, the bytes land in expert 2's
+        buffer; without it the table would still think expert 1 is available
+        and the offsets would disagree with kt.
+        """
+        full = _full_expert(seed=11)
+        rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1, 2})
+        arena = torch.zeros(EXPERTS * PER_EXPERT, dtype=torch.uint8)
+        offsets = SlotOffsets(rows, experts=EXPERTS, part=0)
+        writer = RankShardWriter(
+            arena_by_layer={7: arena},
+            offsets_by_layer={7: offsets},
+            geometry=_Geom(0),
+            shard_reader=_FakeReader({0: _rank_shard(full, 0)}),
+        )
+        # window 1: checkpoint fallback installed 1 -> 4; only bookkeeping here
+        writer.commit_move(7, 1, 4)
+        self.assertIsNone(offsets.get(1))
+        self.assertIsNotNone(offsets.get(4))
+
+        # window 2: rank-write 2 -> 5 must use expert 2's buffer
+        writer.capture(object(), 7, [0], [5])
+        expected_base = offsets.get(2)
+        self.assertTrue(writer.write(7, 2, 5))
+        writer.commit_move(7, 2, 5)
+        self.assertEqual(offsets.get(5), expected_base)
+        want = _kt_reference(full, part=0)["gate"]
+        got = arena[expected_base[0] : expected_base[0] + want.numel()]
+        # only rank 0's slice was written, so compare just that span
+        self.assertTrue(torch.equal(got[: GU_W], want[: GU_W]))
+
     def test_a_missing_rank_leaves_a_detectable_hole(self):
         """Sanity on the test itself: if one rank skips, it must NOT pass."""
         full = _full_expert(seed=99)

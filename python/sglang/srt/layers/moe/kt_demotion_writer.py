@@ -177,7 +177,17 @@ class RankShardWriter:
     # -- step 3: write, after kt has moved the slot ------------------------
 
     def write(self, layer_idx: int, promote_id: int, demote_id: int) -> bool:
-        """Write this rank's slice of ``demote_id`` into the moved buffers."""
+        """Write this rank's slice of ``demote_id`` into the buffers it is about
+        to inherit -- BEFORE anything moves.
+
+        The target address is the same either way: kt's move reassigns which
+        expert id owns a BufferB, not where it lives, so writing at the
+        PROMOTED expert's offsets writes exactly the bytes the demoted expert
+        will own. Doing it in this order is what makes the move the commit
+        point -- a failed write leaves kt's ownership untouched, where the
+        first cut left the slot already moved and irrecoverable (move_slot_only
+        nulls the promoted entry, so it cannot be moved back).
+        """
         if self._staged_layer != layer_idx:
             return False
         shard = self._staged.get(int(demote_id))
@@ -186,8 +196,17 @@ class RankShardWriter:
         t0 = time.perf_counter()
         try:
             offsets = self._offsets[layer_idx]
-            offsets.apply_move(int(promote_id), int(demote_id))
-            row = offsets.get(int(demote_id))
+            row = offsets.get(int(promote_id))
+            if row is None:
+                raise RuntimeError(
+                    f"promoted expert {promote_id} holds no buffer in this "
+                    f"partition's arena (layer {layer_idx})"
+                )
+            if offsets.get(int(demote_id)) is not None:
+                raise RuntimeError(
+                    f"demoted expert {demote_id} already holds a buffer "
+                    f"(layer {layer_idx})"
+                )
             arena = self._arena[layer_idx]
             g = self._g
             lr = g.local_rank
@@ -225,6 +244,20 @@ class RankShardWriter:
         self.written += 1
         self.last_installed = (int(layer_idx), int(demote_id))
         return True
+
+    def commit_move(self, layer_idx: int, promote_id: int, demote_id: int) -> None:
+        """Mirror kt's slot move in this rank's offset table.
+
+        MUST be called on EVERY rank whenever kt's ownership actually moved,
+        by ANY path -- the rank-write install, and equally the checkpoint
+        fallback, whose ``swap_expert_slot`` also routes through
+        ``move_slot_only``. kt's state is global to the arena that every rank
+        maps, so a rank that misses one move has a table that is silently one
+        swap behind, and every later write lands in another expert's buffer.
+        Local bookkeeping only, driven by plan data, so it stays identical
+        across ranks without communication.
+        """
+        self._offsets[layer_idx].apply_move(int(promote_id), int(demote_id))
 
     def end_window(self) -> str:
         line = (
