@@ -130,6 +130,10 @@ class RankShardWriter:
         self.capture_s = 0.0
         self.write_s = 0.0
         self.written = 0
+        # (layer_idx, expert_id) of the most recent completed write, so the
+        # window can point kt's bitwise verifier at something this path
+        # actually produced.
+        self.last_installed: Optional[Tuple[int, int]] = None
 
     # -- step 1: capture, before any GPU row is overwritten ----------------
 
@@ -219,6 +223,7 @@ class RankShardWriter:
         finally:
             self.write_s += time.perf_counter() - t0
         self.written += 1
+        self.last_installed = (int(layer_idx), int(demote_id))
         return True
 
     def end_window(self) -> str:

@@ -7495,6 +7495,9 @@ def maybe_run_expert_swap_window(
         if _rw is not None:
             if dist.is_initialized() and get_parallel().tp_size > 1:
                 dist.barrier(group=get_tp_group().cpu_group)
+            # After the barrier, so every rank's slice is in: this is the only
+            # point where an expert this path built is complete and readable.
+            _verify_rank_write_once(entries, _rw, mover)
             logger.info("%s", _rw.end_window())
         # Direct-DMA epilogue, still inside the quiesced window (the finally
         # covers a raising window too -- some layers may have flipped before
@@ -8787,6 +8790,67 @@ def _get_or_create_gpu_reader():
             logger.exception("[kt-swap] could not build the GPU expert reader")
             return None
     return reader
+
+
+def _verify_rank_write_once(entries, writer, mover) -> None:
+    """SGLANG_KT_VERIFY_CPU_INSTALL=1: prove a rank-written expert bitwise.
+
+    THE gate for this path. Eight ranks each wrote a disjoint slice of an
+    expert directly into kt's buffers; every way that can be wrong -- a
+    partition off by one, a rank's rows landing at another rank's offset, a
+    strip written at the wrong pitch -- produces a valid-looking expert
+    holding wrong weights, which nothing downstream fails on. kt's own
+    verifier rebuilds the expert from the CHECKPOINT through the same
+    fill_expert_buffers the old install used and compares every NUMA
+    partition byte for byte, so it answers exactly the question the unit
+    tests answer in simulation, on the real thing.
+
+    Once per process, one expert, after the window's barrier. Rank 0 only --
+    it owns kt -- and read-only with respect to serving state.
+    """
+    import os
+
+    if os.environ.get("SGLANG_KT_VERIFY_CPU_INSTALL") != "1":
+        return
+    if _KT_SWAP_STATE.get("rank_write_verified"):
+        return
+    if writer.last_installed is None or mover is None:
+        return
+    layer_idx, expert_id = writer.last_installed
+    entry = next(
+        (e for e in entries if e.get("layer_idx") == layer_idx), None
+    )
+    if entry is None:
+        return
+    method = entry.get("method")
+    if method is None or method.wrapper is None:
+        return  # peers hold no kt engine to verify against
+    _KT_SWAP_STATE["rank_write_verified"] = True
+    try:
+        tensors = mover.read_full_expert(
+            entry["layer"], _checkpoint_id(method._kt_physical_to_logical, expert_id)
+        )
+        ok = method.wrapper.verify_install_against_loaded(
+            expert_id, *[t.data_ptr() for t in tensors]
+        )
+    except Exception:
+        logger.exception("[kt-rankwrite] the bitwise check itself failed")
+        return
+    if ok:
+        logger.info(
+            "[kt-rankwrite] expert %d (layer %d): the eight ranks' writes "
+            "BITWISE-MATCH the checkpoint on every NUMA partition",
+            expert_id,
+            layer_idx,
+        )
+    else:
+        logger.error(
+            "[kt-rankwrite] expert %d (layer %d): DIFFERS from the checkpoint "
+            "-- demoted experts are being given wrong weights; set "
+            "SGLANG_KT_DEMOTION_RANK_WRITE=0 and re-check the offset math",
+            expert_id,
+            layer_idx,
+        )
 
 
 def _get_or_create_rank_writer(entry):
