@@ -6757,7 +6757,11 @@ def maybe_run_expert_swap_at_decode_boundary(is_decode: bool, is_extend: bool) -
     try:
         maybe_run_expert_swap_window(anchor, force=True, act=(n > 1 and n % every == 0))
     except Exception:
-        logger.exception("[kt-swap] boundary window failed; serving continues")
+        # NOT swallowed any more. "Serving continues" was the wrong policy: a
+        # window that failed part-way has already moved kt's ownership and
+        # staged GPU rows whose tables never flipped, so continuing serves
+        # wrong experts silently and forever.
+        _fatal_swap_failure("the prefill->decode boundary window raised")
 
 
 def maybe_run_expert_swap_window(
@@ -7223,10 +7227,11 @@ def maybe_run_expert_swap_window(
             # behind for the rest of the process's life.
             writer.commit_move(entry["layer_idx"], promote_id, demote_id)
             if not writer.write(entry["layer_idx"], promote_id, demote_id):
-                raise SwapInstallError(
-                    f"rank-write demotion refused AFTER validation for "
-                    f"demote={demote_id} on layer {entry.get('layer_idx')} -- "
-                    "this is a bug in validate(), not a runtime condition"
+                # kt's slot has already moved; there is no state to return to.
+                _fatal_swap_failure(
+                    f"rank-write refused AFTER validation for demote="
+                    f"{demote_id} on layer {entry.get('layer_idx')} -- a bug "
+                    "in validate(), and kt's ownership has already moved"
                 )
             _timing["install_s"] += time.perf_counter() - t0
             return
@@ -7374,21 +7379,26 @@ def maybe_run_expert_swap_window(
                 rows,
                 [s.demote for s in swaps],
             )
-            if captured:
-                # Every refusal, checked while everything is still undone.
-                # After this the install performs an IRREVERSIBLE kt move, so
-                # nothing fallible may remain -- and the outcome rides the one
-                # consensus below, making the verdict unanimous instead of
-                # per-rank.
-                why = writer.validate(entry["layer_idx"], swaps)
-                if why is not None:
-                    logger.error(
-                        "[kt-rankwrite] layer %s not installable (%s); this "
-                        "layer falls back to the checkpoint on every rank",
-                        entry.get("layer_idx"),
-                        why,
-                    )
-                    captured = False
+            if not captured:
+                _fatal_swap_failure(
+                    f"rank-write capture failed on layer {entry.get('layer_idx')}"
+                )
+            # Every refusal, checked while everything is still undone: after
+            # this the install performs an IRREVERSIBLE kt move.
+            #
+            # A refusal is FATAL, not a fallback. can_move mirrors kt's own
+            # preconditions exactly, so refusing means this rank's table and
+            # kt genuinely disagree -- and the "fallback" would hand that same
+            # pair to swap_expert_slot, whose C++ re-checks the identical
+            # conditions and throws on a worker thread with no handler, i.e.
+            # std::terminate. Proving a pair illegal and then giving it to kt
+            # anyway is strictly worse than stopping here.
+            why = writer.validate(entry["layer_idx"], swaps)
+            if why is not None:
+                _fatal_swap_failure(
+                    f"layer {entry.get('layer_idx')} not installable ({why}): "
+                    "this rank's offset table and kt disagree"
+                )
             _timing["read_s"] += time.perf_counter() - t0
 
         want = (
@@ -7398,20 +7408,14 @@ def maybe_run_expert_swap_window(
             and method.kt_config.cold_only_cpu_experts
         )
         if armed:
-            # One collective per layer, still: the rank-write consensus
-            # REPLACES the gather consensus rather than adding to it (the
-            # two paths are alternatives, and the gather is not used when
-            # rank-write is armed). Keyed to the WINDOW consensus, so all
-            # eight ranks are in this branch or none are -- a rank taking
-            # the other branch would enter read_full_experts' all-gathers
-            # alone, which is M11 exactly.
-            _pending["rank_write"] = _all_tp_ranks_succeeded(captured)
-            if not _pending["rank_write"]:
-                logger.error(
-                    "[kt-rankwrite] layer %s: a rank could not capture its "
-                    "shard; the whole layer falls back to the checkpoint",
-                    entry.get("layer_idx"),
-                )
+            # NO per-layer consensus here any more, and none is needed: under
+            # the fail-fast policy a rank that could not capture or validate
+            # has already terminated every rank, so there is no surviving
+            # disagreement to reconcile. Removing it also removes a
+            # collective, which is the resource these rounds kept
+            # desynchronising. `armed` is the window-scoped consensus, so all
+            # eight ranks take this branch or none do.
+            _pending["rank_write"] = True
             return filtered
         # NOT part of `want`: whether THIS rank has a kt wrapper to install
         # into. Only some ranks do, and gating the gather on it is what
@@ -8874,6 +8878,64 @@ def _get_or_create_gpu_reader():
             logger.exception("[kt-swap] could not build the GPU expert reader")
             return None
     return reader
+
+
+def _fatal_swap_failure(context: str) -> None:
+    """A swap window failed: take the whole server down. Never returns.
+
+    POLICY (user decision, 2026-08-17): do not recover, do not verify, do not
+    continue serving -- terminate and let the process be restarted.
+
+    It is the only sound response, and four review rounds converged on why.
+    A window mutates three things that must agree: kt's BufferB ownership,
+    the resident GPU rows, and the routing tables. They are committed at
+    different points, by different ranks, and the pieces cannot be unwound --
+    ``move_slot_only`` nulls the promoted entry with no inverse, and a kt-side
+    throw runs on a CPUInfer worker with no handler, so it is std::terminate
+    anyway. Every alternative was tried and each was worse:
+
+      * skip the layer and keep serving (the old behaviour) -- the window-end
+        drain then flushes that layer's STAGED promotions into rows whose
+        tables never flipped: silent wrong weights, indefinitely;
+      * raise on one rank -- seven peers keep issuing per-layer collectives
+        while it leaves for the barrier: the M9/M11/M12 hang;
+      * agree on an abort first -- the consensus itself became a collective a
+        rank could skip, and the state it "recovered" to still had kt's slot
+        moved under unflipped tables.
+
+    Killing every rank makes all of that unreachable: a dead server serves no
+    tokens, and the next boot rebuilds kt's ownership from the checkpoint,
+    which is the only state that is trustworthy by construction. Failures
+    here have never been observed (99 windows, ~65k swaps, 0 skipped), so
+    this trades an unmeasurable availability cost for the removal of a silent
+    corruption class.
+    """
+    import os
+
+    from sglang.srt.utils import kill_process_tree
+
+    logger.critical(
+        "[kt-swap] FATAL: %s -- terminating every rank. The swap window's "
+        "partial state (kt ownership moved, rows staged, tables unflipped) "
+        "cannot be reconciled in-process; restart to rebuild it from the "
+        "checkpoint.",
+        context,
+        exc_info=True,
+    )
+    for handler in list(logging.getLogger().handlers) + list(logger.handlers):
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    # The whole server, not just this rank: the ranks are siblings under the
+    # launcher, so killing the tree from here stops peers before they can
+    # block on a collective this rank will never reach (the watchdog is set
+    # to 3600 s -- far too long to be the thing that notices).
+    try:
+        kill_process_tree(os.getppid())
+    except Exception:
+        logger.exception("[kt-swap] could not kill the process tree")
+    os._exit(70)  # EX_SOFTWARE, in case the tree kill missed us
 
 
 def _verify_rank_write_once(entries, writer, mover) -> None:

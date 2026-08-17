@@ -494,13 +494,21 @@ def run_swap_window(
                     logger.exception("[kt-swap] on_layer_abort failed")
             raise
         except Exception:
-            # A layer that fails mid-window is left as it was found: weights
-            # may have been written but the tables were not flipped, so the
-            # rewritten row is still advertised as its previous occupant and
-            # nothing routes to it. Skipping is therefore safe, while raising
-            # would take down a live server for a cache-tuning operation.
+            # RAISES NOW. The old comment claimed "a layer that fails
+            # mid-window is left as it was found" and skipped it -- that was
+            # false in two ways, both confirmed by review:
+            #   * move_weights only RECORDS; the staged promotions are applied
+            #     by the window-end drain regardless, writing them into rows
+            #     whose tables were never flipped;
+            #   * under cold-only the install has already moved kt's BufferB
+            #     ownership for the pairs it got through, and that has no
+            #     inverse.
+            # So the layer is NOT left as it was found, and skipping keeps a
+            # server running on a placement that no longer describes reality.
+            # The caller terminates the process instead.
             logger.exception(
-                "[kt-swap] layer %s: swap window failed, layer left unchanged",
+                "[kt-swap] layer %s: swap window failed; the window cannot be "
+                "left partially applied, so this propagates",
                 entry.get("layer_idx"),
             )
             if on_layer_abort is not None:
@@ -508,8 +516,7 @@ def run_swap_window(
                     on_layer_abort(entry)
                 except Exception:
                     logger.exception("[kt-swap] on_layer_abort failed")
-            skipped += 1
-            continue
+            raise
         policy.note_swapped(swaps)
         applied += len(swaps)
         touched += 1
