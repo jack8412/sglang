@@ -120,6 +120,16 @@ class ColdExpertStore:
         """Per-name views of a single cold slot (the swizzle destination)."""
         return {n: self._rows[(layer_idx, n)][slot] for n in self._shapes}
 
+    # Source-lifecycle hooks shared with ArenaColdSource. The store's rows are
+    # persistent, so there is nothing to recycle or drain -- but the pipeline
+    # calls these on whichever source it holds, so they exist on both.
+
+    def after_enqueue(self, layer_idx: int, stream) -> None:
+        del layer_idx, stream
+
+    def reset(self) -> None:
+        pass
+
     # -- slot bookkeeping --------------------------------------------------
 
     def slot_of(self, layer_idx: int, logical_id: int) -> Optional[int]:

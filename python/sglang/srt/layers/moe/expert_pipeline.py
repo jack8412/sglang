@@ -24,7 +24,10 @@ incorrectly.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Sequence
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, List, Optional, Sequence
 
 import torch
 
@@ -32,6 +35,237 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_cold_store import WEIGHT_NAMES, ColdExpertStore
 
 logger = logging.getLogger(__name__)
+
+
+class ArenaColdSource:
+    """Feed the pipeline from this rank's mapping of kt's memfd arenas.
+
+    Replaces the ~0.415 TB pinned cold store: the bytes already sit in kt's
+    resident buffers (checkpoint layout), mapped read-only into every rank by
+    kt_arena_share. What remains is getting each layer's ~600 MB rank-shard
+    onto the H2D path at prefill cadence, and the arena is pageable shmem, so
+    a direct async copy would fall off the DMA fast path. This stages instead:
+    a thread pool gathers layer L's cold shards into one of three small pinned
+    buffers a couple of layers ahead of L's H2D. The CPU is idle during split
+    prefill -- every routed expert runs on GPU -- so the gather is free
+    concurrency, and the pinned staging (3 x ~600 MB) keeps the copy floor
+    without registering the multi-hundred-GB arena mapping (that direct-DMA
+    variant stays a measured follow-up, not a prerequisite).
+
+    Duck-compatible with ColdExpertStore where ColdExpertPipeline touches it
+    (``num_cold``, ``layer_rows``) plus the lifecycle hooks the pipeline calls
+    on both (``after_enqueue``, ``reset``).
+
+    SLOT ORDER IS THE TABLES'. Staging row ``j`` holds the expert whose
+    ``logical_to_slot`` entry is ``num_gpu + j`` -- supplied per layer by
+    ``cold_slot_expert_ids`` -- so routing and weights derive from the same
+    table. Swaps exchange that table pairwise at window boundaries; a gather
+    snapshots it at issue time, and passes never straddle a window (the
+    window quiesces between batches), so a pass is internally consistent.
+    """
+
+    NUM_STAGE = 3
+    # NOT more workers = faster: the per-expert slicing holds the GIL and the
+    # convoy of blocked workers was MEASURED slower at 8 threads than at 2
+    # (133 ms vs 43 ms per layer on the dev stack); the memcpys themselves
+    # release the GIL, so two threads already keep two copies in flight.
+    WORKERS = 2
+
+    # raw_shard keys, in WEIGHT_NAMES order.
+    _RAW_KEYS = ("w13", "w13_scale", "w2", "w2_scale")
+
+    def __init__(
+        self,
+        *,
+        sources_by_layer: Dict[int, object],
+        cold_slot_expert_ids: Callable[[int], torch.Tensor],
+        raw_shapes: Dict[str, tuple],
+        moe_layer_indices: Sequence[int],
+        num_cold: int,
+    ):
+        self._sources = dict(sources_by_layer)
+        self._ids_for = cold_slot_expert_ids
+        self._layers = sorted(moe_layer_indices)
+        self._pos = {layer: i for i, layer in enumerate(self._layers)}
+        self.num_cold = int(num_cold)
+
+        # Every rank's arena reads are socket-local by geometry (a rank's TP
+        # slice lives inside ONE per_numa block); bind the staging pages and
+        # the gather threads to that socket or roughly half the ~215 GB/s
+        # aggregate gather traffic crosses UPI for nothing. Best effort:
+        # binding failures leave today's unbound behavior.
+        self._node_cpus = self._arena_node_cpus()
+
+        with self._bound_to_arena_node():
+            self._staging: List[Dict[str, torch.Tensor]] = [
+                {
+                    n: torch.empty(
+                        (self.num_cold,) + tuple(shape), dtype=dtype, pin_memory=True
+                    )
+                    for n, (shape, dtype) in raw_shapes.items()
+                }
+                for _ in range(self.NUM_STAGE)
+            ]
+        # Staging row views, prebuilt: they depend only on (stage, row), and
+        # rebuilding 4 views per expert inside the gather loop is ~1-2 ms of
+        # GIL-held work per layer that the forward thread ends up waiting on.
+        self._out_views: List[list] = [
+            [
+                {
+                    key: stage_buf[name][i].view(torch.uint8)
+                    for key, name in zip(self._RAW_KEYS, WEIGHT_NAMES)
+                }
+                for i in range(self.num_cold)
+            ]
+            for stage_buf in self._staging
+        ]
+        # layer -> list of in-flight chunk futures; removed on consumption.
+        self._futures: Dict[int, list] = {}
+        # Which layer's gather most recently claimed each stage (debug aid).
+        self._stage_layer: List[Optional[int]] = [None] * self.NUM_STAGE
+        # WAR gate per stage: recorded on the copy stream after the previous
+        # occupant's H2D was enqueued; a gather reusing the stage must wait it
+        # so the DMA is not reading rows the pool is overwriting.
+        self._stage_free: List[Optional[torch.cuda.Event]] = [None] * self.NUM_STAGE
+        self._pool = ThreadPoolExecutor(
+            max_workers=self.WORKERS,
+            thread_name_prefix="kt-cold-gather",
+            initializer=self._bind_worker_thread,
+        )
+
+        nbytes = sum(
+            t.numel() * t.element_size()
+            for buf in self._staging
+            for t in buf.values()
+        )
+        logger.info(
+            "[cold-pipeline] arena source: %d stages x %d cold experts = "
+            "%.2f GiB pinned staging, %d gather threads",
+            self.NUM_STAGE,
+            self.num_cold,
+            nbytes / (1024**3),
+            self.WORKERS,
+        )
+
+    def _stage(self, layer_idx: int) -> int:
+        return self._pos[layer_idx] % self.NUM_STAGE
+
+    def _arena_node_cpus(self) -> Optional[list]:
+        """CPUs of the socket holding this rank's arena partition, or None."""
+        try:
+            src = next(iter(self._sources.values()))
+            node = (src.tp_rank * src.per_gpu) // src.per_numa
+            with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+                spec = f.read().strip()
+            cpus = set()
+            for part in spec.split(","):
+                if "-" in part:
+                    lo, hi = part.split("-")
+                    cpus.update(range(int(lo), int(hi) + 1))
+                elif part:
+                    cpus.add(int(part))
+            cpus &= os.sched_getaffinity(0)
+            if not cpus:
+                raise RuntimeError("empty intersection with process affinity")
+            return sorted(cpus)
+        except Exception as exc:
+            logger.info(
+                "[cold-pipeline] no NUMA binding for the gather (%s); "
+                "cross-socket staging traffic possible",
+                exc,
+            )
+            return None
+
+    def _bound_to_arena_node(self):
+        """Context manager: pin the calling thread to the arena's socket."""
+        import contextlib
+
+        if self._node_cpus is None:
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def bind():
+            old = os.sched_getaffinity(0)
+            os.sched_setaffinity(0, self._node_cpus)
+            try:
+                yield
+            finally:
+                os.sched_setaffinity(0, old)
+
+        return bind()
+
+    def _bind_worker_thread(self) -> None:
+        if self._node_cpus is not None:
+            try:
+                os.sched_setaffinity(0, self._node_cpus)
+            except OSError:
+                pass
+
+    def begin_gather(self, layer_idx: int) -> None:
+        """Start one layer's gather on the pool; idempotent per layer."""
+        if layer_idx in self._futures:
+            return
+        stage = self._stage(layer_idx)
+        ids = self._ids_for(layer_idx)
+        if len(ids) != self.num_cold:
+            raise RuntimeError(
+                f"layer {layer_idx}: {len(ids)} cold slots, staging holds "
+                f"{self.num_cold}"
+            )
+        free_ev = self._stage_free[stage]
+        self._stage_layer[stage] = layer_idx
+        source = self._sources[layer_idx]
+        out_views = self._out_views[stage]
+        ids_list = ids.tolist()
+
+        def gather(lo: int, hi: int) -> None:
+            if free_ev is not None:
+                free_ev.synchronize()
+            for i in range(lo, hi):
+                source.raw_shard_into(ids_list[i], out_views[i])
+
+        step = -(-self.num_cold // self.WORKERS)
+        self._futures[layer_idx] = [
+            self._pool.submit(gather, lo, min(lo + step, self.num_cold))
+            for lo in range(0, self.num_cold, step)
+        ]
+
+    def layer_rows(self, layer_idx: int, name: str) -> torch.Tensor:
+        """The layer's packed cold rows for one name; blocks until gathered.
+
+        Look-ahead is kicked BEFORE waiting on this layer, so a cold start
+        (prime, first layer of every pass) overlaps the next layers' gathers
+        with this one's wait instead of serializing them; in steady state a
+        gather has ~2 layer periods of head start and the wait is near zero.
+        """
+        i = self._pos[layer_idx]
+        if layer_idx not in self._futures:
+            self.begin_gather(layer_idx)  # cold start (prime, or a miss)
+        for ahead in self._layers[i + 1 : i + self.NUM_STAGE]:
+            self.begin_gather(ahead)
+        for f in self._futures[layer_idx]:
+            f.result()  # propagate a gather failure loudly, never stale bytes
+        return self._staging[self._stage(layer_idx)][name]
+
+    def after_enqueue(self, layer_idx: int, stream: torch.cuda.Stream) -> None:
+        """Mark the stage reusable once the just-enqueued H2D completes."""
+        stage = self._stage(layer_idx)
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        self._stage_free[stage] = ev
+        self._futures.pop(layer_idx, None)
+
+    def reset(self) -> None:
+        """Drain in-flight gathers; called with both streams synchronized."""
+        for futs in self._futures.values():
+            for f in futs:
+                try:
+                    f.result()
+                except Exception:
+                    logger.exception("[cold-pipeline] gather failed during reset")
+        self._futures.clear()
+        self._stage_layer = [None] * self.NUM_STAGE
+        self._stage_free = [None] * self.NUM_STAGE
 
 
 class _OverlapProbe:
@@ -59,6 +293,12 @@ class _OverlapProbe:
         self._compute_end = events()
         self._copied: set = set()
         self._computed: set = set()
+        # Host-side, per layer: how long prefetch_layer waited for the arena
+        # gather BEFORE enqueuing the H2D. Without it that wait hides inside
+        # the copy interval (the copy stream sits idle between copy_begin and
+        # the late-enqueued copies) and a gather-headroom deficit reads as an
+        # H2D-bandwidth regression.
+        self._gather_wait_ms: Dict[int, float] = {}
 
     def copy_begin(self, pos, stream):
         self._copy_begin[pos].record(stream)
@@ -76,6 +316,9 @@ class _OverlapProbe:
     def compute_end(self, pos, stream):
         self._compute_end[pos].record(stream)
         self._computed.add(pos)
+
+    def gather_wait(self, pos, ms):
+        self._gather_wait_ms[pos] = ms
 
     def summarize(self) -> Optional[str]:
         """One line per pass. Caller must have synchronised both streams."""
@@ -106,10 +349,13 @@ class _OverlapProbe:
         # this probe can see. It is NOT a share of the forward, which also
         # contains attention, the dense path and communication; dividing by
         # the forward needs a number the pipeline does not have.
+        gw = [self._gather_wait_ms.get(r[0], 0.0) for r in rows]
+        self._gather_wait_ms.clear()
         return (
             f"[cold-pipeline] {n} layers | "
             f"copy {sum(copy)/n:.1f} ms avg (max {max(copy):.1f}), "
             f"{sum(copy)/1000:.2f} s total | "
+            f"gather-wait {sum(gw)/n:.1f} ms avg (max {max(gw):.1f}) | "
             f"moe {tot_compute/n:.1f} ms avg | "
             f"STALL {tot_stall/n:.2f} ms avg, {max(stall):.1f} max, "
             f"{tot_stall:.0f} ms total = "
@@ -130,7 +376,7 @@ class ColdExpertPipeline:
     def __init__(
         self,
         *,
-        store: ColdExpertStore,
+        store,  # ColdExpertStore or ArenaColdSource (num_cold/layer_rows/hooks)
         device: torch.device,
         per_expert_shapes: Dict[str, tuple],
         moe_layer_indices: Sequence[int],
@@ -220,6 +466,17 @@ class ColdExpertPipeline:
     def prefetch_layer(self, layer_idx: int) -> None:
         """Copy one layer's cold experts into its slot on the copy stream."""
         slot = self._slot(layer_idx)
+        if self._probe is not None:
+            # Resolve the (arena) gather BEFORE copy_begin and time it
+            # host-side: one name waits the layer's whole gather, so the
+            # in-loop layer_rows calls return instantly and copy_begin ->
+            # copy_end goes back to measuring the transfer alone. A plain
+            # store pays a dict lookup.
+            t0 = time.perf_counter()
+            self._store.layer_rows(layer_idx, WEIGHT_NAMES[0])
+            self._probe.gather_wait(
+                self._pos[layer_idx], (time.perf_counter() - t0) * 1e3
+            )
         with torch.cuda.stream(self._copy_stream):
             # WAR: the slot's previous occupant must be done being read.
             self._copy_stream.wait_event(self._consume_events[slot])
@@ -243,6 +500,9 @@ class ColdExpertPipeline:
             if self._probe is not None:
                 self._probe.copy_end(self._pos[layer_idx], self._copy_stream)
             self._prefetch_events[slot].record(self._copy_stream)
+        # After the copies are enqueued: an arena source uses this to recycle
+        # its staging slot once the DMA completes; the store's is a no-op.
+        self._store.after_enqueue(layer_idx, self._copy_stream)
         self._slot_layer[slot] = layer_idx
 
     def _swizzle_into(
@@ -318,3 +578,6 @@ class ColdExpertPipeline:
             if line is not None:
                 logger.info("%s", line)
         self._slot_layer = [None] * self.NUM_SLOTS
+        # Both streams are idle (synchronized above), so the source can drain
+        # its gather threads without racing any in-flight DMA.
+        self._store.reset()

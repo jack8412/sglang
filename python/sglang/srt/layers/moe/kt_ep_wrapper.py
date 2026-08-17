@@ -6658,6 +6658,8 @@ def _kt_swap_tables(method) -> "object":
         pinned_mask=(
             method.wrapper.gpu_experts_mask if method.wrapper is not None else None
         ),
+        logical_to_slot=method.logical_to_slot,
+        logical_to_slot_cuda=method.logical_to_slot_cuda,
     )
 
 
@@ -7606,35 +7608,92 @@ def finalize_split_prefill(server_args) -> bool:
                    getattr(anchor_layer, name).dtype)
             for name in WEIGHT_NAMES
         }
-        dynamic = envs.SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE.get()
-        raw_shapes, swizzle_plan = (
-            _build_dynamic_swizzle_plan(anchor, device) if dynamic else (None, None)
+        # ARENA MODE first: under full-kt + KT_BUFFER_B_MEMFD every rank
+        # already maps every expert's checkpoint-layout bytes, so a pinned
+        # store would duplicate ~0.4 TB of them -- the duplication this whole
+        # design exists to remove. Requires the swizzle plan (raw bytes cannot
+        # land in a resident row without it) and full residency (arena offsets
+        # go stale across swap_expert_slot under cold-only).
+        from sglang.srt.layers.moe.kt_arena_share import arena_source_for
+
+        arena_sources = {li: arena_source_for(li) for li in layer_indices}
+        use_arena = not anchor.kt_config.cold_only_cpu_experts and all(
+            s is not None for s in arena_sources.values()
         )
-        # The plan builder falls back rather than guessing, so honour that here
-        # too: without it, `dynamic` would size the store by a None shape map.
-        dynamic = dynamic and swizzle_plan is not None and raw_shapes is not None
-        # Swapping used to be refused here: the swap path reads and writes
-        # these same rows, and against a raw store that mixed layouts silently.
-        # It no longer does -- _flush_moves swizzles a promotion on its way to
-        # the resident row and unswizzles a demotion on its way back -- so the
-        # two can now run together.
-        store = build_cold_store(
-            layer_indices=layer_indices,
-            gpu_experts_mask=anchor.gpu_experts_mask,
-            weight_path=anchor.kt_config.weight_path,
-            tp_rank=get_parallel().tp_rank,
-            tp_size=get_parallel().tp_size,
-            expert_prefix_for_layer=lambda li: (
-                f"language_model.model.layers.{li}.block_sparse_moe.experts"
-            ),
-            # In dynamic mode the store holds checkpoint-layout bytes, so it is
-            # sized by the RAW shapes, not the resident-buffer ones.
-            per_expert_shapes=raw_shapes if dynamic else per_expert_shapes,
-            device=device,
-            raw_layout=dynamic,
-        )
+        raw_shapes = swizzle_plan = None
+        if use_arena:
+            raw_shapes, swizzle_plan = _build_dynamic_swizzle_plan(anchor, device)
+            use_arena = swizzle_plan is not None and raw_shapes is not None
+        dynamic = use_arena
+        store = None
+        if use_arena:
+            from sglang.srt.layers.moe.expert_pipeline import ArenaColdSource
+
+            methods_by_layer = {
+                m.kt_config.layer_idx: m for m, _ in _KT_SPLIT_PREFILL_LAYERS
+            }
+            num_gpu = anchor.num_gpu_experts
+            num_cold = anchor.global_num_experts - num_gpu
+
+            def cold_slot_expert_ids(layer_idx):
+                # Invert the cold half of the LIVE slot table: staging row j
+                # gets the expert whose slot is num_gpu + j. Derived from
+                # logical_to_slot -- the table routing reads and swaps
+                # exchange -- never from mask order, which goes stale the
+                # moment a window acts.
+                l2s = methods_by_layer[layer_idx].logical_to_slot
+                is_cold = l2s >= num_gpu
+                cold = torch.empty(num_cold, dtype=torch.int64)
+                cold[(l2s[is_cold] - num_gpu).long()] = torch.nonzero(
+                    is_cold, as_tuple=False
+                ).flatten()
+                return cold
+
+            source = ArenaColdSource(
+                sources_by_layer=arena_sources,
+                cold_slot_expert_ids=cold_slot_expert_ids,
+                raw_shapes=raw_shapes,
+                moe_layer_indices=layer_indices,
+                num_cold=num_cold,
+            )
+            logger.info(
+                "[split-prefill] cold experts stream from the kt arena "
+                "mapping; no pinned store built"
+            )
+        else:
+            dynamic = envs.SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE.get()
+            raw_shapes, swizzle_plan = (
+                _build_dynamic_swizzle_plan(anchor, device)
+                if dynamic
+                else (None, None)
+            )
+            # The plan builder falls back rather than guessing, so honour that
+            # here too: without it, `dynamic` would size the store by a None
+            # shape map.
+            dynamic = dynamic and swizzle_plan is not None and raw_shapes is not None
+            # Swapping used to be refused here: the swap path reads and writes
+            # these same rows, and against a raw store that mixed layouts
+            # silently. It no longer does -- _flush_moves swizzles a promotion
+            # on its way to the resident row and unswizzles a demotion on its
+            # way back -- so the two can now run together.
+            store = build_cold_store(
+                layer_indices=layer_indices,
+                gpu_experts_mask=anchor.gpu_experts_mask,
+                weight_path=anchor.kt_config.weight_path,
+                tp_rank=get_parallel().tp_rank,
+                tp_size=get_parallel().tp_size,
+                expert_prefix_for_layer=lambda li: (
+                    f"language_model.model.layers.{li}.block_sparse_moe.experts"
+                ),
+                # In dynamic mode the store holds checkpoint-layout bytes, so
+                # it is sized by the RAW shapes, not the resident-buffer ones.
+                per_expert_shapes=raw_shapes if dynamic else per_expert_shapes,
+                device=device,
+                raw_layout=dynamic,
+            )
+            source = store
         pipeline = ColdExpertPipeline(
-            store=store,
+            store=source,
             device=device,
             per_expert_shapes=per_expert_shapes,
             moe_layer_indices=layer_indices,
@@ -7646,8 +7705,28 @@ def finalize_split_prefill(server_args) -> bool:
             "[split-prefill] build failed; falling back to the margin-routed "
             "CPU path for every layer"
         )
+        store = source = pipeline = None
+
+    # Arming is all-or-nothing ACROSS RANKS. The hot gate is rank-local, and a
+    # split rank set is silent corruption, not a crash: armed ranks contribute
+    # full-expert shards while a disarmed rank contributes its margin-routed
+    # resident-only shard, and the row-parallel all-reduce sums them into
+    # every output token of every large prefill. A single rank's build is the
+    # likeliest thing in this file to fail alone (its arena share can degrade
+    # per rank BY DESIGN, sending only it into the 52 GiB pinned-store
+    # fallback), so unanimity is decided with the same symmetric consensus
+    # every other rank-divergence risk here uses. Reached from the success
+    # AND failure paths, so it cannot itself desynchronise.
+    if not _all_tp_ranks_succeeded(pipeline is not None):
+        if pipeline is not None:
+            logger.error(
+                "[split-prefill] disarmed: another rank failed to build; "
+                "every rank keeps the margin-routed CPU path"
+            )
         for method, _ in _KT_SPLIT_PREFILL_LAYERS:
             method._split_prefill_ready = False
+        _KT_SPLIT_PREFILL_STATE["store"] = None
+        _KT_SPLIT_PREFILL_STATE["pipeline"] = None
         return False
 
     _KT_SPLIT_PREFILL_STATE["store"] = store
@@ -7671,11 +7750,12 @@ def finalize_split_prefill(server_args) -> bool:
 
     logger.info(
         "[split-prefill] armed on %d layers: %d resident + %d cold experts, "
-        "threshold %d tokens",
+        "threshold %d tokens, cold source %s",
         len(_KT_SPLIT_PREFILL_LAYERS),
         anchor.num_gpu_experts,
-        store.num_cold,
+        source.num_cold,
         anchor._split_prefill_threshold,
+        "kt-arena" if store is None else "pinned-store",
     )
     return True
 

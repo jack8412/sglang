@@ -160,6 +160,34 @@ class TestRawShardModes(CustomTestCase):
                 r,
             )
 
+    def test_raw_shard_into_matches_raw_shard(self):
+        """The alloc-free writer must produce the allocating reader's bytes.
+
+        raw_shard_into is what the split-prefill gather runs ~276x per layer;
+        any divergence from raw_shard (whose construction is the one proven
+        bitwise against the checkpoint) is silently wrong weights.
+        """
+        blocks = _make_blocks(seed=23)
+        arenas, offsets = _pack_arenas(blocks)
+        tensors = [torch.from_numpy(a) for a in arenas]
+        for r in range(TP_SIZE):
+            src = KtArenaExpertSource(
+                arenas=tensors,
+                offsets=offsets,
+                geometry=GEOMETRY,
+                tp_rank=r,
+                tp_size=TP_SIZE,
+            )
+            for e in range(EXPERTS):
+                want = src.raw_shard(e)
+                out = {
+                    k: torch.empty_like(want[k])
+                    for k in ("w13", "w13_scale", "w2", "w2_scale")
+                }
+                src.raw_shard_into(e, out)
+                for k, t in out.items():
+                    self.assertTrue(torch.equal(t, want[k]), (r, e, k))
+
     def test_absent_expert_raises(self):
         blocks = _make_blocks()
         arenas, offsets = _pack_arenas(blocks)

@@ -54,6 +54,12 @@ class SwapTables(NamedTuple):
     logical_to_gpu_index_cuda: torch.Tensor  # int32 [num_experts], device
     gpu_index_to_logical: torch.Tensor  # int32 [num_gpu_experts]
     pinned_mask: Optional[torch.Tensor]  # uint8/bool, pointer held by kt C++
+    # Split prefill's ONE slot space (residents [0, num_gpu), cold above it).
+    # Optional because only split-prefill-capable methods build it -- but when
+    # present it MUST flip with the rest: it went stale across swaps before,
+    # which silently misrouted the swapped pair on the next split prefill.
+    logical_to_slot: Optional[torch.Tensor] = None  # int32 [num_experts], CPU
+    logical_to_slot_cuda: Optional[torch.Tensor] = None  # device
 
 
 def apply_swaps_to_tables(tables: SwapTables, swaps: List[ExpertSwap]) -> List[int]:
@@ -84,12 +90,24 @@ def apply_swaps_to_tables(tables: SwapTables, swaps: List[ExpertSwap]) -> List[i
         tables.logical_to_gpu_index[s.promote] = row
         tables.logical_to_gpu_index[s.demote] = -1
         tables.gpu_index_to_logical[row] = s.promote
+        if tables.logical_to_slot is not None:
+            # The pair EXCHANGE slots: the promoted expert takes the demoted
+            # one's resident slot (== its row) and the demoted expert takes
+            # the promoted one's cold slot, whose staging row the cold source
+            # will fill with the demoted expert's bytes on the next prefill.
+            # No other entry moves, mirroring the row assignment above.
+            p_slot = int(tables.logical_to_slot[s.promote].item())
+            d_slot = int(tables.logical_to_slot[s.demote].item())
+            tables.logical_to_slot[s.promote] = d_slot
+            tables.logical_to_slot[s.demote] = p_slot
         rows.append(row)
 
     tables.gpu_experts_mask_cuda.copy_(tables.gpu_experts_mask, non_blocking=True)
     tables.logical_to_gpu_index_cuda.copy_(
         tables.logical_to_gpu_index, non_blocking=True
     )
+    if tables.logical_to_slot_cuda is not None:
+        tables.logical_to_slot_cuda.copy_(tables.logical_to_slot, non_blocking=True)
     if tables.pinned_mask is not None:
         # kt-kernel reads this every forward with no lock; it must be written
         # last, after the GPU rows already hold the new weights, so the CPU

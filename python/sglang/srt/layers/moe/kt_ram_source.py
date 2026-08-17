@@ -218,6 +218,60 @@ class KtRamExpertSource:
             "w2_scale": w2_scale,
         }
 
+    def raw_shard_into(self, logical_id: int, out: Dict[str, torch.Tensor]) -> None:
+        """``raw_shard``, but written into caller storage with zero allocations.
+
+        The split-prefill gather calls this ~276 times per layer per rank at a
+        ~22 ms/layer budget; ``raw_shard``'s fresh ``cat`` outputs would double
+        the memory traffic and hand the allocator a hot loop. ``out`` maps the
+        four names to 2-D uint8 views shaped exactly like ``raw_shard``'s
+        returns (typically rows of a pinned staging buffer). Each ``copy_`` is
+        a plain (possibly strided) memcpy and releases the GIL, which is what
+        lets a thread pool run several of these concurrently.
+        """
+        slot = int(logical_id)
+        if not 0 <= slot < self.experts:
+            raise KeyError(
+                f"expert {logical_id} is outside kt's {self.experts} buffer "
+                "slots"
+            )
+        if self._absent(slot):
+            raise KeyError(
+                f"expert {logical_id} is not CPU-resident here (null BufferB); "
+                "under cold-only residency only cold experts have buffers"
+            )
+
+        h2 = self.hidden // 2
+        hg = self.hidden // self.group
+
+        def fill_rows(dst, pieces):
+            r = 0
+            for p in pieces:
+                n = p.shape[0]
+                dst[r : r + n].copy_(p)
+                r += n
+
+        def fill_cols(dst, pieces):
+            c = 0
+            for p in pieces:
+                n = p.shape[1]
+                dst[:, c : c + n].copy_(p)
+                c += n
+
+        fill_rows(
+            out["w13"],
+            self._row_pieces(_GATE_B, slot, h2) + self._row_pieces(_UP_B, slot, h2),
+        )
+        fill_rows(
+            out["w13_scale"],
+            self._row_pieces(_GATE_D, slot, hg) + self._row_pieces(_UP_D, slot, hg),
+        )
+        fill_cols(out["w2"], self._col_pieces(_DOWN_B, slot, self.per_numa // 2, 2))
+        fill_cols(
+            out["w2_scale"],
+            self._col_pieces(_DOWN_D, slot, self.per_numa // self.group, self.group),
+        )
+
 
 class KtArenaExpertSource(KtRamExpertSource):
     """The offset form: rows index into mapped arenas instead of addresses.

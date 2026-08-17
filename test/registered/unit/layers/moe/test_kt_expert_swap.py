@@ -196,6 +196,47 @@ class TestTableUpdate(CustomTestCase):
         self.assertEqual(int(t.logical_to_gpu_index[3]), 3)
         assert_tables_consistent(t, 4)
 
+    def test_slot_table_exchanges_the_pair(self):
+        """Split prefill routes through logical_to_slot; a swap must exchange
+        exactly the swapped pair's entries there (promoted takes the demoted
+        one's resident slot == its row; demoted takes the promoted one's cold
+        slot) and touch nothing else. Red if the slot table goes stale again —
+        the pre-arena builds shipped that bug, and it misroutes both experts
+        on every split prefill after the first acting window."""
+        from sglang.srt.layers.moe.kt_expert_swap import (
+            ExpertSwap,
+            apply_swaps_to_tables,
+        )
+
+        num_experts, resident = 8, (0, 1, 2, 3)
+        l2s = torch.empty(num_experts, dtype=torch.int32)
+        for row, e in enumerate(resident):
+            l2s[e] = row
+        for j, e in enumerate(e for e in range(num_experts) if e not in resident):
+            l2s[e] = len(resident) + j
+        t = _tables()._replace(logical_to_slot=l2s, logical_to_slot_cuda=l2s.clone())
+        before = l2s.clone()
+
+        apply_swaps_to_tables(t, [ExpertSwap(6, 2, 100.0, 0.0)])
+        self.assertEqual(int(t.logical_to_slot[6]), int(before[2]))
+        self.assertEqual(int(t.logical_to_slot[2]), int(before[6]))
+        for e in range(num_experts):
+            if e not in (2, 6):
+                self.assertEqual(int(t.logical_to_slot[e]), int(before[e]), e)
+        self.assertTrue(torch.equal(t.logical_to_slot_cuda, t.logical_to_slot))
+
+    def test_slot_table_absent_is_tolerated(self):
+        """Methods without split prefill build no slot table; apply must not
+        require one."""
+        from sglang.srt.layers.moe.kt_expert_swap import (
+            ExpertSwap,
+            apply_swaps_to_tables,
+        )
+
+        t = _tables()
+        self.assertIsNone(t.logical_to_slot)
+        apply_swaps_to_tables(t, [ExpertSwap(6, 2, 100.0, 0.0)])
+
     def test_device_and_pinned_copies_track(self):
         from sglang.srt.layers.moe.kt_expert_swap import (
             ExpertSwap,
