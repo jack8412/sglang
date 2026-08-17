@@ -3048,6 +3048,11 @@ class ServerArgs:
         "Run the --kt-expert-split-prefill MoE in token tiles of this many tokens (0 = the whole chunk in one call). A token's MoE output depends only on its own row, so tiling changes no value, but the two large transients -- the gemm2 buffer the kernel sizes for ALL T*top_k slots, and the fp32 finalize accumulator -- then scale with the tile instead of the chunk. Measured at a 49152 chunk: 7.01 GiB peak untiled vs 2.94 GiB at a 16384 tile, for ~7% more MoE time (~1.3% of the forward). This is what lets a large prefill chunk coexist with a long-context KV pool. Ignored unless --kt-expert-split-prefill is set.",
         NS("exec.moe"),
     ] = 0
+    kt_cold_transport: A[
+        Literal["ring-export", "direct-dma"],
+        "How --kt-expert-split-prefill moves cold-expert weights to the GPUs each layer. 'ring-export' (default): kt's CPU pool copies each layer's slices into per-rank pinned rings and the ranks DMA those (3 DRAM transits/byte). 'direct-dma': every rank cudaHostRegisters its read-set of kt's memfd arenas (requires KT_BUFFER_B_MEMFD=1) and its copy engine reads the weights in place -- one transit, no CPU prepare stage; swap windows manage the registrations. Falls back to ring-export, then to the margin-routed CPU path, if arming fails on any rank.",
+        NS("exec.moe"),
+    ] = "ring-export"
     record_kt_gpu_expert_distribution: A[
         bool,
         "[ktransformers parameter] Record the per-layer GPU-resident expert mask each forward pass; dumped with the expert distribution stats.",

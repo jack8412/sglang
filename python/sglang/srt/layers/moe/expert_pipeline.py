@@ -523,10 +523,18 @@ class ColdExpertPipeline:
         from sglang.srt.layers.moe.kt_mxfp4_export import apply_batched_swizzle
 
         raw = self._raw_buffers[slot]
-        for name in WEIGHT_NAMES:
-            raw[name].copy_(
-                self._store.layer_rows(layer_idx, name), non_blocking=True
-            )
+        from sglang.srt.layers.moe.kt_direct_dma import DirectDmaSource
+
+        if isinstance(self._store, DirectDmaSource):
+            # Direct-DMA source: it owns the H2D issue (there is no host
+            # staging to hand back), enqueued on the SAME copy stream so the
+            # prefetch event's meaning is unchanged.
+            self._store.issue_layer_copies(layer_idx, raw, self._copy_stream)
+        else:
+            for name in WEIGHT_NAMES:
+                raw[name].copy_(
+                    self._store.layer_rows(layer_idx, name), non_blocking=True
+                )
         out = apply_batched_swizzle(
             plan=self._swizzle_plan,
             raw_w13=raw[WEIGHT_NAMES[0]],

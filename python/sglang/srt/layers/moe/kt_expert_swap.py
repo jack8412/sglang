@@ -365,6 +365,7 @@ def run_swap_window(
     install_cpu_expert: Optional[Callable[[dict, int, int], None]] = None,
     begin_layer: Optional[Callable[[dict, list, list], None]] = None,
     finish_layer: Optional[Callable[[], None]] = None,
+    after_flip: Optional[Callable[[dict, list], None]] = None,
     quiesce: Optional[Callable[[], None]] = None,
 ) -> SwapWindowResult:
     """Apply pending swaps for every layer, at an already-paused point.
@@ -396,6 +397,20 @@ def run_swap_window(
     made ranks disagree on how many collectives to run, and the window
     deadlocked in NCCL rather than falling back.
 
+    ``begin_layer`` may RETURN a filtered ``(swaps, rows)`` pair: the
+    direct-DMA transport must register a demoted expert's pages on every
+    rank BEFORE that expert becomes routable, so pairs any rank could not
+    register are dropped everywhere (the filter must be consensus-derived --
+    identical on all ranks -- for exactly the reason above). Returning None
+    keeps the plan unchanged.
+
+    ``after_flip(entry, swaps)`` runs once per layer AFTER the tables
+    flipped, with the applied plan. This is where bookkeeping keyed to the
+    NEW table belongs (the direct-DMA transport releases the promoted
+    experts' page pins here -- releasing on the proposed plan instead would
+    drop pins a skipped pair's still-cold expert needs). Failures are
+    logged, never raised: the swap itself completed.
+
     ``finish_layer`` exists for movers that BATCH their writes: they treat
     ``move_weights`` as a record step and apply a layer's copies in bulk, so
     without a hook they would flush lazily on the next layer's first move --
@@ -425,7 +440,12 @@ def run_swap_window(
                 int(tables.logical_to_gpu_index[s.demote].item()) for s in swaps
             ]
             if begin_layer is not None:
-                begin_layer(entry, swaps, rows)
+                filtered = begin_layer(entry, swaps, rows)
+                if filtered is not None:
+                    swaps, rows = filtered
+                    if not swaps:
+                        skipped += 1
+                        continue
             for s, row in zip(swaps, rows):
                 move_weights(entry["layer"], row, s.promote, s.demote)
                 if install_cpu_expert is not None:
@@ -446,6 +466,15 @@ def run_swap_window(
                 finish_layer()
             apply_swaps_to_tables(tables, swaps)
             assert_tables_consistent(tables, entry["num_gpu_experts"])
+            if after_flip is not None:
+                try:
+                    after_flip(entry, swaps)
+                except Exception:
+                    logger.exception(
+                        "[kt-swap] after_flip hook failed on layer %s "
+                        "(bookkeeping only; the swap itself completed)",
+                        entry.get("layer_idx"),
+                    )
         except SwapInstallError:
             # Never absorbed: see SwapInstallError. Skipping here would leave
             # this rank's placement disagreeing with every other rank's.

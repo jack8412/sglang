@@ -1387,6 +1387,13 @@ class Envs:
     # which is identical on every rank. Still opt-in until measured against the
     # checkpoint path on a live server.
     SGLANG_KT_SWAP_GPU_READBACK = EnvBool(False)
+    # Minimum free VRAM (GiB) a rank must still have before the direct-DMA
+    # cold transport is allowed to arm. Boot registration materializes GPU
+    # page tables in VRAM AFTER the KV pool was sized (8 B per 4K page,
+    # measured exact on dense ranges), so arming without a floor could hand
+    # a later transient allocation an OOM mid-serving instead of a clean
+    # fallback at boot.
+    SGLANG_KT_DMA_FREE_VRAM_FLOOR_GB = EnvFloat(1.0)
     # Hold the split-prefill cold store in CHECKPOINT layout and swizzle each
     # layer on device as it is prefetched, instead of storing pre-swizzled
     # bytes. Costs ~1.0 ms per layer (~+4.4% of the ~2.07 s/forward copy floor)

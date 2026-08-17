@@ -213,6 +213,7 @@ class KTConfig:
     expert_swap_hysteresis: float = 2.0
     split_prefill: bool = False
     split_prefill_token_tile: int = 0
+    cold_transport: str = "ring-export"
 
 
 # Process-level registries for the MXFP4 layerwise-prefill slot machinery
@@ -231,7 +232,12 @@ _KT_SWAP_STATE = {"eager_forwards": 0, "windows": 0, "swaps": 0}
 # process cannot inherit stale layers.  (Keying a reset on layer_idx == 0 would
 # not work: K3's early layers are dense, so layer 0 is never an MoE layer.)
 _KT_SPLIT_PREFILL_LAYERS = []
-_KT_SPLIT_PREFILL_STATE = {"store": None, "pipeline": None, "export_source": None}
+_KT_SPLIT_PREFILL_STATE = {
+    "store": None,
+    "pipeline": None,
+    "export_source": None,
+    "direct_source": None,
+}
 
 # Smallest chunk worth paying the cold-expert stream for. The stream is a
 # fixed per-forward cost (~2.0 s measured: every cold expert lands once
@@ -2949,6 +2955,21 @@ def _any_tp_rank_true(local_value: bool) -> bool:
     return bool(status.item())
 
 
+def _all_tp_ranks_succeeded_vec(local_ok: List[bool]) -> List[bool]:
+    """Element-wise unanimity across ranks; ONE fixed-shape collective.
+
+    The shape is len(local_ok), which every caller derives from a
+    plan-deterministic input (identical on all ranks), so the collective is
+    symmetric by construction -- the same discipline as
+    _all_tp_ranks_succeeded, vectorized for per-pair decisions.
+    """
+    if not dist.is_initialized() or get_parallel().tp_size == 1:
+        return list(local_ok)
+    status = torch.tensor([int(v) for v in local_ok], dtype=torch.int32, device="cpu")
+    dist.all_reduce(status, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group)
+    return [bool(v) for v in status.tolist()]
+
+
 def _disable_mxfp4_layerwise_pipeline(signature: tuple, reason: str) -> None:
     _MXFP4_LAYERWISE_DISABLED_REASONS[signature] = reason
     gc.collect()
@@ -3775,6 +3796,7 @@ def create_kt_config_from_server_args(
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
         split_prefill=server_args.kt_expert_split_prefill,
         split_prefill_token_tile=server_args.kt_expert_split_prefill_token_tile,
+        cold_transport=server_args.kt_cold_transport,
     )
 
 
@@ -7155,9 +7177,42 @@ def maybe_run_expert_swap_window(
         conditions. It also guarantees read-before-write unconditionally: no
         move has run yet, so every row still holds its demoted occupant even on
         the checkpoint-fallback path that writes its row immediately.
+
+        Under the direct-DMA transport it additionally RETURNS a filtered
+        (swaps, rows) plan: a demoted expert must have its arena pages
+        registered on EVERY rank before the tables make it routable
+        (register-before-routable, SPEC-DIRECT-DMA invariant 1), so pairs
+        any rank could not register are dropped everywhere. The filter is
+        derived from ONE fixed-shape collective over the plan, so it is
+        identical on all ranks by construction.
         """
         _pending["prefetched"] = {}
         _pending["export_rows"] = {}
+        filtered = None
+        dma_src = _KT_SPLIT_PREFILL_STATE["direct_source"]
+        if dma_src is not None and swaps:
+            local_ok = dma_src.window_acquire_demotions(
+                entry["layer_idx"], [s.demote for s in swaps]
+            )
+            ok = _all_tp_ranks_succeeded_vec(local_ok)
+            if not all(ok):
+                # A locally-successful acquire for a globally-dropped pair
+                # must be released: its expert stays resident, so nothing
+                # would ever release it later.
+                for s, o, local in zip(swaps, ok, local_ok):
+                    if local and not o:
+                        dma_src.window_release(entry["layer_idx"], s.demote)
+                kept = [(s, r) for s, r, o in zip(swaps, rows, ok) if o]
+                logger.error(
+                    "[kt-dma] layer %s: dropped %d/%d swap pair(s) -- a rank "
+                    "could not register the demoted expert's pages",
+                    entry.get("layer_idx"),
+                    len(swaps) - len(kept),
+                    len(swaps),
+                )
+                swaps = [s for s, _ in kept]
+                rows = [r for _, r in kept]
+                filtered = (swaps, rows)
         # Export-design promotions: ONE batched raw export of this layer's
         # promoted experts into stage 0 of every rank's cold ring. Every rank
         # calls this with the identical plan (rank 0 exports, peers wait the
@@ -7218,7 +7273,7 @@ def maybe_run_expert_swap_window(
         # construction, and any residual disagreement degrades to "no rank uses
         # the GPU route here" instead of hanging.
         if not _all_tp_ranks_succeeded(want):
-            return
+            return filtered
         # Not wrapped: absorbing here on one rank would drop it out of the
         # collectives the others are running, which is the failure this hook
         # exists to prevent.
@@ -7227,6 +7282,7 @@ def maybe_run_expert_swap_window(
             s.demote: [t.to("cpu") for t in tensors]
             for s, tensors in zip(swaps, got)
         }
+        return filtered
 
     def _read_demoted_expert(entry, demote_id):
         """The demoted expert's full bytes, from the GPU if that is proven.
@@ -7297,6 +7353,17 @@ def maybe_run_expert_swap_window(
             )
         return got
 
+    def _after_flip(entry, swaps):
+        # Direct-DMA bookkeeping keyed to the FLIPPED table: each applied
+        # pair's PROMOTED expert just left the cold set, so its page pins go
+        # from live to trim-eligible. Releasing on the proposed plan instead
+        # would drop pins a skipped pair's still-cold expert needs.
+        dma_src = _KT_SPLIT_PREFILL_STATE["direct_source"]
+        if dma_src is None:
+            return
+        for s in swaps:
+            dma_src.window_release(entry["layer_idx"], s.promote)
+
     try:
         result = run_swap_window(
             entries,
@@ -7304,6 +7371,7 @@ def maybe_run_expert_swap_window(
             install_cpu_expert=_install_cpu,
             begin_layer=_begin_layer,
             finish_layer=_flush_moves,
+            after_flip=_after_flip,
             quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
         )
     finally:
@@ -7311,6 +7379,25 @@ def maybe_run_expert_swap_window(
         # failed window would be applied during the NEXT one -- writing a stale
         # layer's rows, which is silent and unattributable.
         _flush_moves()
+        # Direct-DMA epilogue, still inside the quiesced window (the finally
+        # covers a raising window too -- some layers may have flipped before
+        # the failure, and serving must not resume on their stale plans):
+        # fold the new logical_to_slot into the copy plans, then trim dead
+        # registration units to budget. Trim is legal ONLY here: nothing is
+        # mid-DMA while the window holds the pipeline quiesced.
+        _dma_src = _KT_SPLIT_PREFILL_STATE["direct_source"]
+        if _dma_src is not None:
+            _dma_src.invalidate_plans()
+            budget = int(1.25 * _dma_src.live_bytes())
+            freed = _dma_src.window_trim(budget_bytes=budget)
+            if freed:
+                logger.info(
+                    "[kt-dma] window trim freed %.2f GiB (registered %.1f GiB, "
+                    "budget %.1f GiB)",
+                    freed / (1 << 30),
+                    _dma_src.registered_bytes() / (1 << 30),
+                    budget / (1 << 30),
+                )
     _KT_SWAP_STATE["windows"] += 1
     _KT_SWAP_STATE["swaps"] += result.swaps_applied
     if _KT_DOORBELL["inited"]:
@@ -7621,6 +7708,8 @@ def reset_split_prefill() -> None:
     _KT_SPLIT_PREFILL_LAYERS.clear()
     _KT_SPLIT_PREFILL_STATE["store"] = None
     _KT_SPLIT_PREFILL_STATE["pipeline"] = None
+    _KT_SPLIT_PREFILL_STATE["export_source"] = None
+    _KT_SPLIT_PREFILL_STATE["direct_source"] = None
 
 
 def _invert_cold_slot_table(
@@ -7641,6 +7730,136 @@ def _invert_cold_slot_table(
         is_cold, as_tuple=False
     ).flatten()
     return cold.cpu()
+
+
+def _try_build_direct_dma(
+    *,
+    layer_indices,
+    anchor,
+    device,
+    num_cold,
+    cold_slot_expert_ids,
+    arena_source_for,
+):
+    """Build the direct-DMA source, or (None, None, None). Rank-local.
+
+    Everything fallible about this transport happens HERE, with no
+    collectives, so the caller can fold the outcome into one consensus. On
+    any failure the registrar is torn down (unregistering whatever booted)
+    before returning None.
+    """
+    from sglang.srt.layers.moe.kt_direct_dma import (
+        ArenaExpertRanges,
+        CudaCopyLib,
+        DirectDmaSource,
+        IntervalRegistrar,
+        boot_acquire_cold_set,
+        cudart_register_fns,
+    )
+
+    registrar = None
+    try:
+        arena_sources = {li: arena_source_for(li) for li in layer_indices}
+        missing = [li for li, s in arena_sources.items() if s is None]
+        if missing:
+            logger.error(
+                "[kt-dma] no arena mapping for %d layer(s) (first: %s) -- is "
+                "KT_BUFFER_B_MEMFD=1 set?",
+                len(missing),
+                missing[0],
+            )
+            return None, None, None
+
+        raw_shapes, swizzle_plan = _build_dynamic_swizzle_plan(anchor, device)
+        if raw_shapes is None or swizzle_plan is None:
+            return None, None, None
+
+        free_b, _total = torch.cuda.mem_get_info(device)
+        floor_b = int(envs.SGLANG_KT_DMA_FREE_VRAM_FLOOR_GB.get() * (1 << 30))
+        # The registration itself costs ~8 B per 4K page of VRAM (measured
+        # exact); insist the floor still holds AFTER the projected cost.
+        ranges_by_layer = {
+            li: ArenaExpertRanges(src) for li, src in arena_sources.items()
+        }
+        any_r = next(iter(ranges_by_layer.values()))
+        per_expert = (
+            2 * any_r.gu_w
+            + 2 * any_r.gu_s
+            + (any_r.hidden - 1) * any_r.w2_pitch
+            + any_r.w2_width
+            + any_r.hidden * any_r.w2s_pitch
+        )
+        projected_pte = (
+            len(layer_indices) * num_cold * per_expert // 4096 * 8
+        )
+        if free_b - projected_pte < floor_b:
+            logger.error(
+                "[kt-dma] refusing to arm: free VRAM %.2f GiB minus projected "
+                "page tables %.2f GiB is under the %.2f GiB floor",
+                free_b / (1 << 30),
+                projected_pte / (1 << 30),
+                floor_b / (1 << 30),
+            )
+            return None, None, None
+
+        # Landing-row geometry must agree with the swizzle plan's raw shapes
+        # BEFORE any plan writes dst offsets with it.
+        def _nbytes(name):
+            shape, dtype = raw_shapes[name]
+            n = 1
+            for s in shape:
+                n *= int(s)
+            return n * torch.empty((), dtype=dtype).element_size()
+
+        checks = (
+            ("w13_weight", 2 * any_r.gu_w),
+            ("w13_weight_scale", 2 * any_r.gu_s),
+            ("w2_weight", any_r.hidden * any_r.w2_width),
+            ("w2_weight_scale", any_r.hidden * any_r.w2s_width),
+        )
+        for name, want in checks:
+            got = _nbytes(name)
+            if got != want:
+                logger.error(
+                    "[kt-dma] landing-row mismatch for %s: raw shape says %d "
+                    "bytes, arena geometry says %d -- refusing to arm",
+                    name,
+                    got,
+                    want,
+                )
+                return None, None, None
+
+        reg_fn, unreg_fn = cudart_register_fns()
+        registrar = IntervalRegistrar(
+            register_fn=reg_fn, unregister_fn=unreg_fn
+        )
+        source = DirectDmaSource(
+            ranges_by_layer=ranges_by_layer,
+            registrar=registrar,
+            copy_lib=CudaCopyLib(),
+            cold_slot_expert_ids=cold_slot_expert_ids,
+            raw_shapes=raw_shapes,
+            moe_layer_indices=layer_indices,
+            num_cold=num_cold,
+            device=device,
+        )
+        if not boot_acquire_cold_set(
+            source=source,
+            registrar=registrar,
+            ranges_by_layer=ranges_by_layer,
+            cold_slot_expert_ids=cold_slot_expert_ids,
+        ):
+            registrar.close()
+            return None, None, None
+        return source, raw_shapes, swizzle_plan
+    except Exception:
+        logger.exception("[kt-dma] build failed on this rank")
+        if registrar is not None:
+            try:
+                registrar.close()
+            except Exception:
+                pass
+        return None, None, None
 
 
 def finalize_split_prefill(server_args) -> bool:
@@ -7711,7 +7930,54 @@ def finalize_split_prefill(server_args) -> bool:
             )
         use_export = holder[0] and not anchor.kt_config.cold_only_cpu_experts
 
+        # DIRECT-DMA first when the launch asks for it (SPEC-DIRECT-DMA.md):
+        # every rank registers its cold read-set of kt's memfd arenas and its
+        # copy engine reads the weights in place -- no prepare stage, one
+        # DRAM transit. Everything here is per-rank fallible feeding ONE
+        # consensus, the same discipline as the branches below: every rank
+        # reaches _all_tp_ranks_succeeded no matter where it failed locally,
+        # and a non-unanimous outcome tears down cleanly and falls through to
+        # the ring-export transport.
         raw_shapes = swizzle_plan = None
+        direct_source = None
+        use_direct = (
+            anchor.kt_config.cold_transport == "direct-dma"
+            and not anchor.kt_config.cold_only_cpu_experts
+        )
+        if use_direct:
+            from sglang.srt.layers.moe.kt_arena_share import arena_source_for
+
+            direct_source, raw_shapes, swizzle_plan = _try_build_direct_dma(
+                layer_indices=layer_indices,
+                anchor=anchor,
+                device=device,
+                num_cold=num_cold,
+                cold_slot_expert_ids=cold_slot_expert_ids,
+                arena_source_for=arena_source_for,
+            )
+            use_direct = _all_tp_ranks_succeeded(direct_source is not None)
+            if not use_direct and direct_source is not None:
+                logger.error(
+                    "[kt-dma] disarmed: another rank failed to build; every "
+                    "rank falls back to the ring-export transport"
+                )
+            if not use_direct:
+                if direct_source is not None:
+                    try:
+                        direct_source.close()
+                    except Exception:
+                        logger.exception("[kt-dma] teardown on disarm failed")
+                direct_source = None
+                raw_shapes = swizzle_plan = None
+            else:
+                source = direct_source
+                dynamic = True
+                use_export = False
+                logger.info(
+                    "[split-prefill] cold experts stream by DIRECT DMA from "
+                    "kt's registered arenas; no export, no rings"
+                )
+
         if use_export:
             # Per-rank fallible (checkpoint read, device allocs) feeding a
             # COLLECTIVE ring build: the outcome must be unanimous or one
@@ -7763,14 +8029,15 @@ def finalize_split_prefill(server_args) -> bool:
 
         arena_sources = {li: arena_source_for(li) for li in layer_indices}
         use_arena = (
-            not use_export
+            not use_direct
+            and not use_export
             and not anchor.kt_config.cold_only_cpu_experts
             and all(s is not None for s in arena_sources.values())
         )
         if use_arena:
             raw_shapes, swizzle_plan = _build_dynamic_swizzle_plan(anchor, device)
             use_arena = swizzle_plan is not None and raw_shapes is not None
-        if not use_export:
+        if not use_export and not use_direct:
             dynamic = use_arena
         if use_arena:
             from sglang.srt.layers.moe.expert_pipeline import ArenaColdSource
@@ -7786,7 +8053,7 @@ def finalize_split_prefill(server_args) -> bool:
                 "[split-prefill] cold experts stream from the kt arena "
                 "mapping; no pinned store built"
             )
-        elif not use_export:
+        elif not use_export and not use_direct:
             dynamic = envs.SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE.get()
             raw_shapes, swizzle_plan = (
                 _build_dynamic_swizzle_plan(anchor, device)
@@ -7831,7 +8098,7 @@ def finalize_split_prefill(server_args) -> bool:
             "[split-prefill] build failed; falling back to the margin-routed "
             "CPU path for every layer"
         )
-        store = source = pipeline = export_source = None
+        store = source = pipeline = export_source = direct_source = None
 
     # Arming is all-or-nothing ACROSS RANKS. The hot gate is rank-local, and a
     # split rank set is silent corruption, not a crash: armed ranks contribute
@@ -7854,16 +8121,23 @@ def finalize_split_prefill(server_args) -> bool:
                 export_source.close()
             except Exception:
                 logger.exception("[kt-export] teardown on disarm failed")
+        if direct_source is not None:
+            try:
+                direct_source.close()
+            except Exception:
+                logger.exception("[kt-dma] teardown on disarm failed")
         for method, _ in _KT_SPLIT_PREFILL_LAYERS:
             method._split_prefill_ready = False
         _KT_SPLIT_PREFILL_STATE["store"] = None
         _KT_SPLIT_PREFILL_STATE["pipeline"] = None
         _KT_SPLIT_PREFILL_STATE["export_source"] = None
+        _KT_SPLIT_PREFILL_STATE["direct_source"] = None
         return False
 
     _KT_SPLIT_PREFILL_STATE["store"] = store
     _KT_SPLIT_PREFILL_STATE["pipeline"] = pipeline
     _KT_SPLIT_PREFILL_STATE["export_source"] = export_source
+    _KT_SPLIT_PREFILL_STATE["direct_source"] = direct_source
     # The swap path needs these too: against a raw store a promotion must
     # swizzle on the way to the GPU and a demotion must unswizzle on the way
     # back, or the two sides silently disagree about layout.
@@ -7888,7 +8162,15 @@ def finalize_split_prefill(server_args) -> bool:
         anchor.num_gpu_experts,
         source.num_cold,
         anchor._split_prefill_threshold,
-        "kt-arena" if store is None else "pinned-store",
+        (
+            "direct-dma"
+            if direct_source is not None
+            else "ring-export"
+            if export_source is not None
+            else "kt-arena"
+            if store is None
+            else "pinned-store"
+        ),
     )
     return True
 
