@@ -231,7 +231,7 @@ _KT_SWAP_STATE = {"eager_forwards": 0, "windows": 0, "swaps": 0}
 # process cannot inherit stale layers.  (Keying a reset on layer_idx == 0 would
 # not work: K3's early layers are dense, so layer 0 is never an MoE layer.)
 _KT_SPLIT_PREFILL_LAYERS = []
-_KT_SPLIT_PREFILL_STATE = {"store": None, "pipeline": None}
+_KT_SPLIT_PREFILL_STATE = {"store": None, "pipeline": None, "export_source": None}
 
 # Smallest chunk worth paying the cold-expert stream for. The stream is a
 # fixed per-forward cost (~2.0 s measured: every cold expert lands once
@@ -6869,6 +6869,7 @@ def maybe_run_expert_swap_window(
         "layer_idx": None,
         "items": [],
         "prefetched": {},
+        "export_rows": {},
         # True while the staged items' "promoted" bytes came from the arena
         # source (checkpoint layout, no cold-store slot behind them). A batch
         # is never mixed: arena staging happens only when there is no store.
@@ -7009,33 +7010,35 @@ def maybe_run_expert_swap_window(
         layer_idx = layer.layer_id
         slot = None if store is None else store.slot_of(layer_idx, logical_id)
         if slot is None:
-            # Storeless promotion, preferred source first: this rank's mapping
-            # of kt's resident buffers -- a ~2.2 MB RAM read instead of a
-            # checkpoint read. Requires the swizzle plan (checkpoint layout
-            # cannot land in a resident row without it). Kept out of any batch
-            # with store-backed items by construction: this branch only runs
-            # when there is no store at all.
+            # Storeless promotion, preferred sources in order: the layer's
+            # batched ring export (staged by _begin_layer), then this rank's
+            # arena mapping -- either way ~2.2 MB of RAM instead of a
+            # checkpoint read, in checkpoint layout for the batched swizzle.
+            # Kept out of any batch with store-backed items by construction:
+            # this branch only runs when there is no store at all.
             if store is None and _KT_SPLIT_PREFILL_STATE.get("swizzle_plan") is not None:
-                src = arena_source_for(layer_idx)
-                if src is not None:
-                    t0 = time.perf_counter()
-                    staged_row = _arena_stage_row(src, logical_id)
-                    _timing["read_s"] += time.perf_counter() - t0
-                    if staged_row is not None:
-                        if _pending["layer_idx"] != layer_idx:
-                            _flush_moves()
-                            _pending["layer"] = layer
-                            _pending["layer_idx"] = layer_idx
-                        _pending["items"].append(
-                            {
-                                "dst_row": dst_row,
-                                "slot": None,
-                                "demoted_id": demoted_id,
-                                "promoted": staged_row,
-                            }
-                        )
-                        _pending["arena"] = True
-                        return
+                staged_row = _pending["export_rows"].pop(logical_id, None)
+                if staged_row is None:
+                    src = arena_source_for(layer_idx)
+                    if src is not None:
+                        t0 = time.perf_counter()
+                        staged_row = _arena_stage_row(src, logical_id)
+                        _timing["read_s"] += time.perf_counter() - t0
+                if staged_row is not None:
+                    if _pending["layer_idx"] != layer_idx:
+                        _flush_moves()
+                        _pending["layer"] = layer
+                        _pending["layer_idx"] = layer_idx
+                    _pending["items"].append(
+                        {
+                            "dst_row": dst_row,
+                            "slot": None,
+                            "demoted_id": demoted_id,
+                            "promoted": staged_row,
+                        }
+                    )
+                    _pending["arena"] = True
+                    return
             # No store, or the expert left the cold set (a re-promotion inside
             # one window). The checkpoint path writes the GPU row immediately,
             # so drain anything staged for this layer first -- otherwise a
@@ -7154,6 +7157,48 @@ def maybe_run_expert_swap_window(
         the checkpoint-fallback path that writes its row immediately.
         """
         _pending["prefetched"] = {}
+        _pending["export_rows"] = {}
+        # Export-design promotions: ONE batched raw export of this layer's
+        # promoted experts into stage 0 of every rank's cold ring. Every rank
+        # calls this with the identical plan (rank 0 exports, peers wait the
+        # ring flag), the window is quiesced so stage 0 is free, and the rows
+        # are consumed (stack-copied) by _flush_moves before the next layer's
+        # begin can overwrite them. ~1 ms per layer at swap-max 8.
+        exp_src = _KT_SPLIT_PREFILL_STATE["export_source"]
+        if (
+            exp_src is not None
+            and store is None
+            and _KT_SPLIT_PREFILL_STATE.get("swizzle_plan") is not None
+        ):
+            t0 = time.perf_counter()
+            try:
+                staged = exp_src.export_experts_sync(
+                    entry["layer_idx"], [s.promote for s in swaps]
+                )
+            except Exception:
+                logger.exception(
+                    "[kt-export] promotion export failed for layer %s; this "
+                    "layer falls back to the checkpoint",
+                    entry.get("layer_idx"),
+                )
+            else:
+                from sglang.srt.layers.moe.expert_cold_store import WEIGHT_NAMES
+
+                # CLONES, not views: consumption must complete before the
+                # per-layer all_reduce below, which is what stops rank 0's
+                # NEXT layer's export from overwriting stage 0 while a
+                # lagging peer still reads it (the review's promotion-WAR
+                # finding). ~18 MB per layer at swap-max 8.
+                _pending["export_rows"] = {
+                    int(s.promote): {
+                        res: staged[raw][i].clone()
+                        for res, raw in zip(
+                            _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES, WEIGHT_NAMES
+                        )
+                    }
+                    for i, s in enumerate(swaps)
+                }
+            _timing["read_s"] += time.perf_counter() - t0
         method = entry.get("method")
         want = (
             gpu_reader is not None
@@ -7628,42 +7673,107 @@ def finalize_split_prefill(server_args) -> bool:
                    getattr(anchor_layer, name).dtype)
             for name in WEIGHT_NAMES
         }
-        # ARENA MODE first: under full-kt + KT_BUFFER_B_MEMFD every rank
-        # already maps every expert's checkpoint-layout bytes, so a pinned
-        # store would duplicate ~0.4 TB of them -- the duplication this whole
-        # design exists to remove. Requires the swizzle plan (raw bytes cannot
-        # land in a resident row without it) and full residency (arena offsets
-        # go stale across swap_expert_slot under cold-only).
+        # EXPORT MODE first (the design of record): kt keeps anonymous weight
+        # memory and its own pool fills small per-rank pinned rings with a
+        # batched raw export -- measured 30.7 ms/layer with NUMA-local rings,
+        # bitwise-verified. Capability lives on rank 0's wrapper only, so it
+        # is decided ONCE and broadcast before any collective ring work; a
+        # per-rank guess here is exactly the class of divergence the arming
+        # consensus below exists to catch, but a boot-time broadcast is
+        # cheaper than burning the whole build on it.
+        methods_by_layer = {
+            m.kt_config.layer_idx: m for m, _ in _KT_SPLIT_PREFILL_LAYERS
+        }
+        num_gpu = anchor.num_gpu_experts
+        num_cold = anchor.global_num_experts - num_gpu
+
+        def cold_slot_expert_ids(layer_idx):
+            return _invert_cold_slot_table(
+                methods_by_layer[layer_idx].logical_to_slot, num_gpu, num_cold
+            )
+
+        can_export = False
+        if get_parallel().tp_rank == 0:
+            wrappers = {
+                li: m.wrapper for li, m in methods_by_layer.items()
+            }
+            can_export = all(
+                w is not None and hasattr(w, "submit_write_raw_experts_to_buffer")
+                and hasattr(w.moe, "write_raw_experts_to_buffer_task")
+                for w in wrappers.values()
+            )
+        holder = [can_export]
+        if dist.is_initialized() and get_parallel().tp_size > 1:
+            dist.broadcast_object_list(
+                holder,
+                src=get_tp_group().first_rank,
+                group=get_tp_group().cpu_group,
+            )
+        use_export = holder[0] and not anchor.kt_config.cold_only_cpu_experts
+
+        raw_shapes = swizzle_plan = None
+        if use_export:
+            # Per-rank fallible (checkpoint read, device allocs) feeding a
+            # COLLECTIVE ring build: the outcome must be unanimous or one
+            # failed rank skips the rings' broadcast/barriers while seven
+            # enter them. Every rank reaches this consensus because
+            # use_export is uniform (broadcast capability AND launch config).
+            raw_shapes, swizzle_plan = _build_dynamic_swizzle_plan(anchor, device)
+            use_export = _all_tp_ranks_succeeded(
+                swizzle_plan is not None and raw_shapes is not None
+            )
+        store = None
+        export_source = None
+        if use_export:
+            from sglang.srt.layers.moe.kt_export_source import (
+                ExportColdSource,
+                build_cold_rings,
+            )
+
+            my_ring, peer_rings = build_cold_rings(
+                tp_rank=get_parallel().tp_rank,
+                tp_size=get_parallel().tp_size,
+                num_cold=num_cold,
+                raw_shapes=raw_shapes,
+            )
+            source = ExportColdSource(
+                tp_rank=get_parallel().tp_rank,
+                tp_size=get_parallel().tp_size,
+                my_ring=my_ring,
+                peer_rings=peer_rings,
+                cold_slot_expert_ids=cold_slot_expert_ids,
+                raw_shapes=raw_shapes,
+                moe_layer_indices=layer_indices,
+                num_cold=num_cold,
+                wrappers_by_layer=(
+                    wrappers if get_parallel().tp_rank == 0 else None
+                ),
+            )
+            export_source = source
+            dynamic = True
+            logger.info(
+                "[split-prefill] cold experts stream via kt's batched raw "
+                "export into per-rank rings; no mapping, no pinned store"
+            )
+
+        # ARENA MODE second: under full-kt + KT_BUFFER_B_MEMFD every rank
+        # already maps every expert's checkpoint-layout bytes. Kept as the
+        # bridge configuration while the export design proves out.
         from sglang.srt.layers.moe.kt_arena_share import arena_source_for
 
         arena_sources = {li: arena_source_for(li) for li in layer_indices}
-        use_arena = not anchor.kt_config.cold_only_cpu_experts and all(
-            s is not None for s in arena_sources.values()
+        use_arena = (
+            not use_export
+            and not anchor.kt_config.cold_only_cpu_experts
+            and all(s is not None for s in arena_sources.values())
         )
-        raw_shapes = swizzle_plan = None
         if use_arena:
             raw_shapes, swizzle_plan = _build_dynamic_swizzle_plan(anchor, device)
             use_arena = swizzle_plan is not None and raw_shapes is not None
-        dynamic = use_arena
-        store = None
+        if not use_export:
+            dynamic = use_arena
         if use_arena:
             from sglang.srt.layers.moe.expert_pipeline import ArenaColdSource
-
-            methods_by_layer = {
-                m.kt_config.layer_idx: m for m, _ in _KT_SPLIT_PREFILL_LAYERS
-            }
-            num_gpu = anchor.num_gpu_experts
-            num_cold = anchor.global_num_experts - num_gpu
-
-            def cold_slot_expert_ids(layer_idx):
-                # Invert the cold half of the LIVE slot table: staging row j
-                # gets the expert whose slot is num_gpu + j. Derived from
-                # logical_to_slot -- the table routing reads and swaps
-                # exchange -- never from mask order, which goes stale the
-                # moment a window acts.
-                return _invert_cold_slot_table(
-                    methods_by_layer[layer_idx].logical_to_slot, num_gpu, num_cold
-                )
 
             source = ArenaColdSource(
                 sources_by_layer=arena_sources,
@@ -7676,7 +7786,7 @@ def finalize_split_prefill(server_args) -> bool:
                 "[split-prefill] cold experts stream from the kt arena "
                 "mapping; no pinned store built"
             )
-        else:
+        elif not use_export:
             dynamic = envs.SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE.get()
             raw_shapes, swizzle_plan = (
                 _build_dynamic_swizzle_plan(anchor, device)
@@ -7721,7 +7831,7 @@ def finalize_split_prefill(server_args) -> bool:
             "[split-prefill] build failed; falling back to the margin-routed "
             "CPU path for every layer"
         )
-        store = source = pipeline = None
+        store = source = pipeline = export_source = None
 
     # Arming is all-or-nothing ACROSS RANKS. The hot gate is rank-local, and a
     # split rank set is silent corruption, not a crash: armed ranks contribute
@@ -7739,14 +7849,21 @@ def finalize_split_prefill(server_args) -> bool:
                 "[split-prefill] disarmed: another rank failed to build; "
                 "every rank keeps the margin-routed CPU path"
             )
+        if export_source is not None:
+            try:
+                export_source.close()
+            except Exception:
+                logger.exception("[kt-export] teardown on disarm failed")
         for method, _ in _KT_SPLIT_PREFILL_LAYERS:
             method._split_prefill_ready = False
         _KT_SPLIT_PREFILL_STATE["store"] = None
         _KT_SPLIT_PREFILL_STATE["pipeline"] = None
+        _KT_SPLIT_PREFILL_STATE["export_source"] = None
         return False
 
     _KT_SPLIT_PREFILL_STATE["store"] = store
     _KT_SPLIT_PREFILL_STATE["pipeline"] = pipeline
+    _KT_SPLIT_PREFILL_STATE["export_source"] = export_source
     # The swap path needs these too: against a raw store a promotion must
     # swizzle on the way to the GPU and a demotion must unswizzle on the way
     # back, or the two sides silently disagree about layout.
