@@ -95,6 +95,10 @@ class IntervalRegistrar:
     runs on the forward thread or inside a quiesced swap window.
     """
 
+    # Backoff schedule for transient (rc=2) registration failures; class
+    # attribute so tests can zero the sleeps.
+    RETRY_DELAYS = (0.1, 0.5, 2.0)
+
     def __init__(
         self,
         *,
@@ -212,6 +216,20 @@ class IntervalRegistrar:
                 pieces.append((prev, g_hi))
                 for p_lo, p_hi in pieces:
                     rc = self._register(p_lo, p_hi - p_lo)
+                    # rc 2 (cudaErrorMemoryAllocation) is TRANSIENT here:
+                    # D1's boot saw 5/8 ranks fail within one second at peak
+                    # page-cache pressure (1.6 TB of shard reads still
+                    # resident) while 3 ranks sailed through the identical
+                    # 102 GiB -- kernel allocation pressure during the 8-way
+                    # registration storm, not a cap (Probe B registered
+                    # 850 GB nominal cleanly). Back off and retry: reclaim
+                    # needs a moment, not a redesign.
+                    if rc == 2:
+                        for delay in self.RETRY_DELAYS:
+                            time.sleep(delay)
+                            rc = self._register(p_lo, p_hi - p_lo)
+                            if rc != 2:
+                                break
                     if rc != 0:
                         logger.error(
                             "[kt-dma] cudaHostRegister(%#x, %d) failed rc=%d; "

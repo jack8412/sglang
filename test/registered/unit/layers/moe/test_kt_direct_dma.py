@@ -97,14 +97,17 @@ class FakeCuda:
     def __init__(self, fail_at=None):
         self.regions = {}  # base -> size
         self.calls = []
-        self.fail_at = fail_at  # register-call index to fail, or None
+        # Fail every register call from this index on (persistent failure --
+        # the registrar retries rc=2 with backoff, so a one-shot failure
+        # would be absorbed by the retry rather than exercising rollback).
+        self.fail_at = fail_at
         self._n = 0
 
     def register(self, ptr, nbytes):
         self.calls.append(("reg", ptr, nbytes))
         assert ptr % PAGE == 0 and nbytes % PAGE == 0, "registrar must page-align"
         self._n += 1
-        if self.fail_at is not None and self._n == self.fail_at:
+        if self.fail_at is not None and self._n >= self.fail_at:
             return 2  # cudaErrorMemoryAllocation
         for base, size in self.regions.items():
             if ptr < base + size and base < ptr + nbytes:
@@ -121,7 +124,9 @@ class FakeCuda:
 
 
 def make_registrar(fake):
-    return IntervalRegistrar(register_fn=fake.register, unregister_fn=fake.unregister)
+    reg = IntervalRegistrar(register_fn=fake.register, unregister_fn=fake.unregister)
+    reg.RETRY_DELAYS = (0, 0, 0)  # keep persistent-failure tests fast
+    return reg
 
 
 class TestMergeRanges(unittest.TestCase):
@@ -158,6 +163,23 @@ class TestIntervalRegistrar(unittest.TestCase):
             sorted(fake.regions.items()),
             [(0, 3 * PAGE), (3 * PAGE, 2 * PAGE), (5 * PAGE, 3 * PAGE)],
         )
+
+    def test_transient_rc2_is_retried(self):
+        """One rc=2 then success: the acquire must survive (D1's boot saw
+        5/8 ranks fail on exactly this -- transient kernel pressure)."""
+
+        class OneShot(FakeCuda):
+            def register(self, ptr, nbytes):
+                self._n += 1
+                if self._n == 1:
+                    self.calls.append(("reg", ptr, nbytes))
+                    return 2
+                return super().register(ptr, nbytes)
+
+        fake = OneShot()
+        reg = make_registrar(fake)
+        self.assertTrue(reg.acquire("a", [(0, 2 * PAGE)]))
+        self.assertEqual(reg.registered_bytes(), 2 * PAGE)
 
     def test_failed_acquire_rolls_back(self):
         fake = FakeCuda(fail_at=2)
