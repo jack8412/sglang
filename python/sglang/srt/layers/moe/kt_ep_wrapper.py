@@ -8306,6 +8306,7 @@ def _start_demotion_prefetch(anchor, entries):
     the GPU, which deadlocked three times for exactly that reason.
     """
     import threading
+    from concurrent.futures import ThreadPoolExecutor
 
     state = _KT_SWAP_STATE.get("prefetch")
     if state is not None and not state["done"].is_set():
@@ -8345,18 +8346,35 @@ def _start_demotion_prefetch(anchor, entries):
     data: dict = {}
     _KT_SWAP_STATE["prefetch"] = {"done": done, "data": data, "planned": len(plan)}
 
+    def _read_one(item):
+        layer, layer_idx, p2l, demote_id = item
+        try:
+            # Cache key stays the PLAN id (that is what the window looks
+            # up); only the checkpoint read arg translates.
+            data[(layer_idx, demote_id)] = mover.read_full_expert(
+                layer, _checkpoint_id(p2l, demote_id)
+            )
+        except Exception:
+            pass  # a miss just costs a synchronous read later
+
     def _work():
         t0 = time.perf_counter()
         try:
-            for layer, layer_idx, p2l, demote_id in plan:
-                try:
-                    # Cache key stays the PLAN id (that is what the window
-                    # looks up); only the checkpoint read arg translates.
-                    data[(layer_idx, demote_id)] = mover.read_full_expert(
-                        layer, _checkpoint_id(p2l, demote_id)
-                    )
-                except Exception:
-                    pass  # a miss just costs a synchronous read later
+            # PARALLEL, and the parallelism is the point. A window demotes
+            # 8 experts x 92 layers = 736 FULL experts (kt needs every NUMA
+            # partition, not this rank's slice) = ~12.9 GB, and it arrives
+            # as ~4.4k scattered 2-3 MB tensor ranges out of mmap'd
+            # safetensors. Read serially that is page-fault-bound at ~0.6
+            # GB/s -- the ~22 s of fetch measured in a ~31 s window -- on an
+            # NVMe that streams several GB/s. The reads release the GIL and
+            # are independent, so overlapping them is what actually lets the
+            # device be the limit. (The GPU read-back route avoids the disk
+            # entirely and is faster still; this is the floor when it is
+            # off or misses.)
+            with ThreadPoolExecutor(
+                max_workers=8, thread_name_prefix="kt-swap-prefetch"
+            ) as pool:
+                list(pool.map(_read_one, plan))
         finally:
             _KT_SWAP_STATE["prefetch"]["seconds"] = time.perf_counter() - t0
             done.set()
@@ -8365,7 +8383,9 @@ def _start_demotion_prefetch(anchor, entries):
         target=_work, name="kt-swap-prefetch", daemon=True
     ).start()
     logger.info(
-        "[kt-swap] prefetching %d demoted experts off the critical path", len(plan)
+        "[kt-swap] prefetching %d demoted experts off the critical path "
+        "(8 reader threads)",
+        len(plan),
     )
 
 
@@ -8638,14 +8658,28 @@ def _build_dynamic_swizzle_plan(anchor, device):
 def _get_or_create_gpu_reader():
     """Process-wide reader for demoted experts; None if disabled or unbuildable.
 
-    Off by default. The read-back itself is proved bitwise, but it reaches the
-    full expert through a TP all-gather, and the install path it lives in has
-    data-dependent early-outs (no cold-store slot, a row already written, a
-    disabled route). Ranks that disagree on how many collectives to run
-    deadlock the window rather than falling back -- observed as an
-    _ALLGATHER_BASE timing out after 600 s with the NCCL watchdog killing the
-    process group. Re-enable once the collective count is a pure function of
-    the per-layer swap plan rather than of those early-outs.
+    WHY IT IS WORTH USING. A window demotes 8 experts x 92 layers = 736 FULL
+    experts, ~12.9 GB, and the disk route reads that as ~4.4k scattered
+    2-3 MB ranges out of mmap'd safetensors (measured ~22 s of fetch in a
+    ~31 s window). The bytes are already in VRAM -- they are the resident
+    rows about to be overwritten -- so this route unswizzles them and
+    all-gathers the full expert over NVLink instead, which is microseconds
+    of transfer against seconds of disk.
+
+    WHY IT WAS OFF, AND WHY IT IS ON NOW. The read-back is proved bitwise,
+    but it reaches the full expert through a TP all-gather, and the install
+    path it lived in had data-dependent early-outs (no cold-store slot, a
+    row already written, a disabled route). Ranks that disagreed on how many
+    collectives to run deadlocked the window rather than falling back --
+    observed as an _ALLGATHER_BASE timing out after 600 s with the NCCL
+    watchdog killing the process group. The condition for re-enabling was
+    that the collective count become a pure function of the per-layer swap
+    plan, and it now is: `_begin_layer` runs ONCE per layer with the whole
+    plan, and its decision goes through `_all_tp_ranks_succeeded(want)`,
+    which every rank executes whether or not it consumes the gather. A
+    residual disagreement therefore degrades to "no rank uses the GPU route
+    on this layer" instead of hanging. SGLANG_KT_SWAP_GPU_READBACK=0 still
+    forces the disk route if a window ever misbehaves.
     """
     if not envs.SGLANG_KT_SWAP_GPU_READBACK.get():
         return None
