@@ -163,15 +163,32 @@ ARG KT_REF=feat/mxfp4-kimi-k3
 # Pinned so a rebuild is reproducible; pass KT_COMMIT= (empty) to track the
 # branch tip instead.
 #
-# This is the sha the NODE actually runs (k3.sh doctor, 2026-08-14:
-# "kt efb25f1 staging: let the host-node path dispatch from the packed buffer").
-# It is deliberately NOT the sha in CLAUDE.md's Pins section
-# (ab677cb43c9c2998694dc8d5e18fb6c34231b7b8) -- that records the Session-1
-# wheel and PREDATES packed staging: `submit_forward_packed` does not appear
-# anywhere in it. Building against it produces a kt_kernel that installs and
-# imports cleanly and then cannot serve this branch's doorbell transport.
-# The packed-staging assert in step 5 is what caught it; leave that assert in.
-ARG KT_COMMIT=efb25f1bf4ffef3461a963e23dfb69c09e4987ba
+# EMPTY BY DEFAULT = track the branch tip, which is what sglang actually
+# references. k3ops/k3.sh pins no sha either: it sets
+# BRANCH_KT=feat/mxfp4-kimi-k3 and `deploy` does `git reset --hard FETCH_HEAD`,
+# so the node always runs the tip. A sha hardcoded here goes stale silently and
+# the image then serves older CPU kernels than the measurements it is compared
+# against -- which already happened once with ab677cb (the Session-1 wheel,
+# which predates packed staging: a wheel built from it installs, imports and
+# reports 0.6.4 cleanly, then cannot serve --kt-transport doorbell). The
+# packed-staging assert in step 5 is what caught it; leave that assert in.
+#
+# CACHING CAVEAT -- read before relying on the empty default. BuildKit keys a
+# RUN on its command string, and "clone the branch tip" does not change when
+# the remote moves, so a rebuild happily reuses a STALE cached clone. Tracking
+# the tip therefore requires passing the resolved sha in, which both busts the
+# cache and records what you actually got:
+#
+#   --build-arg KT_COMMIT=$(git ls-remote \
+#       https://github.com/jack8412/ktransformers.git feat/mxfp4-kimi-k3 | cut -f1)
+#
+# That is the recommended invocation: always current, still reproducible. Pass
+# an explicit older sha to rebuild a past image; pass nothing only when you do
+# not care which tip you get AND the kt layer is not already cached.
+#
+# The resolved sha is written to /opt/k3-build-info.txt inside the image, so
+# provenance survives even when the input was not pinned.
+ARG KT_COMMIT=
 ARG KT_CPU_VARIANT=all
 ARG KT_CUDA_ARCHS=
 ARG TORCH_PIN=2.13.0
@@ -299,7 +316,16 @@ RUN git clone ${KT_REPO} ${WS}/ktransformers \
     && git submodule update --init --recursive third_party/pybind11 third_party/llama.cpp \
     && test -f third_party/pybind11/CMakeLists.txt \
     && test -f third_party/llama.cpp/CMakeLists.txt \
-    && echo "kt $(git log --oneline -1)"
+    && echo "kt $(git log --oneline -1)" \
+    # Record the RESOLVED sha in the image. With KT_COMMIT empty (branch-tip
+    # tracking) the build ARG does not say what was actually built, and the
+    # LABEL cannot be computed from a RUN -- so write it to a file. This is the
+    # only way to answer "which kt is in this image?" after the fact.
+    && printf 'kt_repo=%s\nkt_ref=%s\nkt_commit_requested=%s\nkt_commit_resolved=%s\nkt_subject=%s\n' \
+         "${KT_REPO}" "${KT_REF}" "${KT_COMMIT:-<branch tip>}" \
+         "$(git rev-parse HEAD)" "$(git log -1 --format=%s)" \
+         > /opt/k3-build-info.txt \
+    && cat /opt/k3-build-info.txt
 
 # --- 5. kt-kernel (traps 1 and 3) ------------------------------------------
 # The CPUINFER_* block is setup.py's variant preset, set explicitly so nothing
