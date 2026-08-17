@@ -76,33 +76,52 @@ class SlotOffsets:
     them locally and the table stays exact without any communication.
     """
 
-    def __init__(self, rows: Sequence[Sequence[int]], *, experts: int, part: int):
-        # rows are [partition * experts + expert]; keep only this rank's
-        # partition, as six offsets or None.
-        self._by_expert: List[Optional[List[int]]] = []
-        base = part * experts
-        for e in range(experts):
-            row = [int(v) for v in rows[base + e]]
-            self._by_expert.append(None if row[_GATE_B] < 0 else row)
+    def __init__(self, rows: Sequence[Sequence[int]], *, experts: int, numa: int):
+        # EVERY partition, not just this rank's. kt's move_slot_only checks
+        # its preconditions on ALL partitions (it runs under do_numa_job), so
+        # a rank that validated only its own would disagree with kt about
+        # whether a move is legal -- and a fault confined to partition 1 would
+        # make ranks 4-7 refuse while ranks 0-3 proceed, splitting the group
+        # 3-vs-5. Validating the same thing kt validates keeps every rank's
+        # verdict identical.
+        self._by_part: List[List[Optional[List[int]]]] = []
+        for part in range(numa):
+            base = part * experts
+            self._by_part.append(
+                [
+                    None
+                    if int(rows[base + e][_GATE_B]) < 0
+                    else [int(v) for v in rows[base + e]]
+                    for e in range(experts)
+                ]
+            )
 
-    def get(self, expert: int) -> Optional[List[int]]:
-        return self._by_expert[expert]
+    def get(self, expert: int, part: int) -> Optional[List[int]]:
+        return self._by_part[part][expert]
+
+    def can_move(self, promote_id: int, demote_id: int) -> Optional[str]:
+        """None if the move is legal on EVERY partition, else why not."""
+        for part, table in enumerate(self._by_part):
+            if table[promote_id] is None:
+                return (
+                    f"promoted expert {promote_id} holds no buffer in "
+                    f"partition {part}"
+                )
+            if table[demote_id] is not None:
+                return (
+                    f"demoted expert {demote_id} already holds a buffer in "
+                    f"partition {part}"
+                )
+        return None
 
     def apply_move(self, promote_id: int, demote_id: int) -> None:
-        """Mirror kt's move: promoted expert's buffers become the demoted's."""
-        row = self._by_expert[promote_id]
-        if row is None:
-            raise RuntimeError(
-                f"slot move {promote_id}->{demote_id}: promoted expert has no "
-                "buffer in this partition's arena"
-            )
-        if self._by_expert[demote_id] is not None:
-            raise RuntimeError(
-                f"slot move {promote_id}->{demote_id}: demoted expert already "
-                "holds a buffer"
-            )
-        self._by_expert[demote_id] = row
-        self._by_expert[promote_id] = None
+        """Mirror kt's move on every partition, or refuse on every partition."""
+        why = self.can_move(promote_id, demote_id)
+        if why is not None:
+            raise RuntimeError(f"slot move {promote_id}->{demote_id}: {why}")
+        for table in self._by_part:
+            table[demote_id] = table[promote_id]
+            table[promote_id] = None
 
 
 class RankShardWriter:
@@ -176,17 +195,40 @@ class RankShardWriter:
 
     # -- step 3: write, after kt has moved the slot ------------------------
 
-    def write(self, layer_idx: int, promote_id: int, demote_id: int) -> bool:
-        """Write this rank's slice of ``demote_id`` into the buffers it is about
-        to inherit -- BEFORE anything moves.
+    def validate(self, layer_idx: int, swaps) -> Optional[str]:
+        """Everything that can refuse, checked BEFORE any state moves.
 
-        The target address is the same either way: kt's move reassigns which
-        expert id owns a BufferB, not where it lives, so writing at the
-        PROMOTED expert's offsets writes exactly the bytes the demoted expert
-        will own. Doing it in this order is what makes the move the commit
-        point -- a failed write leaves kt's ownership untouched, where the
-        first cut left the slot already moved and irrecoverable (move_slot_only
-        nulls the promoted entry, so it cannot be moved back).
+        This is what makes the ordering safe. The write must happen AFTER
+        kt's move -- writing beforehand would blit the demoted expert's bytes
+        over the PROMOTED expert's live buffer, and if the layer then aborted,
+        that expert stays CPU-routable with corrupted weights. But the move is
+        irreversible (move_slot_only nulls the promoted entry), so nothing
+        fallible may follow it. Hoisting every check here satisfies both: the
+        move happens only once the write is known to be possible.
+
+        Returns None if every pair is installable, else the first reason.
+        """
+        if self._staged_layer != layer_idx:
+            return f"no shards captured for layer {layer_idx}"
+        offsets = self._offsets.get(layer_idx)
+        if offsets is None:
+            return f"no offset table for layer {layer_idx}"
+        for s in swaps:
+            demote_id = int(s.demote)
+            if demote_id not in self._staged:
+                return f"expert {demote_id} was not captured"
+            why = offsets.can_move(int(s.promote), demote_id)
+            if why is not None:
+                return why
+        return None
+
+    def write(self, layer_idx: int, promote_id: int, demote_id: int) -> bool:
+        """Write this rank's slice into the buffers the demoted expert now owns.
+
+        Call AFTER kt's move and after ``validate`` passed for this layer: the
+        buffers already belong to the demoted expert, so overwriting them is
+        correct rather than destructive, and everything that could refuse has
+        already been checked.
         """
         if self._staged_layer != layer_idx:
             return False
@@ -196,16 +238,11 @@ class RankShardWriter:
         t0 = time.perf_counter()
         try:
             offsets = self._offsets[layer_idx]
-            row = offsets.get(int(promote_id))
+            row = offsets.get(int(demote_id), self._g.part)
             if row is None:
                 raise RuntimeError(
-                    f"promoted expert {promote_id} holds no buffer in this "
-                    f"partition's arena (layer {layer_idx})"
-                )
-            if offsets.get(int(demote_id)) is not None:
-                raise RuntimeError(
-                    f"demoted expert {demote_id} already holds a buffer "
-                    f"(layer {layer_idx})"
+                    f"expert {demote_id} holds no buffer in partition "
+                    f"{self._g.part} after the move (layer {layer_idx})"
                 )
             arena = self._arena[layer_idx]
             g = self._g

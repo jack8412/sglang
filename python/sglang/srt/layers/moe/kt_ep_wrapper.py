@@ -7189,32 +7189,39 @@ def maybe_run_expert_swap_window(
         writer = _KT_SWAP_STATE.get("rank_writer")
         if writer is not None and _pending.get("rank_write"):
             t0 = time.perf_counter()
-            # WRITE FIRST, MOVE SECOND. The bytes land at the promoted
-            # expert's offsets either way -- kt's move reassigns ownership,
-            # not addresses -- so this ordering costs nothing and makes the
-            # move the commit point: a failed write leaves kt untouched,
-            # where moving first left the slot moved and unrecoverable.
-            ok = writer.write(entry["layer_idx"], promote_id, demote_id)
-            if not ok:
-                _timing["install_s"] += time.perf_counter() - t0
-                raise SwapInstallError(
-                    f"rank-write demotion failed for demote={demote_id} on "
-                    f"layer {entry.get('layer_idx')}: the expert would hold a "
-                    "hole where this rank's slice belongs"
-                )
-            if method.wrapper is not None:
-                try:
+            # MOVE, COMMIT, THEN WRITE -- and never raise from here.
+            #
+            # Order: writing before the move would blit the demoted expert's
+            # bytes over the PROMOTED expert's LIVE buffer, and an aborted
+            # layer leaves that expert CPU-routable with corrupted weights.
+            # The move must therefore come first; everything that could
+            # refuse was hoisted into validate() at _begin_layer, before
+            # anything moved, so the irreversible step is only taken once the
+            # write is known to be possible.
+            #
+            # No raising: run_swap_window re-raises SwapInstallError out of
+            # the whole window, which on ONE rank sends it to the window-end
+            # barrier while seven peers keep issuing per-layer all_reduces --
+            # the M11/M12 split. Failures are recorded and turned into a
+            # UNANIMOUS abort by the per-layer consensus in _finish_layer.
+            try:
+                if method.wrapper is not None:
                     method.wrapper.move_expert_slot(promote_id, demote_id)
-                except Exception as exc:
-                    _timing["install_s"] += time.perf_counter() - t0
-                    raise SwapInstallError(
-                        f"kt slot move failed for demote={demote_id} "
-                        f"promote={promote_id} on layer {entry.get('layer_idx')}"
-                    ) from exc
-            # Every rank mirrors the move kt just made, wrapper or not: the
-            # arena is shared, so a rank that misses one is silently a swap
-            # behind for the rest of the process's life.
-            writer.commit_move(entry["layer_idx"], promote_id, demote_id)
+                # Every rank mirrors the move kt just made, wrapper or not:
+                # the arena is shared, so a rank that misses one is silently a
+                # swap behind for the rest of the process's life.
+                writer.commit_move(entry["layer_idx"], promote_id, demote_id)
+                if not writer.write(entry["layer_idx"], promote_id, demote_id):
+                    raise RuntimeError("write refused after validation")
+            except Exception:
+                logger.exception(
+                    "[kt-rankwrite] install failed for demote=%s promote=%s on "
+                    "layer %s; the layer will abort on every rank",
+                    demote_id,
+                    promote_id,
+                    entry.get("layer_idx"),
+                )
+                _pending["install_failed"] = True
             _timing["install_s"] += time.perf_counter() - t0
             return
 
@@ -7353,6 +7360,7 @@ def maybe_run_expert_swap_window(
         armed = bool(_KT_SWAP_STATE.get("rank_write_armed"))
         writer = _KT_SWAP_STATE.get("rank_writer") if armed else None
         captured = False
+        _pending["install_failed"] = False
         if writer is not None and swaps:
             t0 = time.perf_counter()
             captured = writer.capture(
@@ -7361,6 +7369,21 @@ def maybe_run_expert_swap_window(
                 rows,
                 [s.demote for s in swaps],
             )
+            if captured:
+                # Every refusal, checked while everything is still undone.
+                # After this the install performs an IRREVERSIBLE kt move, so
+                # nothing fallible may remain -- and the outcome rides the one
+                # consensus below, making the verdict unanimous instead of
+                # per-rank.
+                why = writer.validate(entry["layer_idx"], swaps)
+                if why is not None:
+                    logger.error(
+                        "[kt-rankwrite] layer %s not installable (%s); this "
+                        "layer falls back to the checkpoint on every rank",
+                        entry.get("layer_idx"),
+                        why,
+                    )
+                    captured = False
             _timing["read_s"] += time.perf_counter() - t0
 
         want = (
@@ -7490,6 +7513,29 @@ def maybe_run_expert_swap_window(
         for s in swaps:
             dma_src.window_release(entry["layer_idx"], s.promote)
 
+    def _finish_layer():
+        """Apply the layer's batched GPU moves, then agree on the outcome.
+
+        The second half is what makes an install failure survivable. A
+        rank-local raise out of the window is the M11/M12 split -- one rank at
+        the window-end barrier, seven still issuing per-layer all_reduces --
+        so the rank-write install records failures instead of raising, and
+        this ONE consensus turns any rank's failure into the SAME abort on
+        every rank. run_swap_window then leaves the layer's tables unflipped
+        everywhere, which is the state it is designed to recover from.
+
+        Called once per layer with swaps, on every rank, from the same hook:
+        symmetric by construction.
+        """
+        _flush_moves()
+        if not _KT_SWAP_STATE.get("rank_write_armed"):
+            return
+        if not _all_tp_ranks_succeeded(not _pending.get("install_failed")):
+            raise SwapInstallError(
+                "rank-write install failed on at least one rank; every rank "
+                "aborts this layer with its tables unflipped"
+            )
+
     def _on_layer_abort(entry):
         # The layer failed after _begin_layer: tables never flipped, its
         # demoted experts stay resident, and nothing else would ever release
@@ -7515,7 +7561,7 @@ def maybe_run_expert_swap_window(
             move_weights=_move,
             install_cpu_expert=_install_cpu,
             begin_layer=_begin_layer,
-            finish_layer=_flush_moves,
+            finish_layer=_finish_layer,
             after_flip=_after_flip,
             on_layer_abort=_on_layer_abort,
             quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
@@ -8945,9 +8991,7 @@ def _get_or_create_rank_writer(entry):
                     li: s._arenas[geom.part] for li, s in sources.items()
                 },
                 offsets_by_layer={
-                    li: SlotOffsets(
-                        s._rows, experts=s.experts, part=geom.part
-                    )
+                    li: SlotOffsets(s._rows, experts=s.experts, numa=s.numa)
                     for li, s in sources.items()
                 },
                 geometry=geom,

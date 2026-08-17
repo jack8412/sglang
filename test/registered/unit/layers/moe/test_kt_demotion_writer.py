@@ -161,32 +161,47 @@ def _offset_rows(experts, numa, resident_ids):
 class TestSlotOffsets(unittest.TestCase):
     def test_move_transfers_the_buffer_and_leaves_a_hole(self):
         rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1, 2})
-        off = SlotOffsets(rows, experts=EXPERTS, part=0)
-        promoted = off.get(1)
+        off = SlotOffsets(rows, experts=EXPERTS, numa=NUMA)
+        promoted = off.get(1, 0)
         self.assertIsNotNone(promoted)
-        self.assertIsNone(off.get(4))
+        self.assertIsNone(off.get(4, 0))
         off.apply_move(1, 4)
-        self.assertEqual(off.get(4), promoted)
-        self.assertIsNone(off.get(1))
+        self.assertEqual(off.get(4, 0), promoted)
+        self.assertIsNone(off.get(1, 0))
 
     def test_move_refuses_an_absent_promoted_or_occupied_demoted(self):
         rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1})
-        off = SlotOffsets(rows, experts=EXPERTS, part=0)
+        off = SlotOffsets(rows, experts=EXPERTS, numa=NUMA)
         with self.assertRaises(RuntimeError):
             off.apply_move(3, 4)  # promoted holds nothing here
         with self.assertRaises(RuntimeError):
             off.apply_move(0, 1)  # demoted already holds one
 
-    def test_partitions_are_read_independently(self):
+    def test_a_move_applies_to_every_partition(self):
+        """kt's move_slot_only runs under do_numa_job, i.e. on ALL partitions.
+
+        A table that tracked only this rank's partition would disagree with kt
+        about whether a move is legal, and a fault confined to partition 1
+        would make ranks 4-7 refuse while ranks 0-3 proceeded -- a 3-vs-5
+        split of the group.
+        """
         rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1, 2})
-        p0 = SlotOffsets(rows, experts=EXPERTS, part=0)
-        p1 = SlotOffsets(rows, experts=EXPERTS, part=1)
-        # Same layout per partition, but they are separate objects: a move on
-        # one must not disturb the other (each rank owns only its own).
-        self.assertEqual(p0.get(2), p1.get(2))
-        p0.apply_move(2, 5)
-        self.assertIsNone(p0.get(2))
-        self.assertIsNotNone(p1.get(2))
+        off = SlotOffsets(rows, experts=EXPERTS, numa=NUMA)
+        before = [off.get(2, p) for p in range(NUMA)]
+        off.apply_move(2, 5)
+        for p in range(NUMA):
+            self.assertIsNone(off.get(2, p))
+            self.assertEqual(off.get(5, p), before[p])
+
+    def test_can_move_refuses_when_any_partition_refuses(self):
+        rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1, 2})
+        off = SlotOffsets(rows, experts=EXPERTS, numa=NUMA)
+        self.assertIsNone(off.can_move(1, 4))
+        # make partition 1 alone illegal, exactly the split-risk case
+        off._by_part[1][1] = None
+        self.assertIsNotNone(off.can_move(1, 4))
+        with self.assertRaises(RuntimeError):
+            off.apply_move(1, 4)
 
 
 class TestEightRanksReconstructTheExpert(unittest.TestCase):
@@ -206,13 +221,16 @@ class TestEightRanksReconstructTheExpert(unittest.TestCase):
             writer = RankShardWriter(
                 arena_by_layer={7: arena[geom.part]},
                 offsets_by_layer={
-                    7: SlotOffsets(rows, experts=EXPERTS, part=geom.part)
+                    7: SlotOffsets(rows, experts=EXPERTS, numa=NUMA)
                 },
                 geometry=geom,
                 # row index is arbitrary; map it to this rank's shard
                 shard_reader=_FakeReader({0: shards[rank]}),
             )
             self.assertTrue(writer.capture(object(), 7, [0], [demote_id]))
+            swaps = [types.SimpleNamespace(promote=promote_id, demote=demote_id)]
+            self.assertIsNone(writer.validate(7, swaps))
+            writer.commit_move(7, promote_id, demote_id)
             self.assertTrue(writer.write(7, promote_id, demote_id))
         return full, arena, rows
 
@@ -258,47 +276,55 @@ class TestEightRanksReconstructTheExpert(unittest.TestCase):
                     f"expert {other}'s buffers",
                 )
 
-    def test_write_does_not_move_the_slot_and_commit_does(self):
-        """Write-before-move: a failed write must leave kt's ownership alone.
+    def test_write_requires_the_move_to_have_happened(self):
+        """Move first, then write -- the reverse corrupts a live expert.
 
-        The first cut moved the slot first, so a write that failed left the
-        promoted entry nulled and unrecoverable (move_slot_only cannot be
-        undone). The write now targets the PROMOTED expert's offsets -- the
-        same bytes -- and commit_move is the commit point.
+        Writing before the move blits the demoted expert's bytes over the
+        PROMOTED expert's buffer, which is still CPU-routable until the tables
+        flip; an aborted layer then leaves it serving corrupted weights. So
+        write() addresses the DEMOTED expert and refuses until ownership has
+        actually moved.
         """
         full = _full_expert(seed=7)
         rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1, 2})
-        geom = _Geom(0)
-        offsets = SlotOffsets(rows, experts=EXPERTS, part=0)
+        offsets = SlotOffsets(rows, experts=EXPERTS, numa=NUMA)
         writer = RankShardWriter(
             arena_by_layer={7: torch.zeros(EXPERTS * PER_EXPERT, dtype=torch.uint8)},
             offsets_by_layer={7: offsets},
-            geometry=geom,
+            geometry=_Geom(0),
             shard_reader=_FakeReader({0: _rank_shard(full, 0)}),
         )
         writer.capture(object(), 7, [0], [4])
-        before = offsets.get(1)
-        self.assertTrue(writer.write(7, 1, 4))
-        # write() alone must not have transferred ownership
-        self.assertEqual(offsets.get(1), before)
-        self.assertIsNone(offsets.get(4))
+        # before the move the demoted expert owns nothing -> refuse
+        self.assertFalse(writer.write(7, 1, 4))
         writer.commit_move(7, 1, 4)
-        self.assertEqual(offsets.get(4), before)
-        self.assertIsNone(offsets.get(1))
+        self.assertTrue(writer.write(7, 1, 4))
 
-    def test_failed_write_leaves_the_table_untouched(self):
+    def test_validate_refuses_before_anything_moves(self):
+        """Every refusal must be known BEFORE the irreversible kt move.
+
+        move_slot_only nulls the promoted entry, so nothing fallible may run
+        after it. validate() is what lets the install commit only once the
+        write is known to be possible.
+        """
         rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1, 2})
-        offsets = SlotOffsets(rows, experts=EXPERTS, part=0)
+        offsets = SlotOffsets(rows, experts=EXPERTS, numa=NUMA)
         writer = RankShardWriter(
             arena_by_layer={7: torch.zeros(EXPERTS * PER_EXPERT, dtype=torch.uint8)},
             offsets_by_layer={7: offsets},
             geometry=_Geom(0),
             shard_reader=_FakeReader({}),
         )
-        # nothing captured for this expert -> write refuses
-        self.assertFalse(writer.write(7, 1, 4))
-        self.assertIsNotNone(offsets.get(1))
-        self.assertIsNone(offsets.get(4))
+        swaps = [types.SimpleNamespace(promote=1, demote=4)]
+        # nothing captured for this layer
+        self.assertIsNotNone(writer.validate(7, swaps))
+        # captured, but the promoted expert holds no buffer -> still refused
+        writer._staged_layer = 7
+        writer._staged[4] = {}
+        self.assertIsNotNone(
+            writer.validate(7, [types.SimpleNamespace(promote=3, demote=4)])
+        )
+        self.assertIsNotNone(offsets.get(1, 0))  # untouched
 
     def test_a_fallback_move_must_be_committed_or_later_writes_corrupt(self):
         """The checkpoint fallback moves kt's slot too.
@@ -313,7 +339,7 @@ class TestEightRanksReconstructTheExpert(unittest.TestCase):
         full = _full_expert(seed=11)
         rows = _offset_rows(EXPERTS, NUMA, resident_ids={0, 1, 2})
         arena = torch.zeros(EXPERTS * PER_EXPERT, dtype=torch.uint8)
-        offsets = SlotOffsets(rows, experts=EXPERTS, part=0)
+        offsets = SlotOffsets(rows, experts=EXPERTS, numa=NUMA)
         writer = RankShardWriter(
             arena_by_layer={7: arena},
             offsets_by_layer={7: offsets},
@@ -322,15 +348,15 @@ class TestEightRanksReconstructTheExpert(unittest.TestCase):
         )
         # window 1: checkpoint fallback installed 1 -> 4; only bookkeeping here
         writer.commit_move(7, 1, 4)
-        self.assertIsNone(offsets.get(1))
-        self.assertIsNotNone(offsets.get(4))
+        self.assertIsNone(offsets.get(1, 0))
+        self.assertIsNotNone(offsets.get(4, 0))
 
         # window 2: rank-write 2 -> 5 must use expert 2's buffer
         writer.capture(object(), 7, [0], [5])
-        expected_base = offsets.get(2)
-        self.assertTrue(writer.write(7, 2, 5))
+        expected_base = offsets.get(2, 0)
         writer.commit_move(7, 2, 5)
-        self.assertEqual(offsets.get(5), expected_base)
+        self.assertTrue(writer.write(7, 2, 5))
+        self.assertEqual(offsets.get(5, 0), expected_base)
         want = _kt_reference(full, part=0)["gate"]
         got = arena[expected_base[0] : expected_base[0] + want.numel()]
         # only rank 0's slice was written, so compare just that span
@@ -352,12 +378,13 @@ class TestEightRanksReconstructTheExpert(unittest.TestCase):
             writer = RankShardWriter(
                 arena_by_layer={7: arena[geom.part]},
                 offsets_by_layer={
-                    7: SlotOffsets(rows, experts=EXPERTS, part=geom.part)
+                    7: SlotOffsets(rows, experts=EXPERTS, numa=NUMA)
                 },
                 geometry=geom,
                 shard_reader=_FakeReader({0: shards[rank]}),
             )
             writer.capture(object(), 7, [0], [4])
+            writer.commit_move(7, 1, 4)
             writer.write(7, 1, 4)
         ref = _kt_reference(full, part=1)  # rank 5 lives in partition 1
         base = rows[1 * EXPERTS + 1]
