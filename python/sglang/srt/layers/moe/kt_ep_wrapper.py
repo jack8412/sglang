@@ -8911,6 +8911,7 @@ def _fatal_swap_failure(context: str) -> None:
     corruption class.
     """
     import os
+    import signal
 
     from sglang.srt.utils import kill_process_tree
 
@@ -8927,15 +8928,35 @@ def _fatal_swap_failure(context: str) -> None:
             handler.flush()
         except Exception:
             pass
-    # The whole server, not just this rank: the ranks are siblings under the
-    # launcher, so killing the tree from here stops peers before they can
-    # block on a collective this rank will never reach (the watchdog is set
-    # to 3600 s -- far too long to be the thing that notices).
+    # ONE SYSCALL, NOT A LOOP. kill_process_tree(os.getppid()) looks right and
+    # is not: it enumerates the launcher's children -- a list that CONTAINS
+    # this rank -- and SIGKILLs them in /proc order, so when it reaches our
+    # own pid we die mid-loop and every later rank plus the parent survive
+    # (reproduced: a fatal on rank 3 left ranks 4-7 running and the launcher
+    # alive; ranks spawn in ascending pid order, so a fatal on rank 0 kills
+    # almost nobody). The survivors then hang on the window-end barrier the
+    # dead ranks never join, behind a live HTTP front end.
+    #
+    # killpg is atomic with respect to ordering: every rank, the launcher and
+    # the HTTP server share the process group under launch.sh, and the signal
+    # is delivered to all of them regardless of where we are in the group.
+    # SIGKILL rather than a graceful teardown on purpose -- we are abandoning
+    # in-memory state deliberately, so there is nothing to flush, and a
+    # graceful path would try to run the very collectives that are broken.
+    # Nothing leaks: the cold rings are unlinked at creation, kt's arenas are
+    # memfds freed when the last reference drops, and pinned host memory is
+    # ordinary process memory.
     try:
-        kill_process_tree(os.getppid())
+        os.killpg(os.getpgrp(), signal.SIGKILL)
     except Exception:
-        logger.exception("[kt-swap] could not kill the process tree")
-    os._exit(70)  # EX_SOFTWARE, in case the tree kill missed us
+        logger.exception("[kt-swap] killpg failed; falling back to the tree")
+        try:
+            # skip_pid matters for the same reason: without it this kills us
+            # before it reaches the peers.
+            kill_process_tree(os.getppid(), skip_pid=os.getpid())
+        except Exception:
+            logger.exception("[kt-swap] could not kill the process tree")
+    os._exit(70)  # EX_SOFTWARE; only reached if the group kill somehow missed us
 
 
 def _verify_rank_write_once(entries, writer, mover) -> None:
