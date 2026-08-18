@@ -401,7 +401,8 @@ class HiCacheFile(HiCacheStorage):
         # --dcp-size change must MISS, not return a wrong-shaped tensor.
         dcp_rank = storage_config.dcp_rank
         dcp_size = storage_config.dcp_size
-        if dcp_size > 1:
+        self._dcp_sharded = dcp_size > 1
+        if self._dcp_sharded:
             self.config_suffix += f"_dcp{dcp_rank}_{dcp_size}"
 
         # Every DCP rank writes now, so the directory can no longer be rank 0's
@@ -729,13 +730,20 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         try:
-            # Only this rank's own objects. The directory is shared, and under
-            # DCP every rank writes into it -- a rank that unlinked everything
-            # would silently destroy seven peers' shards, with no barrier to
-            # order it against their in-flight writes. The suffix is exactly
-            # the identity that makes a file this rank's, so filter on it.
+            # Under DCP every rank writes into this shared directory, so a
+            # rank that unlinked everything would silently destroy seven peers'
+            # shards with no barrier ordering it against their in-flight
+            # writes. Filter on the suffix, which is exactly the identity that
+            # makes a file this rank's.
+            #
+            # ONLY under DCP. Without it this is the operator's reclaim button
+            # and it is expected to empty the directory -- including objects
+            # left by a previous model or a different tp_size, which nothing
+            # else in the process ever scans (the evictor and the metadata
+            # cache both filter to this run's suffix), so skipping them would
+            # strand that disk forever.
             for filename in os.listdir(self.file_path):
-                if self.config_suffix and self.config_suffix not in filename:
+                if self._dcp_sharded and self.config_suffix not in filename:
                     continue
                 file_path = os.path.join(self.file_path, filename)
                 if os.path.isfile(file_path):

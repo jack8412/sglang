@@ -105,5 +105,48 @@ class TestDcpStorageKeys(CustomTestCase):
         self.assertTrue(os.path.isdir(target))
 
 
+class TestDcpBackendFence(CustomTestCase):
+    """Only backends whose keys carry dcp_rank may run under DCP.
+
+    The blanket "L3 + DCP unsupported" error was removed when the file backend
+    learned dcp_rank-scoped keys. That single removal opened EVERY backend, and
+    the others still key their objects without a rank -- so eight ranks would
+    write different bytes to one object per page, at the right length, and the
+    reader would get whichever landed last with nothing raising.
+
+    An allow-list is the fence. This pins it, so adding a backend to the list
+    is a deliberate act taken together with teaching its key the rank -- and so
+    that no one is tempted to "fix" the other backends' skip logic instead,
+    which is inert while they cannot run under DCP at all.
+    """
+
+    def _args(self, backend, dcp_size=8):
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs.__new__(ServerArgs)
+        args.dcp_size = dcp_size
+        args.enable_hierarchical_cache = True
+        args.hicache_storage_backend = backend
+        args.speculative_algorithm = None
+        args.enable_lmcache = False
+        args.enable_hisparse = False
+        args.use_mla_backend = lambda: True
+        return args
+
+    def test_file_backend_is_permitted(self):
+        self._args("file")._resolve_hicache_dcp_compatibility()
+
+    def test_other_backends_are_refused(self):
+        for backend in ("mooncake", "nixl", "hf3fs", "eic", "aibrix"):
+            with self.assertRaises(NotImplementedError, msg=backend) as cm:
+                self._args(backend)._resolve_hicache_dcp_compatibility()
+            self.assertIn("dcp_rank-scoped", str(cm.exception))
+
+    def test_without_dcp_every_backend_is_permitted(self):
+        """The fence must not touch the non-DCP world."""
+        for backend in ("mooncake", "nixl", "hf3fs", None):
+            self._args(backend, dcp_size=1)._resolve_hicache_dcp_compatibility()
+
+
 if __name__ == "__main__":
     unittest.main()
