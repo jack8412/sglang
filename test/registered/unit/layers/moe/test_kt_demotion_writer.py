@@ -579,5 +579,91 @@ class TestDirectDmaRoundTrip(unittest.TestCase):
             unreg_fn(int(arena.data_ptr()))
 
 
+class TestDirectDmaRoundTripContiguous(unittest.TestCase):
+    """Same round trip, but at ONE RANK PER PARTITION.
+
+    That geometry (per_numa == per_gpu, so w2_pitch == w2_width) takes a
+    different branch: the down strips are contiguous, so the copies drop the 2D
+    descriptor entirely. It is also the geometry production runs, and the
+    strided test above cannot reach it -- its _Geom has 2 partitions, pitch 768
+    against width 192.
+
+    The branch exists because the pitched form cost 7.05 ms per expert there:
+    3,584 row transactions of 192 bytes to move a block that is one copy. So
+    this asserts the fast path still round-trips bitwise, not just that it is
+    faster."""
+
+    class _Geom8:
+        """per_numa == per_gpu: one rank per partition, contiguous down."""
+
+        def __init__(self):
+            self.hidden = HIDDEN
+            self.per_gpu = PER_GPU
+            self.group = GROUP
+            self.part = 0
+            self.local_rank = 0
+            self.gu_w = GU_W
+            self.gu_s = GU_S
+            self.w2_width = PER_GPU // 2
+            self.w2_pitch = PER_GPU // 2          # == width: contiguous
+            self.w2s_width = PER_GPU // GROUP
+            self.w2s_pitch = PER_GPU // GROUP
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_contiguous_branch_round_trips(self):
+        ArenaDmaWriter = _dw.ArenaDmaWriter
+        from sglang.srt.layers.moe.kt_direct_dma import (
+            CudaCopyLib,
+            cudart_register_fns,
+        )
+
+        g = self._Geom8()
+        self.assertEqual(g.w2_pitch, g.w2_width, "fixture must hit the fast path")
+        gu_block = GU_W
+        w2_block = HIDDEN * g.w2_width
+        gus_block = GU_S
+        w2s_block = HIDDEN * g.w2s_width
+        row = [0, gu_block, 2 * gu_block, 2 * gu_block + w2_block,
+               2 * gu_block + w2_block + gus_block,
+               2 * gu_block + w2_block + 2 * gus_block]
+        total = row[5] + w2s_block
+        arena = torch.zeros(total, dtype=torch.uint8)
+
+        reg_fn, unreg_fn = cudart_register_fns()
+        rc = reg_fn(int(arena.data_ptr()), int(arena.numel()))
+        self.assertEqual(rc, 0, f"cudaHostRegister rc={rc}")
+        try:
+            dev = torch.device("cuda")
+            torch.manual_seed(23)
+            src = {
+                "w13": torch.randint(0, 255, (2 * GU_W,), dtype=torch.uint8).to(dev),
+                "w13_scale": torch.randint(0, 255, (2 * GU_S,), dtype=torch.uint8).to(dev),
+                "w2": torch.randint(
+                    0, 255, (HIDDEN, g.w2_width), dtype=torch.uint8
+                ).to(dev),
+                "w2_scale": torch.randint(
+                    0, 255, (HIDDEN, g.w2s_width), dtype=torch.uint8
+                ).to(dev),
+            }
+            dma = ArenaDmaWriter(
+                arena_by_layer={}, geometry=g,
+                copy_lib=CudaCopyLib(), register_fn=lambda p, n: 0,
+            )
+            dma._base[0] = int(arena.data_ptr())
+            st = torch.cuda.current_stream().cuda_stream
+            dma.write(layer_idx=0, row=row, shard=src, stream=st)
+            torch.cuda.synchronize()
+            out = {k: torch.zeros_like(v) for k, v in src.items()}
+            dma.read(layer_idx=0, row=row, out=out, stream=st)
+            torch.cuda.synchronize()
+            for name in src:
+                self.assertTrue(
+                    torch.equal(out[name], src[name]),
+                    f"{name}: {int((out[name] != src[name]).sum())} bytes differ",
+                )
+        finally:
+            unreg_fn(int(arena.data_ptr()))
+
+
 if __name__ == "__main__":
     unittest.main()

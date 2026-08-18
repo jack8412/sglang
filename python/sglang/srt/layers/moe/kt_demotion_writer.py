@@ -211,26 +211,32 @@ class ArenaDmaWriter:
             g.gu_s,
             stream,
         )
-        # down: the source strips are strided by the partition pitch, the
-        # destination is packed -- the copy engine walks the stride.
-        self._copy.memcpy2d_h2d(
-            out["w2"].data_ptr(),
-            g.w2_width,
-            base + row[_DOWN_B] + lr * g.w2_width,
-            g.w2_pitch,
-            g.w2_width,
-            g.hidden,
-            stream,
+        # down. A PITCHED COPY ONLY WHEN THE REGION IS ACTUALLY STRIDED: at one
+        # rank per partition w2_pitch == w2_width, so the strips are contiguous
+        # and a 2D descriptor would buy nothing while costing 3,584 row
+        # transactions of 192 bytes each -- measured at 7.05 ms per expert,
+        # 5.19 s of a 5.61 s window, which is the entire promotion cost.
+        self._copy_down_h2d(
+            dst=out["w2"].data_ptr(),
+            src=base + row[_DOWN_B] + lr * g.w2_width,
+            width=g.w2_width,
+            pitch=g.w2_pitch,
+            stream=stream,
         )
-        self._copy.memcpy2d_h2d(
-            out["w2_scale"].data_ptr(),
-            g.w2s_width,
-            base + row[_DOWN_D] + lr * g.w2s_width,
-            g.w2s_pitch,
-            g.w2s_width,
-            g.hidden,
-            stream,
+        self._copy_down_h2d(
+            dst=out["w2_scale"].data_ptr(),
+            src=base + row[_DOWN_D] + lr * g.w2s_width,
+            width=g.w2s_width,
+            pitch=g.w2s_pitch,
+            stream=stream,
         )
+
+    def _copy_down_h2d(self, *, dst, src, width, pitch, stream):
+        g = self._g
+        if pitch == width:
+            self._copy.memcpy_h2d(dst, src, width * g.hidden, stream)
+        else:
+            self._copy.memcpy2d_h2d(dst, width, src, pitch, width, g.hidden, stream)
 
     def write(self, *, layer_idx: int, row, shard, stream: int) -> None:
         """Issue one expert's six copies. Async on ``stream``."""
@@ -261,24 +267,27 @@ class ArenaDmaWriter:
         )
         # down: one strip per hidden row, at this rank's column offset. The
         # destination is strided; the source is a packed [hidden, width] block.
-        self._copy.memcpy2d_d2h(
-            base + row[_DOWN_B] + lr * g.w2_width,
-            g.w2_pitch,
-            shard["w2"].data_ptr(),
-            g.w2_width,
-            g.w2_width,
-            g.hidden,
-            stream,
+        self._copy_down_d2h(
+            dst=base + row[_DOWN_B] + lr * g.w2_width,
+            src=shard["w2"].data_ptr(),
+            width=g.w2_width,
+            pitch=g.w2_pitch,
+            stream=stream,
         )
-        self._copy.memcpy2d_d2h(
-            base + row[_DOWN_D] + lr * g.w2s_width,
-            g.w2s_pitch,
-            shard["w2_scale"].data_ptr(),
-            g.w2s_width,
-            g.w2s_width,
-            g.hidden,
-            stream,
+        self._copy_down_d2h(
+            dst=base + row[_DOWN_D] + lr * g.w2s_width,
+            src=shard["w2_scale"].data_ptr(),
+            width=g.w2s_width,
+            pitch=g.w2s_pitch,
+            stream=stream,
         )
+
+    def _copy_down_d2h(self, *, dst, src, width, pitch, stream):
+        g = self._g
+        if pitch == width:
+            self._copy.memcpy_d2h(dst, src, width * g.hidden, stream)
+        else:
+            self._copy.memcpy2d_d2h(dst, pitch, src, width, width, g.hidden, stream)
 
 
 
