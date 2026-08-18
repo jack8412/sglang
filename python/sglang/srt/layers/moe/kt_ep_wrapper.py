@@ -8500,6 +8500,27 @@ def finalize_split_prefill(server_args) -> bool:
             else "pinned-store"
         ),
     )
+
+    # BUILD THE DEMOTION WRITER NOW, AT BOOT, not on the first window that
+    # needs it. Registering the arena is the expensive part -- 51 GiB per rank
+    # at 4K pages measured ~62 s -- and paying it lazily puts that stall inside
+    # the first swap window, i.e. inside serving, where it looks like a
+    # pathological window rather than a one-off setup cost. Everything it
+    # needs exists by this point: the arenas are mapped (kt_arena_share ran
+    # per layer during load) and the layer list is complete.
+    #
+    # Failure policy is unchanged and lives in the callee: rank-write that
+    # cannot arm falls back to the checkpoint path, and direct DMA that cannot
+    # arm terminates. Doing it here only moves WHEN that is decided, which is
+    # itself worth something -- a boot that cannot honour the requested
+    # transport now fails at boot instead of minutes into serving.
+    try:
+        _get_or_create_rank_writer({"method": anchor})
+    except Exception:
+        logger.exception(
+            "[kt-rankwrite] boot-time writer construction failed; the first "
+            "window will retry"
+        )
     return True
 
 
@@ -9052,7 +9073,10 @@ def _verify_rank_write_once(entries, writer, mover) -> None:
 def _get_or_create_rank_writer(entry):
     """Process-wide rank-write demotion writer, or None (checkpoint path).
 
-    Built once, on the first layer of the first window that could use it.
+    Built once, at boot (finalize_split_prefill) so the arena registration
+    that direct DMA needs is not paid inside the first serving window. The
+    first window still calls this and gets the cached instance; the lazy path
+    remains only as the fallback if boot-time construction was skipped.
     Every precondition is uniform across ranks by construction -- the env
     gate, the launch config, and whether kt exposes the slot move -- EXCEPT
     the arena mapping, which `kt_arena_share` degrades per rank by design.
