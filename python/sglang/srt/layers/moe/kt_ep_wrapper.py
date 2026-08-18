@@ -6743,25 +6743,49 @@ def maybe_run_expert_swap_at_decode_boundary(is_decode: bool, is_extend: bool) -
         _KT_BOUNDARY_STATE["last_was_extend"] = is_extend
         return
 
-    crossed = is_decode and _KT_BOUNDARY_STATE["last_was_extend"]
+    prev_extend = _KT_BOUNDARY_STATE["last_was_extend"]
+    prev_decode = _KT_BOUNDARY_STATE.get("last_was_decode", False)
     _KT_BOUNDARY_STATE["last_was_extend"] = is_extend
-    if not crossed:
+    _KT_BOUNDARY_STATE["last_was_decode"] = is_decode
+
+    crossed = is_decode and prev_extend
+    steady = is_decode and prev_decode
+
+    # NEVER ON THE PREFILL BOUNDARY ITSELF. Under split prefill every expert is
+    # computed on GPU, so a prefill does not care which experts are offloaded:
+    # placement only matters for decode. Running the window at the
+    # prefill->decode crossing therefore buys nothing and lands squarely in the
+    # request's time-to-first-token -- measured as prefill rows of 1,967-3,099
+    # tok/s against a clean 9,365, purely from which requests a window hit.
+    #
+    # So the crossing only DECIDES; the window runs at the first steady decode
+    # step after it, once the first token is already out. The condition is a
+    # pure function of the batch-mode sequence, which every TP rank sees
+    # identically -- a queue-depth test would not be, and rank divergence here
+    # is the M9/M11/M12 failure class.
+    if crossed:
+        _KT_BOUNDARY_STATE["transitions"] += 1
+        n = _KT_BOUNDARY_STATE["transitions"]
+        every = max(1, cfg.expert_swap_interval // _KT_BOUNDARY_DIVISOR)
+        # Observe on every transition, act on every `every`-th, and never on
+        # the first: a cumulative counter's first delta is the whole launch
+        # history, so acting on it is acting on a baseline.
+        if n > 1 and n % every == 0:
+            _KT_BOUNDARY_STATE["act_pending"] = True
+    elif not (steady and _KT_BOUNDARY_STATE.get("act_pending")):
         return
 
-    _KT_BOUNDARY_STATE["transitions"] += 1
-    n = _KT_BOUNDARY_STATE["transitions"]
-    every = max(1, cfg.expert_swap_interval // _KT_BOUNDARY_DIVISOR)
-    # Observe on every transition, act on every `every`-th, and never on the
-    # first: a cumulative counter's first delta is the whole launch history,
-    # so acting on it is acting on a baseline.
+    act_now = bool(steady and _KT_BOUNDARY_STATE.get("act_pending"))
+    if act_now:
+        _KT_BOUNDARY_STATE["act_pending"] = False
     try:
-        maybe_run_expert_swap_window(anchor, force=True, act=(n > 1 and n % every == 0))
+        maybe_run_expert_swap_window(anchor, force=True, act=act_now)
     except Exception:
         # NOT swallowed any more. "Serving continues" was the wrong policy: a
         # window that failed part-way has already moved kt's ownership and
         # staged GPU rows whose tables never flipped, so continuing serves
         # wrong experts silently and forever.
-        _fatal_swap_failure("the prefill->decode boundary window raised")
+        _fatal_swap_failure("the decode-boundary swap window raised")
 
 
 def maybe_run_expert_swap_window(
