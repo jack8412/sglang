@@ -72,5 +72,61 @@ class TestFinalizeSplitPrefillIsIdempotent(CustomTestCase):
             m._KT_SPLIT_PREFILL_STATE.update(state)
 
 
+class TestDraftWorkerDoesNotBuildTheStore(CustomTestCase):
+    """Bug regression: the draft ModelRunner must not run split-prefill finalize.
+
+    maybe_init_split_prefill gated only on get_exec().moe.kt_expert_split_prefill,
+    which is a PROCESS-GLOBAL snapshot -- so it read True inside the draft
+    worker, which shares the process with the target and whose layers are still
+    registered. The draft therefore built a second complete pinned cold store:
+    51.1 GiB per rank, 439 GB across TP8, on top of the first.
+
+    Tested here rather than on hardware because the trigger needs a draft model
+    (a full DSpark checkpoint) that only one of our hosts has, while the defect
+    itself is one branch."""
+
+    def _runner(self, *, is_draft):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        class _Stub:
+            is_draft_worker = is_draft
+            server_args = object()
+
+        return ModelRunner.maybe_init_split_prefill, _Stub()
+
+    def test_draft_worker_skips_finalize(self):
+        from sglang.srt.layers.moe import kt_ep_wrapper
+
+        fn, stub = self._runner(is_draft=True)
+        with patch.object(
+            kt_ep_wrapper,
+            "finalize_split_prefill",
+            side_effect=AssertionError("draft built the cold store"),
+        ):
+            fn(stub)  # must return before touching finalize at all
+
+    def test_target_worker_still_finalizes(self):
+        """The guard must not disable split prefill outright -- red if someone
+        'fixes' the draft path by skipping finalize for everyone, which boots
+        fine and silently serves the margin-routed path instead."""
+        from sglang.srt.layers.moe import kt_ep_wrapper
+        from sglang.srt.model_executor import model_runner as mr
+
+        called = []
+        fn, stub = self._runner(is_draft=False)
+
+        class _Moe:
+            kt_expert_split_prefill = True
+
+        class _Exec:
+            moe = _Moe()
+
+        with patch.object(mr, "get_exec", return_value=_Exec()), patch.object(
+            kt_ep_wrapper, "finalize_split_prefill", side_effect=lambda sa: called.append(sa)
+        ):
+            fn(stub)
+        self.assertEqual(len(called), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
