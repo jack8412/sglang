@@ -15,6 +15,7 @@ dimension; scales likewise).
 
 import importlib.util
 import os
+import re
 import sys
 import types
 import unittest
@@ -663,6 +664,72 @@ class TestDirectDmaRoundTripContiguous(unittest.TestCase):
                 )
         finally:
             unreg_fn(int(arena.data_ptr()))
+
+
+class TestColdSourceSatisfiesThePipelineProtocol(unittest.TestCase):
+    """Every method the pipeline calls unguarded, the arena source must have.
+
+    This exists because of a real failure. ``ArenaDmaColdSource`` shipped
+    without ``layer_rows``, and nothing noticed: the pipeline only calls it
+    from inside ``if self._probe is not None``, so the gap was invisible until
+    a server booted with SGLANG_DEBUG_KT_PIPELINE_OVERLAP=1 and every one of
+    the eight ranks died with AttributeError partway through a benchmark --
+    after a 17-minute boot.
+
+    So do not hardcode the method list. Derive it from the pipeline source, and
+    treat a name as REQUIRED unless the pipeline guards it with hasattr (which
+    is how the optional ``issue_layer_copies`` fast path is dispatched). A new
+    unguarded ``self._store.foo()`` then fails here rather than on the node.
+    """
+
+    def _pipeline_source(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.normpath(
+            os.path.join(
+                here,
+                "../../../../../python/sglang/srt/layers/moe/expert_pipeline.py",
+            )
+        )
+        with open(path) as fh:
+            return fh.read()
+
+    def test_arena_source_implements_every_unguarded_store_call(self):
+        src = self._pipeline_source()
+        called = set(re.findall(r"self\._store\.([A-Za-z_][A-Za-z0-9_]*)", src))
+        optional = set(
+            re.findall(r'hasattr\(\s*self\._store\s*,\s*"([^"]+)"', src)
+        )
+        required = called - optional
+
+        self.assertIn(
+            "layer_rows",
+            required,
+            "the regression this test exists for: layer_rows is called "
+            "unguarded (under the overlap probe), so it is REQUIRED",
+        )
+
+        missing = sorted(
+            name for name in required if not hasattr(_dw.ArenaDmaColdSource, name)
+        )
+        self.assertEqual(
+            missing,
+            [],
+            f"ArenaDmaColdSource is missing {missing}; the pipeline calls "
+            f"these without a hasattr guard (required={sorted(required)}, "
+            f"optional={sorted(optional)})",
+        )
+
+    def test_layer_rows_is_cheap_and_returns_none(self):
+        """The probe charges its host-side wait to gather_wait; ours is zero.
+
+        A source that reads out of kt's registered arena has no host gather, so
+        the honest measurement is 0 ms. Returning None (rather than a tensor)
+        is what marks it as "nothing was gathered" -- and it must not blow up
+        on a layer index it has never planned.
+        """
+        src = _dw.ArenaDmaColdSource.__new__(_dw.ArenaDmaColdSource)
+        self.assertIsNone(src.layer_rows(0, "w13_weight"))
+        self.assertIsNone(src.layer_rows(9999, "w2_weight"))
 
 
 if __name__ == "__main__":

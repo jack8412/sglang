@@ -381,6 +381,18 @@ class ArenaDmaColdSource:
     def reset(self) -> None:
         return
 
+    def layer_rows(self, layer_idx: int, name: str) -> None:
+        """Probe hook compatibility: no host gather to wait for.
+
+        The overlap probe calls this before ``copy_begin`` to charge a
+        gathering source's host-side wait to its own column instead of letting
+        it hide inside the copy interval. This source reads straight out of
+        kt's registered arena, so there is nothing to gather and nothing to
+        wait for -- the honest measurement is zero. Same stub, same reason, as
+        the direct-DMA transport's.
+        """
+        return None
+
     def issue_layer_copies(self, layer_idx: int, raw, stream) -> None:
         """Gather one layer's whole cold set into ``raw``, six pitched copies."""
         g = self._g
