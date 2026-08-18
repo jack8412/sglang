@@ -8357,19 +8357,7 @@ def finalize_split_prefill(server_args) -> bool:
                 src=get_tp_group().first_rank,
                 group=get_tp_group().cpu_group,
             )
-        # PINNED-STORE mode is the explicit "give me the fastest per-layer
-        # path and the fastest promotions, I will pay the RAM" choice: every
-        # streaming transport below is skipped so the build falls through to
-        # build_cold_store in RESIDENT layout. It composes with FULL kt
-        # residency (no --kt-cold-only-cpu-experts), which is what makes a
-        # demotion a nop -- the demoted expert never lost its CPU buffers --
-        # while promotions read pre-swizzled rows straight out of the cache.
-        force_store = anchor.kt_config.cold_transport == "pinned-store"
-        use_export = (
-            holder[0]
-            and not anchor.kt_config.cold_only_cpu_experts
-            and not force_store
-        )
+        use_export = holder[0] and not anchor.kt_config.cold_only_cpu_experts
 
         # DIRECT-DMA first when the launch asks for it (SPEC-DIRECT-DMA.md):
         # every rank registers its cold read-set of kt's memfd arenas and its
@@ -8384,7 +8372,6 @@ def finalize_split_prefill(server_args) -> bool:
         use_direct = (
             anchor.kt_config.cold_transport == "direct-dma"
             and not anchor.kt_config.cold_only_cpu_experts
-            and not force_store
         )
         if use_direct:
             from sglang.srt.layers.moe.kt_arena_share import arena_source_for
@@ -8493,7 +8480,6 @@ def finalize_split_prefill(server_args) -> bool:
             not use_arena_dma
             and not use_direct
             and not use_export
-            and not force_store
             and not anchor.kt_config.cold_only_cpu_experts
             and all(s is not None for s in arena_sources.values())
         )

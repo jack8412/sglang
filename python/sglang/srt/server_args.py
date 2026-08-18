@@ -3049,8 +3049,8 @@ class ServerArgs:
         NS("exec.moe"),
     ] = 0
     kt_cold_transport: A[
-        Literal["ring-export", "direct-dma", "pinned-store"],
-        "How --kt-expert-split-prefill moves cold-expert weights to the GPUs each layer. 'ring-export' (default): kt's CPU pool copies each layer's slices into per-rank pinned rings and the ranks DMA those (3 DRAM transits/byte). 'direct-dma': every rank cudaHostRegisters its read-set of kt's memfd arenas (requires KT_BUFFER_B_MEMFD=1) and its copy engine reads the weights in place -- one transit, no CPU prepare stage. 'pinned-store': each rank builds its own pinned host cache of the cold experts in RESIDENT (trtllm) layout at boot (~51 GiB/rank) and DMAs four contiguous copies per layer out of it -- the fastest per-layer path (no prepare stage, no per-layer swizzle) and the fastest promotions (a swap reads pre-swizzled rows straight out of the cache), at the cost of holding a second copy of the cold set in RAM. Falls back to ring-export, then to the margin-routed CPU path, if arming fails on any rank.",
+        Literal["ring-export", "direct-dma"],
+        "How --kt-expert-split-prefill moves cold-expert weights to the GPUs each layer. 'ring-export' (default): kt's CPU pool copies each layer's slices into per-rank pinned rings and the ranks DMA those (3 DRAM transits/byte). 'direct-dma': every rank cudaHostRegisters its read-set of kt's memfd arenas (requires KT_BUFFER_B_MEMFD=1) and its copy engine reads the weights in place -- one transit, no CPU prepare stage. Falls back to ring-export, then to the margin-routed CPU path, if arming fails on any rank.",
         NS("exec.moe"),
     ] = "ring-export"
     record_kt_gpu_expert_distribution: A[
@@ -6979,23 +6979,6 @@ class ServerArgs:
                 )
 
         if self.kt_cold_only_cpu_experts:
-            # pinned-store builds a second, RESIDENT-layout copy of the cold set
-            # out of kt's CPU buffers, which only exists under FULL residency.
-            # Under cold-only there is nothing to copy from, so the request
-            # cannot be honoured -- and today it is silently ignored, leaving a
-            # launch line that names a transport the server is not using. Say so
-            # instead: a flag that quietly does nothing is worse than one that
-            # refuses.
-            if self.kt_cold_transport == "pinned-store":
-                raise ValueError(
-                    "--kt-cold-transport pinned-store cannot be combined with "
-                    "--kt-cold-only-cpu-experts: the pinned store is built from "
-                    "kt's resident CPU buffers, and under cold-only residency "
-                    "only the cold experts have any. The cold set streams out "
-                    "of kt's arena instead, so drop the flag (or drop "
-                    "--kt-cold-only-cpu-experts if the store is what you want)."
-                )
-
             from sglang.srt.layers.moe.kt_ep_wrapper import (
                 KT_WHEEL_SUPPORTS_COLD_ONLY,
             )
