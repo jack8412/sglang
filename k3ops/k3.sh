@@ -515,6 +515,18 @@ tmux kill-session -t bench 2>/dev/null
 pkill -INT -f "launch_serve[r]" 2>/dev/null; sleep 15
 pkill -9 -f "sglang::sched[u]ler" 2>/dev/null; sleep 5
 pgrep -f "launch_serve[r]" >/dev/null && echo "STILL RUNNING" || echo "stopped"
+# Wait for the GPUs to actually drain before returning. The processes exit well
+# before their CUDA contexts are torn down, and a launch that starts into a
+# half-released device dies with "NCCL error: unhandled cuda error" partway
+# through init_torch_distributed -- which costs a boot to discover, and reads
+# like an NCCL problem rather than a teardown race.
+for i in $(seq 1 30); do
+  busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
+         | awk '$1>500{c++} END{print c+0}')
+  [ "$busy" = "0" ] && break
+  sleep 5
+done
+[ "$busy" = "0" ] && echo "GPUs free" || echo "WARNING: $busy GPU(s) still hold memory"
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | head -3
 EOS
 }
