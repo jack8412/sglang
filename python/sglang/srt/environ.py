@@ -1396,6 +1396,7 @@ class Envs:
     # KT_BUFFER_B_MEMFD=1 and cold-only residency (with full kt residency a
     # demotion is already a nop). Falls back per layer to the checkpoint path.
     SGLANG_KT_DEMOTION_RANK_WRITE = EnvBool(False)
+    SGLANG_KT_DEMOTION_DIRECT_DMA = EnvBool(False)
     # Minimum free VRAM (GiB) a rank must still have, after the projected
     # page-table cost (8 B per 4K page, measured exact on dense ranges),
     # before the direct-DMA cold transport is allowed to arm. NOTE the

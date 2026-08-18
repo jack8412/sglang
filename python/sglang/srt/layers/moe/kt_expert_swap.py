@@ -445,7 +445,7 @@ def run_swap_window(
     after_flip: Optional[Callable[[dict, list], None]] = None,
     on_layer_abort: Optional[Callable[[dict], None]] = None,
     quiesce: Optional[Callable[[], None]] = None,
-    phase_timer: Optional[Callable[[str, float], None]] = None,
+    phase_timing: Optional[dict] = None,
 ) -> SwapWindowResult:
     """Apply pending swaps for every layer, at an already-paused point.
 
@@ -521,8 +521,8 @@ def run_swap_window(
         tables: SwapTables = entry["tables"]
         _t = time.perf_counter()
         swaps = policy.select(tables.gpu_experts_mask)
-        if phase_timer is not None:
-            phase_timer("select_s", time.perf_counter() - _t)
+        if phase_timing is not None:
+            phase_timing["select_s"] += time.perf_counter() - _t
         if not swaps:
             continue
         try:
@@ -533,13 +533,20 @@ def run_swap_window(
             rows = tables.logical_to_gpu_index[
                 torch.tensor([s.demote for s in swaps], dtype=torch.long)
             ].tolist()
-            if phase_timer is not None:
-                phase_timer("rows_s", time.perf_counter() - _t)
+            if phase_timing is not None:
+                phase_timing["rows_s"] += time.perf_counter() - _t
             if begin_layer is not None:
+                # EXCLUSIVE of the capture begin_layer performs: the hook bills
+                # that to read_s itself, and counting it in both is what made a
+                # window's "attributed" exceed its own elapsed time and print a
+                # negative residue.
                 _t = time.perf_counter()
+                _r0 = phase_timing["read_s"] if phase_timing is not None else 0.0
                 filtered = begin_layer(entry, swaps, rows)
-                if phase_timer is not None:
-                    phase_timer("begin_s", time.perf_counter() - _t)
+                if phase_timing is not None:
+                    phase_timing["begin_s"] += (time.perf_counter() - _t) - (
+                        phase_timing["read_s"] - _r0
+                    )
                 if filtered is not None:
                     swaps, rows = filtered
                     if not swaps:
@@ -548,8 +555,8 @@ def run_swap_window(
             for s, row in zip(swaps, rows):
                 _t = time.perf_counter()
                 move_weights(entry["layer"], row, s.promote, s.demote)
-                if phase_timer is not None:
-                    phase_timer("move_s", time.perf_counter() - _t)
+                if phase_timing is not None:
+                    phase_timing["move_s"] += time.perf_counter() - _t
                 if install_cpu_expert is not None:
                     # BEFORE the tables flip: the demoted expert must not be
                     # routable on the CPU until its weights are actually
@@ -565,18 +572,28 @@ def run_swap_window(
                             f"{entry.get('layer_idx')}"
                         ) from exc
             if finish_layer is not None:
+                # EXCLUSIVE of flush_gpu_s/flush_store_s, which the flush hook
+                # accumulates from inside this very call. What remains is the
+                # unswizzle and the bookkeeping around them -- the part no
+                # other span covers.
                 _t = time.perf_counter()
+                _g0 = phase_timing["flush_gpu_s"] if phase_timing is not None else 0.0
+                _s0 = phase_timing["flush_store_s"] if phase_timing is not None else 0.0
                 finish_layer()
-                if phase_timer is not None:
-                    phase_timer("finish_s", time.perf_counter() - _t)
+                if phase_timing is not None:
+                    phase_timing["finish_s"] += (
+                        (time.perf_counter() - _t)
+                        - (phase_timing["flush_gpu_s"] - _g0)
+                        - (phase_timing["flush_store_s"] - _s0)
+                    )
             _t = time.perf_counter()
             apply_swaps_to_tables(tables, swaps)
-            if phase_timer is not None:
-                phase_timer("apply_s", time.perf_counter() - _t)
+            if phase_timing is not None:
+                phase_timing["apply_s"] += time.perf_counter() - _t
             _t = time.perf_counter()
             assert_tables_consistent(tables, entry["num_gpu_experts"])
-            if phase_timer is not None:
-                phase_timer("tables_s", time.perf_counter() - _t)
+            if phase_timing is not None:
+                phase_timing["tables_s"] += time.perf_counter() - _t
             if after_flip is not None:
                 _t = time.perf_counter()
                 try:
@@ -587,8 +604,8 @@ def run_swap_window(
                         "(bookkeeping only; the swap itself completed)",
                         entry.get("layer_idx"),
                     )
-                if phase_timer is not None:
-                    phase_timer("after_s", time.perf_counter() - _t)
+                if phase_timing is not None:
+                    phase_timing["after_s"] += time.perf_counter() - _t
         except SwapInstallError:
             # Never absorbed: see SwapInstallError. Skipping here would leave
             # this rank's placement disagreeing with every other rank's.

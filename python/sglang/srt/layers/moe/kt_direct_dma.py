@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 PAGE = 4096
 _CUDA_MEMCPY_HOST_TO_DEVICE = 1
+_CUDA_MEMCPY_DEVICE_TO_HOST = 2
 
 
 def _page_floor(v: int) -> int:
@@ -412,6 +413,39 @@ class CudaCopyLib:
         )
         if rc != 0:
             raise RuntimeError(f"cudaMemcpyAsync rc={rc}")
+
+    def memcpy_d2h(self, dst: int, src: int, nbytes: int, stream: int) -> None:
+        """Device -> registered host, the demotion direction."""
+        rc = self._lib.cudaMemcpyAsync(
+            dst, src, nbytes, _CUDA_MEMCPY_DEVICE_TO_HOST, stream
+        )
+        if rc != 0:
+            raise RuntimeError(f"cudaMemcpyAsync D2H rc={rc}")
+
+    def memcpy2d_d2h(
+        self,
+        dst: int,
+        dpitch: int,
+        src: int,
+        spitch: int,
+        width: int,
+        height: int,
+        stream: int,
+    ) -> None:
+        """Device -> registered host, pitched.
+
+        This is what makes w2 free: the demoted expert's strips land at
+        ``dpitch`` intervals inside kt's buffer, and the copy engine walks
+        that stride itself. The host-side gather it replaces was the largest
+        single component of demotion -- measured 0.44-1.14 ms per expert
+        against 0.26 ms for the read-back that feeds it.
+        """
+        rc = self._lib.cudaMemcpy2DAsync(
+            dst, dpitch, src, spitch, width, height,
+            _CUDA_MEMCPY_DEVICE_TO_HOST, stream,
+        )
+        if rc != 0:
+            raise RuntimeError(f"cudaMemcpy2DAsync D2H rc={rc}")
 
     def memcpy2d_h2d(
         self,

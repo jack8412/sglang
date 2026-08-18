@@ -124,6 +124,100 @@ class SlotOffsets:
             table[promote_id] = None
 
 
+
+class ArenaDmaWriter:
+    """Device -> kt's arena in ONE hop: no pinned intermediate, no CPU memcpy.
+
+    What this replaces. The staged path reads the demoted rows off the GPU
+    into a fresh pinned buffer (a real D2H DMA) and then memcpys that buffer
+    into kt's arena on the CPU. The second hop is pure DRAM traffic -- a read
+    and a write through the one controller, serialized against the DMA engine
+    doing the first hop -- and it MEASURED as the larger of the two: at 114
+    demotions per rank, capture 0.03 s against write 0.05-0.13 s; at 2,646,
+    capture 2.06 s against write 3.35 s. Same ratio across a 23x range.
+
+    Registering the arena lets the copy engine put the bytes where they belong
+    itself, so the second hop stops existing rather than getting faster.
+
+    w2's interleave costs nothing here, which is the part worth stating: the
+    strips land at ``w2_pitch`` intervals inside kt's buffer, and
+    cudaMemcpy2DAsync walks that stride in hardware. The host-side strided
+    write it replaces is the same one the module docstring calls the awkward
+    part of this campaign.
+
+    REGISTRATION IS PER MAPPING, NOT PER EXPERT. kt makes one memfd per
+    (layer, partition) and a rank reads only its own partition, so this is 92
+    registrations of ~2275 MiB, once, at arm time -- against the 150,144
+    per-expert ranges that made the direct-DMA transport fail with rc=2. The
+    page count is what costs (~0.117 us/page, ~8 B of PTE per 4K page), so
+    expect ~6 s and ~418 MB of page tables per rank for ~204 GiB.
+    """
+
+    def __init__(self, *, arena_by_layer, geometry, copy_lib, register_fn):
+        self._g = geometry
+        self._copy = copy_lib
+        self._base: Dict[int, int] = {}
+        total = 0
+        for layer_idx, arena in arena_by_layer.items():
+            ptr, nbytes = int(arena.data_ptr()), int(arena.numel())
+            rc = register_fn(ptr, nbytes)
+            if rc != 0:
+                raise RuntimeError(
+                    f"cudaHostRegister(layer {layer_idx}, {nbytes} B) rc={rc}"
+                )
+            self._base[int(layer_idx)] = ptr
+            total += nbytes
+        self.registered_bytes = total
+
+    def write(self, *, layer_idx: int, row, shard, stream: int) -> None:
+        """Issue one expert's six copies. Async on ``stream``."""
+        g = self._g
+        lr = g.local_rank
+        base = self._base[int(layer_idx)]
+        w13 = shard["w13"]
+        w13_s = shard["w13_scale"]
+        # gate | up, each contiguous at this rank's row offset -- the same two
+        # offsets the host path blits to.
+        self._copy.memcpy_d2h(
+            base + row[_GATE_B] + lr * g.gu_w, w13.data_ptr(), g.gu_w, stream
+        )
+        self._copy.memcpy_d2h(
+            base + row[_UP_B] + lr * g.gu_w,
+            w13.data_ptr() + g.gu_w,
+            g.gu_w,
+            stream,
+        )
+        self._copy.memcpy_d2h(
+            base + row[_GATE_D] + lr * g.gu_s, w13_s.data_ptr(), g.gu_s, stream
+        )
+        self._copy.memcpy_d2h(
+            base + row[_UP_D] + lr * g.gu_s,
+            w13_s.data_ptr() + g.gu_s,
+            g.gu_s,
+            stream,
+        )
+        # down: one strip per hidden row, at this rank's column offset. The
+        # destination is strided; the source is a packed [hidden, width] block.
+        self._copy.memcpy2d_d2h(
+            base + row[_DOWN_B] + lr * g.w2_width,
+            g.w2_pitch,
+            shard["w2"].data_ptr(),
+            g.w2_width,
+            g.w2_width,
+            g.hidden,
+            stream,
+        )
+        self._copy.memcpy2d_d2h(
+            base + row[_DOWN_D] + lr * g.w2s_width,
+            g.w2s_pitch,
+            shard["w2_scale"].data_ptr(),
+            g.w2s_width,
+            g.w2s_width,
+            g.hidden,
+            stream,
+        )
+
+
 class RankShardWriter:
     """Writes this rank's slice of demoted experts into kt's memfd arena.
 
@@ -139,11 +233,13 @@ class RankShardWriter:
         offsets_by_layer: Dict[int, SlotOffsets],
         geometry,  # ArenaExpertRanges-like: gu_w, gu_s, w2_*, hidden, local_rank
         shard_reader,  # _GpuResidentExpertReader: read_own_shards(layer, rows)
+        dma=None,  # ArenaDmaWriter, or None for the staged host path
     ):
         self._arena = arena_by_layer
         self._offsets = offsets_by_layer
         self._g = geometry
         self._reader = shard_reader
+        self._dma = dma
         self._staged: Dict[int, Dict[str, torch.Tensor]] = {}
         self._staged_layer: Optional[int] = None
         self.capture_s = 0.0
@@ -172,7 +268,26 @@ class RankShardWriter:
             # this would be a second chance to get the inverse wrong, and a
             # wrong inverse yields right-shaped wrong bytes.
             shards = self._reader.read_own_shards(layer, list(rows))
+            g = self._g
             for shard, demote_id in zip(shards, demote_ids):
+                if self._dma is not None:
+                    # STAY ON DEVICE. The copy engine reads from here straight
+                    # into kt's arena, so pulling to host first would add back
+                    # exactly the hop this path exists to remove. Contiguous
+                    # uint8 views because the copies are pointer arithmetic.
+                    self._staged[int(demote_id)] = {
+                        "w13": shard.w13.contiguous().view(torch.uint8).reshape(-1),
+                        "w13_scale": shard.w13_scale_e8m0.contiguous()
+                        .view(torch.uint8)
+                        .reshape(-1),
+                        "w2": shard.w2.contiguous()
+                        .view(torch.uint8)
+                        .reshape(g.hidden, g.w2_width),
+                        "w2_scale": shard.w2_scale_e8m0.contiguous()
+                        .view(torch.uint8)
+                        .reshape(g.hidden, g.w2s_width),
+                    }
+                    continue
                 # To host in one go per tensor; pinned so the D2H is a real
                 # DMA rather than a staged pageable copy.
                 self._staged[int(demote_id)] = {
@@ -244,10 +359,29 @@ class RankShardWriter:
                     f"expert {demote_id} holds no buffer in partition "
                     f"{self._g.part} after the move (layer {layer_idx})"
                 )
-            arena = self._arena[layer_idx]
             g = self._g
             lr = g.local_rank
 
+            if self._dma is not None:
+                # One hop: the copy engine reads the demoted rows off the GPU
+                # and lands them at kt's offsets itself. Async on the current
+                # stream, so it is ordered against the window's other GPU work
+                # and completed by the flush's existing device sync -- there is
+                # no correctness window here because the swap window holds the
+                # pipeline quiesced until it returns.
+                self._dma.write(
+                    layer_idx=layer_idx,
+                    row=row,
+                    shard=shard,
+                    stream=torch.cuda.current_stream().cuda_stream,
+                )
+                # write_s is accumulated by the finally below on every exit,
+                # including this one -- adding it here too double-counted it.
+                self.written += 1
+                self.last_installed = (int(layer_idx), int(demote_id))
+                return True
+
+            arena = self._arena[layer_idx]
             w13 = shard["w13"].view(torch.uint8).reshape(-1)
             w13_s = shard["w13_scale"].view(torch.uint8).reshape(-1)
             half_w, half_s = g.gu_w, g.gu_s

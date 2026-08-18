@@ -392,5 +392,111 @@ class TestEightRanksReconstructTheExpert(unittest.TestCase):
         self.assertFalse(torch.equal(got, ref["gate"]))
 
 
+class TestDirectDmaMatchesTheHostPath(unittest.TestCase):
+    """The DMA offsets must land exactly where the host blits land.
+
+    Direct DMA replaces the pinned-staging plus host memcpy with one
+    device-to-arena copy per range, and w2's interleave stops being a strided
+    CPU write and becomes a cudaMemcpy2DAsync stride. Nothing about that is
+    visible if it is wrong: a mis-computed offset or a swapped pitch/width
+    writes a valid-looking expert holding the wrong bytes, which is the same
+    silent failure the whole module docstring is about.
+
+    So both paths write the same shard into their own arena and the two arenas
+    are compared byte for byte. CUDA-gated because cudaHostRegister and the
+    copy engine are the things under test; there is no CPU stand-in for them
+    that would prove anything."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_dma_and_host_writes_are_bitwise_equal(self):
+        ArenaDmaWriter = _dw.ArenaDmaWriter
+        _blit, _blit_strided = _dw._blit, _dw._blit_strided
+        from sglang.srt.layers.moe.kt_direct_dma import (
+            CudaCopyLib,
+            cudart_register_fns,
+        )
+
+        # One expert's buffers laid out back to back, in kt's row order:
+        # gate | up | down | gate_s | up_s | down_s.
+        off_gate = 0
+        off_up = off_gate + GU_BLOCK
+        off_down = off_up + GU_BLOCK
+        off_gate_s = off_down + W2_BLOCK
+        off_up_s = off_gate_s + GUS_BLOCK
+        off_down_s = off_up_s + GUS_BLOCK
+        row = [off_gate, off_up, off_down, off_gate_s, off_up_s, off_down_s]
+        total = off_down_s + W2S_BLOCK
+
+        host_arena = torch.zeros(total, dtype=torch.uint8)
+        dma_arena = torch.zeros(total, dtype=torch.uint8)
+
+        reg_fn, unreg_fn = cudart_register_fns()
+        rc = reg_fn(int(dma_arena.data_ptr()), int(dma_arena.numel()))
+        self.assertEqual(rc, 0, f"cudaHostRegister rc={rc}")
+        try:
+            full = _full_expert(seed=7)
+            for rank in range(TP_SIZE):
+                g = _Geom(rank)
+                if g.part != 0:
+                    continue  # one partition's arena, as a rank sees it
+                sh = _rank_shard(full, rank)
+                lr = g.local_rank
+
+                # -- host path, the proven one
+                w13 = sh.w13.reshape(-1)
+                _blit(host_arena, row[0] + lr * g.gu_w, w13[: g.gu_w])
+                _blit(host_arena, row[1] + lr * g.gu_w, w13[g.gu_w :])
+                w13s = sh.w13_scale_e8m0.reshape(-1)
+                _blit(host_arena, row[3] + lr * g.gu_s, w13s[: g.gu_s])
+                _blit(host_arena, row[4] + lr * g.gu_s, w13s[g.gu_s :])
+                _blit_strided(
+                    host_arena,
+                    row[2] + lr * g.w2_width,
+                    sh.w2.reshape(g.hidden, g.w2_width),
+                    pitch=g.w2_pitch,
+                )
+                _blit_strided(
+                    host_arena,
+                    row[5] + lr * g.w2s_width,
+                    sh.w2_scale_e8m0.reshape(g.hidden, g.w2s_width),
+                    pitch=g.w2s_pitch,
+                )
+
+                # -- DMA path, from device
+                dev = torch.device("cuda")
+                gpu_shard = {
+                    "w13": sh.w13.reshape(-1).contiguous().to(dev),
+                    "w13_scale": sh.w13_scale_e8m0.reshape(-1)
+                    .contiguous()
+                    .to(dev),
+                    "w2": sh.w2.reshape(g.hidden, g.w2_width)
+                    .contiguous()
+                    .to(dev),
+                    "w2_scale": sh.w2_scale_e8m0.reshape(g.hidden, g.w2s_width)
+                    .contiguous()
+                    .to(dev),
+                }
+                writer = ArenaDmaWriter(
+                    arena_by_layer={},
+                    geometry=g,
+                    copy_lib=CudaCopyLib(),
+                    register_fn=lambda p, n: 0,
+                )
+                writer._base[0] = int(dma_arena.data_ptr())
+                writer.write(
+                    layer_idx=0,
+                    row=row,
+                    shard=gpu_shard,
+                    stream=torch.cuda.current_stream().cuda_stream,
+                )
+            torch.cuda.synchronize()
+            self.assertTrue(
+                torch.equal(host_arena, dma_arena),
+                f"{int((host_arena != dma_arena).sum())} bytes differ",
+            )
+        finally:
+            unreg_fn(int(dma_arena.data_ptr()))
+
+
 if __name__ == "__main__":
     unittest.main()

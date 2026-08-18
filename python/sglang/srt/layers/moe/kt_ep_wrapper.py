@@ -7590,7 +7590,7 @@ def maybe_run_expert_swap_window(
             finish_layer=_flush_moves,
             after_flip=_after_flip,
             on_layer_abort=_on_layer_abort,
-            phase_timer=lambda k, v: _timing.__setitem__(k, _timing[k] + v),
+            phase_timing=_timing,
             quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
         )
     finally:
@@ -9107,10 +9107,37 @@ def _get_or_create_rank_writer(entry):
                     f"(first {missing[0]}) -- is KT_BUFFER_B_MEMFD=1 set?"
                 )
             geom = ArenaExpertRanges(next(iter(sources.values())))
+            arenas = {li: s._arenas[geom.part] for li, s in sources.items()}
+            dma = None
+            if envs.SGLANG_KT_DEMOTION_DIRECT_DMA.get():
+                # One registration per (layer, partition) MAPPING -- 92 of
+                # ~2275 MiB, not the 150,144 per-expert ranges that made the
+                # direct-DMA transport fail with rc=2. Cost is per page, so
+                # expect seconds and a few hundred MB of page tables, once.
+                from sglang.srt.layers.moe.kt_demotion_writer import ArenaDmaWriter
+                from sglang.srt.layers.moe.kt_direct_dma import (
+                    CudaCopyLib,
+                    cudart_register_fns,
+                )
+
+                _t_reg = time.perf_counter()
+                reg_fn, _ = cudart_register_fns()
+                dma = ArenaDmaWriter(
+                    arena_by_layer=arenas,
+                    geometry=geom,
+                    copy_lib=CudaCopyLib(),
+                    register_fn=reg_fn,
+                )
+                logger.info(
+                    "[kt-rankwrite] direct DMA armed: registered %d arena "
+                    "mapping(s), %.0f GiB, in %.1fs -- demotions go GPU -> kt "
+                    "in one hop, no pinned staging and no host memcpy",
+                    len(arenas),
+                    dma.registered_bytes / (1 << 30),
+                    time.perf_counter() - _t_reg,
+                )
             writer = RankShardWriter(
-                arena_by_layer={
-                    li: s._arenas[geom.part] for li, s in sources.items()
-                },
+                arena_by_layer=arenas,
                 offsets_by_layer={
                     li: SlotOffsets(s._rows, experts=s.experts, numa=s.numa)
                     for li, s in sources.items()
@@ -9119,6 +9146,7 @@ def _get_or_create_rank_writer(entry):
                 shard_reader=_GpuResidentExpertReader(
                     _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
                 ),
+                dma=dma,
             )
             logger.info(
                 "[kt-rankwrite] armed on %d layers: this rank writes its own "
