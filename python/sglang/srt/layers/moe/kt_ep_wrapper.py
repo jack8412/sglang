@@ -6887,10 +6887,15 @@ def maybe_run_expert_swap_window(
         # either: it is the boundary right after an acting window that has the
         # newly-changed plan, so it all misses cache and is read for real.
         #
-        # Gated on the LAST window's arming, which is durable state: if a rank
-        # ever fails to map the arena the window disarms, every rank returns to
-        # the checkpoint path, and the prefetch resumes on its own.
-        if entries and not _KT_SWAP_STATE.get("rank_write_armed"):
+        # Gate on whether rank-write is CONFIGURED, not on whether a previous
+        # window armed it. Arming is only known after a window has run, so
+        # keying on it left every boundary before the first window prefetching
+        # ~12.9 GB that rank-write would never read -- V14 logged 17 such
+        # passes, every one of them "prefetch 0 hit / 0 miss". The writer is
+        # built at boot (finalize_split_prefill), so its presence is already
+        # decided by the time any boundary is reached, and there is no longer a
+        # checkpoint path to fall back to: a rank-write failure terminates.
+        if entries and not _rank_write_owns_demotions():
             _start_demotion_prefetch(anchor, entries)
         return
 
@@ -8703,6 +8708,19 @@ def finalize_split_prefill(server_args) -> bool:
             "window will retry"
         )
     return True
+
+
+def _rank_write_owns_demotions() -> bool:
+    """True when a demoted expert's bytes come off the GPU, not the checkpoint.
+
+    Two signals, because they become available at different times: the writer
+    is constructed at boot, while arming is the per-window consensus. Either
+    one means _read_demoted_expert is never called, so prefetching for it is
+    pure disk traffic.
+    """
+    if _KT_SWAP_STATE.get("rank_write_armed"):
+        return True
+    return _KT_SWAP_STATE.get("rank_writer") is not None
 
 
 def _start_demotion_prefetch(anchor, entries):
