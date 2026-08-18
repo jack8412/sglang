@@ -642,15 +642,22 @@ def run_swap_window(
         policy.note_swapped(swaps)
         applied += len(swaps)
         touched += 1
-        logger.info(
-            "[kt-swap] layer=%s applied %d swap(s): %s",
-            entry.get("layer_idx"),
-            len(swaps),
-            ", ".join(
-                f"{s.promote}(d={s.demand:.1f})<-row{r}-{s.demote}(h={s.hits:.1f})"
-                for s, r in zip(swaps, rows)
-            ),
-        )
+        # DEBUG, not INFO. This is one line per LAYER per RANK per window --
+        # 92 x 8 x every window -- and each carries the full pair list, so a
+        # 32-swap layer is ~1 KB. Measured on V7: 9,768 lines and 9 MB of log
+        # in a single benchmark run, written eight times over because every
+        # rank logs the same decision. The window summary already reports the
+        # totals; this is only useful when a specific pair is under suspicion.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-swap] layer=%s applied %d swap(s): %s",
+                entry.get("layer_idx"),
+                len(swaps),
+                ", ".join(
+                    f"{s.promote}(d={s.demand:.1f})<-row{r}-{s.demote}(h={s.hits:.1f})"
+                    for s, r in zip(swaps, rows)
+                ),
+            )
     return SwapWindowResult(
         swaps_applied=applied, layers_touched=touched, skipped_layers=skipped
     )

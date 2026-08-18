@@ -6854,7 +6854,19 @@ def maybe_run_expert_swap_window(
         # Sampling-only pass: counters folded into the EMAs, nothing moved --
         # but it is also the last boundary before an acting one, so it is where
         # the demotion reads get started off the critical path.
-        if entries:
+        # NOT under rank-write. The prefetch feeds _read_demoted_expert, and
+        # rank-write never calls it: each rank captures its own slice off its
+        # own GPU rows, so no demoted expert's bytes come off the checkpoint at
+        # all. MEASURED on V7: 28 prefetch passes moved 25,617 experts --
+        # ~448 GB off disk -- while every one of 112 windows reported
+        # "prefetch 0 hit / 0 miss". Not one byte was consumed. It is not free
+        # either: it is the boundary right after an acting window that has the
+        # newly-changed plan, so it all misses cache and is read for real.
+        #
+        # Gated on the LAST window's arming, which is durable state: if a rank
+        # ever fails to map the arena the window disarms, every rank returns to
+        # the checkpoint path, and the prefetch resumes on its own.
+        if entries and not _KT_SWAP_STATE.get("rank_write_armed"):
             _start_demotion_prefetch(anchor, entries)
         return
 
