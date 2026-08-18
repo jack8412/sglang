@@ -8416,8 +8416,28 @@ def finalize_split_prefill(server_args) -> bool:
         from sglang.srt.layers.moe.kt_arena_share import arena_source_for
 
         arena_sources = {li: arena_source_for(li) for li in layer_indices}
+        # ARENA-DMA FIRST, and it is the one that deletes the pinned store.
+        # The demotion path has already registered this rank's whole arena, so
+        # the cold stream can be read straight out of it: no 51.1 GiB of pinned
+        # rows per rank, and no host copy to fill them. Built here rather than
+        # lazily because the registration must exist before the source does.
+        _dma_writer = None
+        if (
+            envs.SGLANG_KT_DEMOTION_DIRECT_DMA.get()
+            and envs.SGLANG_KT_DEMOTION_RANK_WRITE.get()
+            and anchor.kt_config.cold_only_cpu_experts
+            and not use_direct
+            and not use_export
+        ):
+            _dma_writer = _get_or_create_rank_writer({"method": anchor})
+        use_arena_dma = (
+            _dma_writer is not None
+            and getattr(_dma_writer, "_dma", None) is not None
+        )
+
         use_arena = (
-            not use_direct
+            not use_arena_dma
+            and not use_direct
             and not use_export
             and not force_store
             and not anchor.kt_config.cold_only_cpu_experts
@@ -8428,7 +8448,33 @@ def finalize_split_prefill(server_args) -> bool:
             use_arena = swizzle_plan is not None and raw_shapes is not None
         if not use_export and not use_direct:
             dynamic = use_arena
-        if use_arena:
+        if use_arena_dma:
+            from sglang.srt.layers.moe.kt_demotion_writer import ArenaDmaColdSource
+
+            raw_shapes, swizzle_plan = _build_dynamic_swizzle_plan(anchor, device)
+            if swizzle_plan is None or raw_shapes is None:
+                # No fallback: the arena is checkpoint layout and without the
+                # plan there is no way to produce a resident row from it.
+                raise RuntimeError(
+                    "arena-DMA cold source needs the swizzle plan and it could "
+                    "not be built"
+                )
+            source = ArenaDmaColdSource(
+                dma=_dma_writer._dma,
+                offsets_by_layer=_dma_writer._offsets,
+                geometry=_dma_writer._g,
+                layers=layer_indices,
+                num_cold=num_cold,
+                experts=anchor.global_num_experts,
+            )
+            dynamic = True
+            logger.info(
+                "[split-prefill] cold experts stream by DMA out of kt's "
+                "registered arena: no pinned store built, %d GiB per rank "
+                "saved, six pitched copies per layer",
+                51,
+            )
+        elif use_arena:
             from sglang.srt.layers.moe.expert_pipeline import ArenaColdSource
 
             source = ArenaColdSource(

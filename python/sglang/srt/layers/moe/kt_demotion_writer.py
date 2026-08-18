@@ -281,6 +281,123 @@ class ArenaDmaWriter:
         )
 
 
+
+class ArenaDmaColdSource:
+    """Split prefill's cold stream, straight out of kt's arena.
+
+    THIS IS WHAT DELETES THE PINNED STORE. The store exists to hand the
+    pipeline a layer's 272 cold experts as packed host rows; those same bytes
+    are already in kt's arena, which the demotion path has registered. So the
+    copy engine can read them directly and the ~51 GiB per rank (409 GiB across
+    TP8) never needs to exist.
+
+    SIX COPIES PER LAYER, not 272. Two properties make that possible, and both
+    are checked at construction rather than assumed:
+
+      * kt bump-allocates the resident experts in order, so each kind's buffers
+        sit at a CONSTANT stride -- an expert's gate block is
+        ``base_gate + k * stride``. One cudaMemcpy2DAsync per kind therefore
+        gathers all 272, with spitch = stride and width = the per-expert slice.
+      * At cpu_tp == gpu_tp (one rank per partition) per_numa == per_gpu, so
+        w2_width == w2_pitch and a rank's down-projection strips are CONTIGUOUS
+        inside the block. The interleave that forces a strided read at coarser
+        partitionings simply is not there, so w2 is one pitched copy like the
+        rest. At cpu_tp < gpu_tp it would need one copy per expert; this class
+        refuses instead of silently doing 272x the launches.
+
+    SLOT ORDER IS ADDRESS ORDER. Staging row j must hold the expert in cold
+    slot j. kt allocates blocks in ascending logical id and sglang assigns cold
+    slots the same way, so block j is slot j at boot; a swap hands the block to
+    the demoted expert and exchanges the slot entry in step, so the two stay
+    aligned and the physical blocks never move. Sorting the live offsets by
+    address therefore yields slot order at any point in the run.
+
+    Duck-compatible with ColdExpertStore where ColdExpertPipeline touches it.
+    """
+
+    def __init__(self, *, dma, offsets_by_layer, geometry, layers, num_cold, experts):
+        self._dma = dma
+        self._g = geometry
+        self.num_cold = int(num_cold)
+        self._layers = sorted(layers)
+        self.raw_layout = True  # the arena is checkpoint layout
+        self.dirty = False
+        g = geometry
+        if g.w2_width != g.w2_pitch:
+            raise ValueError(
+                f"arena DMA cold source needs one rank per partition "
+                f"(w2_width {g.w2_width} != w2_pitch {g.w2_pitch}); at coarser "
+                f"partitionings a layer would cost 272 pitched copies, not 6"
+            )
+        # base address per (layer, kind) and the shared stride, derived from
+        # the live offsets and verified to be a true arithmetic progression.
+        self._plan: Dict[int, Tuple[int, List[int]]] = {}
+        for layer_idx in self._layers:
+            offs = offsets_by_layer[layer_idx]
+            rows = [
+                r
+                for r in (offs.get(e, g.part) for e in range(experts))
+                if r is not None
+            ]
+            if len(rows) != self.num_cold:
+                raise ValueError(
+                    f"layer {layer_idx}: {len(rows)} resident experts in "
+                    f"partition {g.part}, expected {self.num_cold}"
+                )
+            bases, stride = [], None
+            for kind in (_GATE_B, _UP_B, _DOWN_B, _GATE_D, _UP_D, _DOWN_D):
+                vals = sorted(int(r[kind]) for r in rows)
+                deltas = {b - a for a, b in zip(vals, vals[1:])}
+                if len(deltas) != 1:
+                    raise ValueError(
+                        f"layer {layer_idx} kind {kind}: expert blocks are not "
+                        f"evenly strided ({len(deltas)} distinct deltas); the "
+                        f"bulk pitched read would read the wrong bytes"
+                    )
+                d = deltas.pop()
+                if stride is None:
+                    stride = d
+                elif d != stride:
+                    raise ValueError(
+                        f"layer {layer_idx}: kind {kind} strides by {d} but "
+                        f"another kind strides by {stride}"
+                    )
+                bases.append(vals[0])
+            self._plan[int(layer_idx)] = (int(stride), bases)
+
+    # -- ColdExpertStore-compatible lifecycle -----------------------------
+    def after_enqueue(self, layer_idx: int, stream) -> None:
+        return
+
+    def reset(self) -> None:
+        return
+
+    def issue_layer_copies(self, layer_idx: int, raw, stream) -> None:
+        """Gather one layer's whole cold set into ``raw``, six pitched copies."""
+        g = self._g
+        stride, bases = self._plan[int(layer_idx)]
+        base = self._dma._base[int(layer_idx)]
+        n = self.num_cold
+        names = list(raw.keys())
+        w13, w13_s, w2, w2_s = (raw[k] for k in names[:4])
+        cp = self._dma._copy
+        # gate | up halves into the packed [n, 2*gu_w] destination
+        cp.memcpy2d_h2d(w13.data_ptr(), 2 * g.gu_w,
+                        base + bases[0], stride, g.gu_w, n, stream)
+        cp.memcpy2d_h2d(w13.data_ptr() + g.gu_w, 2 * g.gu_w,
+                        base + bases[1], stride, g.gu_w, n, stream)
+        cp.memcpy2d_h2d(w13_s.data_ptr(), 2 * g.gu_s,
+                        base + bases[3], stride, g.gu_s, n, stream)
+        cp.memcpy2d_h2d(w13_s.data_ptr() + g.gu_s, 2 * g.gu_s,
+                        base + bases[4], stride, g.gu_s, n, stream)
+        # down: contiguous per expert (w2_width == w2_pitch), so a whole
+        # expert's block is one row of the pitched copy.
+        cp.memcpy2d_h2d(w2.data_ptr(), g.hidden * g.w2_width,
+                        base + bases[2], stride, g.hidden * g.w2_width, n, stream)
+        cp.memcpy2d_h2d(w2_s.data_ptr(), g.hidden * g.w2s_width,
+                        base + bases[5], stride, g.hidden * g.w2s_width, n, stream)
+
+
 class RankShardWriter:
     """Writes this rank's slice of demoted experts into kt's memfd arena.
 

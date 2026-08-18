@@ -523,12 +523,14 @@ class ColdExpertPipeline:
         from sglang.srt.layers.moe.kt_mxfp4_export import apply_batched_swizzle
 
         raw = self._raw_buffers[slot]
-        from sglang.srt.layers.moe.kt_direct_dma import DirectDmaSource
 
-        if isinstance(self._store, DirectDmaSource):
-            # Direct-DMA source: it owns the H2D issue (there is no host
-            # staging to hand back), enqueued on the SAME copy stream so the
-            # prefetch event's meaning is unchanged.
+        if hasattr(self._store, "issue_layer_copies"):
+            # The source owns the H2D issue: there is no host staging to hand
+            # back, because the bytes are read straight out of kt's registered
+            # arena. Enqueued on the SAME copy stream so the prefetch event's
+            # meaning is unchanged. Duck-typed rather than isinstance so both
+            # the direct-DMA transport and the arena cold source qualify
+            # without this file importing either.
             self._store.issue_layer_copies(layer_idx, raw, self._copy_stream)
         else:
             for name in WEIGHT_NAMES:
