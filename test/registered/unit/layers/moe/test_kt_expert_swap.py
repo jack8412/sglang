@@ -429,7 +429,19 @@ class TestSwapWindow(CustomTestCase):
         self.assertEqual(occupant_at_write, 2)  # flip had not happened yet
         self.assertEqual(int(entry["tables"].gpu_index_to_logical[2]), 6)
 
-    def test_failing_layer_is_isolated_not_fatal(self):
+    def test_failing_layer_propagates_and_leaves_the_tables_alone(self):
+        """A failed move must RAISE, and must not touch the tables.
+
+        The raise is the fail-fast policy: skipping the layer and continuing
+        was the shipped behaviour and it was a silent-wrong-weights bug --
+        move_weights only RECORDS, so the window-end drain then flushed the
+        skipped layer's staged promotions into rows whose tables never
+        flipped. This test asserted the old contract and kept passing until
+        the policy changed under it.
+
+        The other half is unchanged and is the real invariant: whatever the
+        window does on the way out, row 2 must still be advertised as its
+        previous occupant, so nothing routes to a half-updated expert."""
         from sglang.srt.layers.moe.kt_expert_swap import run_swap_window
 
         entry = self._entry()
@@ -437,11 +449,8 @@ class TestSwapWindow(CustomTestCase):
         def boom(layer, row, expert, demoted):
             raise RuntimeError("export failed")
 
-        res = run_swap_window([entry], move_weights=boom)
-        self.assertEqual(res.swaps_applied, 0)
-        self.assertEqual(res.skipped_layers, 1)
-        # tables untouched, so the rewritten row is still advertised as its
-        # previous occupant and nothing routes to a half-updated expert
+        with self.assertRaises(RuntimeError):
+            run_swap_window([entry], move_weights=boom)
         self.assertEqual(int(entry["tables"].gpu_index_to_logical[2]), 2)
         self.assertTrue(bool(entry["tables"].gpu_experts_mask[2]))
 
@@ -478,15 +487,14 @@ class TestSwapWindow(CustomTestCase):
         def boom():
             raise RuntimeError("bulk copy failed")
 
-        res = run_swap_window(
-            [entry],
-            move_weights=lambda l, r, e, d: None,
-            finish_layer=boom,
-        )
-        self.assertEqual(res.swaps_applied, 0)
-        self.assertEqual(res.skipped_layers, 1)
-        # The whole point: a failed bulk write must NOT leave row 2 advertised
-        # as expert 6 while it still holds expert 2.
+        with self.assertRaises(RuntimeError):
+            run_swap_window(
+                [entry],
+                move_weights=lambda l, r, e, d: None,
+                finish_layer=boom,
+            )
+        # The whole point, and unchanged by fail-fast: a failed bulk write must
+        # NOT leave row 2 advertised as expert 6 while it still holds expert 2.
         self.assertEqual(int(entry["tables"].gpu_index_to_logical[2]), 2)
         self.assertTrue(bool(entry["tables"].gpu_experts_mask[2]))
 
