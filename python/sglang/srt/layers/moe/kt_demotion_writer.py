@@ -475,18 +475,28 @@ class ArenaDmaColdSource:
         # 2. the HBM leg: scatter the records into the layout the swizzle reads.
         #    as_strided (not view) because the run is addressed in records, and
         #    the tail record may be shorter than a full stride.
+        #
+        #    Everything here is in BYTES, via a uint8 view of each destination.
+        #    The widths and bases come from kt's arena and are byte counts, and
+        #    the pitched path they replace addressed these same buffers as raw
+        #    bytes (`w13.data_ptr() + g.gu_w`). Indexing them as ELEMENTS would
+        #    agree only while every raw dtype happens to be one byte wide, and
+        #    would silently halve the copy the day one is not.
+        def _bytes(t):
+            return t.view(torch.uint8).reshape(n, -1)
+
         with torch.cuda.stream(stream):
             for dst, kind in (
-                (w13.view(n, -1)[:, : g.gu_w], 0),
-                (w13.view(n, -1)[:, g.gu_w :], 1),
-                (w2.view(n, -1), 2),
-                (w13_s.view(n, -1)[:, : g.gu_s], 3),
-                (w13_s.view(n, -1)[:, g.gu_s :], 4),
-                (w2_s.view(n, -1), 5),
+                (_bytes(w13)[:, : g.gu_w], 0),
+                (_bytes(w13)[:, g.gu_w :], 1),
+                (_bytes(w2), 2),
+                (_bytes(w13_s)[:, : g.gu_s], 3),
+                (_bytes(w13_s)[:, g.gu_s :], 4),
+                (_bytes(w2_s), 5),
             ):
                 width = self._widths[kind]
                 src = staging.as_strided((n, width), (stride, 1), bases[kind] - lo)
-                dst.copy_(src.view(dst.dtype), non_blocking=True)
+                dst.copy_(src, non_blocking=True)
 
 
 class RankShardWriter:

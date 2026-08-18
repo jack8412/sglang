@@ -879,6 +879,36 @@ class TestPackedColdStreamMatchesPitched(unittest.TestCase):
                 raw["w2"][i], self.arena[w2_off : w2_off + P_HIDDEN * P_W2_W]
             )
 
+    def test_multi_byte_dtypes_are_addressed_in_bytes(self):
+        """The widths are BYTE counts; the raw buffers need not be uint8.
+
+        Both paths address these buffers as raw bytes -- the pitched one via
+        data_ptr arithmetic -- so the unpack must too. Indexing the destination
+        in elements agrees only while every dtype is one byte wide, and silently
+        copies half the data the day one is not.
+        """
+
+        def raw16():
+            n = P_COLD
+            return {
+                # same BYTE widths, half the element count
+                "w13": torch.zeros(n, P_GU_W, dtype=torch.bfloat16),
+                "w13_s": torch.zeros(n, P_GU_S, dtype=torch.bfloat16),
+                "w2": torch.zeros(n, P_HIDDEN * P_W2_W // 2, dtype=torch.bfloat16),
+                "w2_s": torch.zeros(n, P_HIDDEN * P_W2S_W // 2, dtype=torch.bfloat16),
+            }
+
+        a, b = raw16(), raw16()
+        _packed_source(self.arena, _FakeCopy()).issue_layer_copies(0, a, None)
+        src = _packed_source(self.arena, _FakeCopy())
+        staging = torch.zeros(src.staging_nbytes, dtype=torch.uint8)
+        src.issue_layer_copies(0, b, None, staging=staging)
+        for name in a:
+            self.assertTrue(
+                torch.equal(a[name].view(torch.uint8), b[name].view(torch.uint8)),
+                f"{name} differs under a 2-byte dtype",
+            )
+
     def test_staging_never_reads_past_the_arena(self):
         """The read must stop at the last kind of the last expert, not a stride."""
         src = _packed_source(self.arena, _FakeCopy())
