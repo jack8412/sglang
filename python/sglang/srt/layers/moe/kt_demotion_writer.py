@@ -126,7 +126,12 @@ class SlotOffsets:
 
 
 class ArenaDmaWriter:
-    """Device -> kt's arena in ONE hop: no pinned intermediate, no CPU memcpy.
+    """kt's arena <-> device in ONE hop: no pinned intermediate, no CPU memcpy.
+
+    Both directions live here because they share the thing that costs: the
+    registration. A promotion reads the same offsets a demotion writes, so
+    splitting them into two objects would either register the arena twice or
+    make one depend on the other's internals.
 
     What this replaces. The staged path reads the demoted rows off the GPU
     into a fresh pinned buffer (a real D2H DMA) and then memcpys that buffer
@@ -168,6 +173,64 @@ class ArenaDmaWriter:
             self._base[int(layer_idx)] = ptr
             total += nbytes
         self.registered_bytes = total
+
+    def read(self, *, layer_idx: int, row, out, stream: int) -> None:
+        """kt's arena -> device: one promoted expert's slice, six copies.
+
+        The exact inverse of :meth:`write`, against the same offsets, so a
+        promotion reads back precisely the bytes a demotion put there. ``out``
+        holds DEVICE tensors in checkpoint layout -- w13 and w13_scale flat,
+        w2 and w2_scale as [hidden, width] -- which is the shape
+        ``_swizzle_promoted_rows`` takes before the row is scattered into the
+        resident slot.
+
+        This is what makes the pinned cold store removable: the promoted bytes
+        already sit in kt's buffers, and the copy engine can put them on the
+        GPU without a host-side staging copy in between.
+        """
+        g = self._g
+        lr = g.local_rank
+        base = self._base[int(layer_idx)]
+        w13 = out["w13"]
+        w13_s = out["w13_scale"]
+        self._copy.memcpy_h2d(
+            w13.data_ptr(), base + row[_GATE_B] + lr * g.gu_w, g.gu_w, stream
+        )
+        self._copy.memcpy_h2d(
+            w13.data_ptr() + g.gu_w,
+            base + row[_UP_B] + lr * g.gu_w,
+            g.gu_w,
+            stream,
+        )
+        self._copy.memcpy_h2d(
+            w13_s.data_ptr(), base + row[_GATE_D] + lr * g.gu_s, g.gu_s, stream
+        )
+        self._copy.memcpy_h2d(
+            w13_s.data_ptr() + g.gu_s,
+            base + row[_UP_D] + lr * g.gu_s,
+            g.gu_s,
+            stream,
+        )
+        # down: the source strips are strided by the partition pitch, the
+        # destination is packed -- the copy engine walks the stride.
+        self._copy.memcpy2d_h2d(
+            out["w2"].data_ptr(),
+            g.w2_width,
+            base + row[_DOWN_B] + lr * g.w2_width,
+            g.w2_pitch,
+            g.w2_width,
+            g.hidden,
+            stream,
+        )
+        self._copy.memcpy2d_h2d(
+            out["w2_scale"].data_ptr(),
+            g.w2s_width,
+            base + row[_DOWN_D] + lr * g.w2s_width,
+            g.w2s_pitch,
+            g.w2s_width,
+            g.hidden,
+            stream,
+        )
 
     def write(self, *, layer_idx: int, row, shard, stream: int) -> None:
         """Issue one expert's six copies. Async on ``stream``."""

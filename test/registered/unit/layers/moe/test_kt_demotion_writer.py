@@ -498,5 +498,86 @@ class TestDirectDmaMatchesTheHostPath(unittest.TestCase):
             unreg_fn(int(dma_arena.data_ptr()))
 
 
+class TestDirectDmaRoundTrip(unittest.TestCase):
+    """A promotion must read back exactly what a demotion wrote.
+
+    The two directions share offsets but not code paths -- write uses
+    memcpy_d2h / memcpy2d_d2h, read uses the h2d pair with source and
+    destination pitches swapped. A sign error or a transposed pitch/width in
+    either produces right-shaped wrong bytes, which is the failure mode this
+    whole module exists to prevent, and no shape check would catch it.
+
+    So: write a known shard through the DMA path, read it back through the DMA
+    path, and require the bytes to be identical. Doing it for every rank of a
+    partition also proves the slices do not overlap -- rank 2's read must not
+    see rank 1's write."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_write_then_read_is_identity(self):
+        ArenaDmaWriter = _dw.ArenaDmaWriter
+        from sglang.srt.layers.moe.kt_direct_dma import (
+            CudaCopyLib,
+            cudart_register_fns,
+        )
+
+        off_gate = 0
+        off_up = off_gate + GU_BLOCK
+        off_down = off_up + GU_BLOCK
+        off_gate_s = off_down + W2_BLOCK
+        off_up_s = off_gate_s + GUS_BLOCK
+        off_down_s = off_up_s + GUS_BLOCK
+        row = [off_gate, off_up, off_down, off_gate_s, off_up_s, off_down_s]
+        arena = torch.zeros(off_down_s + W2S_BLOCK, dtype=torch.uint8)
+
+        reg_fn, unreg_fn = cudart_register_fns()
+        rc = reg_fn(int(arena.data_ptr()), int(arena.numel()))
+        self.assertEqual(rc, 0, f"cudaHostRegister rc={rc}")
+        try:
+            dev = torch.device("cuda")
+            full = _full_expert(seed=11)
+            written = {}
+            for rank in range(TP_SIZE):
+                g = _Geom(rank)
+                if g.part != 0:
+                    continue
+                sh = _rank_shard(full, rank)
+                src = {
+                    "w13": sh.w13.reshape(-1).contiguous().to(dev),
+                    "w13_scale": sh.w13_scale_e8m0.reshape(-1).contiguous().to(dev),
+                    "w2": sh.w2.reshape(g.hidden, g.w2_width).contiguous().to(dev),
+                    "w2_scale": sh.w2_scale_e8m0.reshape(g.hidden, g.w2s_width)
+                    .contiguous()
+                    .to(dev),
+                }
+                dma = ArenaDmaWriter(
+                    arena_by_layer={}, geometry=g,
+                    copy_lib=CudaCopyLib(), register_fn=lambda p, n: 0,
+                )
+                dma._base[0] = int(arena.data_ptr())
+                dma.write(layer_idx=0, row=row, shard=src,
+                          stream=torch.cuda.current_stream().cuda_stream)
+                written[rank] = (g, src, dma)
+            torch.cuda.synchronize()
+
+            for rank, (g, src, dma) in written.items():
+                out = {
+                    "w13": torch.zeros_like(src["w13"]),
+                    "w13_scale": torch.zeros_like(src["w13_scale"]),
+                    "w2": torch.zeros_like(src["w2"]),
+                    "w2_scale": torch.zeros_like(src["w2_scale"]),
+                }
+                dma.read(layer_idx=0, row=row, out=out,
+                         stream=torch.cuda.current_stream().cuda_stream)
+                torch.cuda.synchronize()
+                for name in ("w13", "w13_scale", "w2", "w2_scale"):
+                    self.assertTrue(
+                        torch.equal(out[name], src[name]),
+                        f"rank {rank} {name}: read back "
+                        f"{int((out[name] != src[name]).sum())} differing bytes",
+                    )
+        finally:
+            unreg_fn(int(arena.data_ptr()))
+
+
 if __name__ == "__main__":
     unittest.main()

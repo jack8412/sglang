@@ -7139,6 +7139,67 @@ def maybe_run_expert_swap_window(
         if _pending["layer_idx"] != layer_idx:
             _flush_moves()
             _pending["layer"], _pending["layer_idx"] = layer, layer_idx
+
+        _rw = _KT_SWAP_STATE.get("rank_writer")
+        if (
+            _rw is not None
+            and getattr(_rw, "_dma", None) is not None
+            and _KT_SWAP_STATE.get("rank_write_armed")
+        ):
+            # PROMOTION BY DMA, the mirror of the demotion write. The promoted
+            # expert's bytes are already in kt's arena and this rank needs only
+            # its own slice, so the copy engine reads them straight to device.
+            # No stage_row clone (a host read plus a host write of 2.19 MB per
+            # expert), no pinned staging, and the read happens BEFORE
+            # install_cpu_expert moves the slot, so the promoted expert still
+            # owns these buffers -- the same read-before-move rule the writer
+            # relies on, inverted.
+            #
+            # AND THE TWO ALIAS. After the move the demoted expert owns exactly
+            # the buffers this read is sourcing, and the rank-write D2H lands
+            # in them. Both are issued on the CURRENT stream, so the read is
+            # ordered ahead of the write and completes first; putting either on
+            # a private stream would silently reintroduce the race.
+            _t = time.perf_counter()
+            _row = _rw._offsets[layer_idx].get(int(logical_id), _rw._g.part)
+            if _row is None:
+                _fatal_swap_failure(
+                    f"DMA promotion: expert {logical_id} holds no buffer in "
+                    f"partition {_rw._g.part} (layer {layer_idx})"
+                )
+            _raw = _KT_SPLIT_PREFILL_STATE["raw_shapes"]
+            _dev = getattr(
+                layer, _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]
+            ).data.device
+            _staged_row = {
+                n: torch.empty(tuple(_raw[n][0]), dtype=_raw[n][1], device=_dev)
+                for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+            }
+            _rw._dma.read(
+                layer_idx=layer_idx,
+                row=_row,
+                out={
+                    "w13": _staged_row[_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]],
+                    "w13_scale": _staged_row[_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[1]],
+                    "w2": _staged_row[_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[2]],
+                    "w2_scale": _staged_row[_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[3]],
+                },
+                stream=torch.cuda.current_stream().cuda_stream,
+            )
+            _timing["stage_s"] += time.perf_counter() - _t
+            # Arena bytes are CHECKPOINT layout; the resident row wants trtllm,
+            # so the batch must go through the GPU swizzle.
+            _pending["arena"] = True
+            _pending["items"].append(
+                {
+                    "dst_row": dst_row,
+                    "slot": slot,
+                    "demoted_id": demoted_id,
+                    "promoted": _staged_row,
+                }
+            )
+            return
+
         _t = time.perf_counter()
         _staged_row = store.stage_row(layer_idx, slot)
         _timing["stage_s"] += time.perf_counter() - _t
@@ -8482,6 +8543,10 @@ def finalize_split_prefill(server_args) -> bool:
     # swizzle on the way to the GPU and a demotion must unswizzle on the way
     # back, or the two sides silently disagree about layout.
     _KT_SPLIT_PREFILL_STATE["swizzle_plan"] = swizzle_plan
+    # The checkpoint-layout shapes, kept because DMA promotion allocates its
+    # landing buffers from them: the arena hands back raw bytes and
+    # _swizzle_promoted_rows wants exactly these shapes.
+    _KT_SPLIT_PREFILL_STATE["raw_shapes"] = raw_shapes
     _KT_SPLIT_PREFILL_STATE["swizzle_inverse"] = None
     _KT_SPLIT_PREFILL_STATE["raw_scale_shapes"] = (
         None
