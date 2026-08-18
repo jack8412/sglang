@@ -54,6 +54,10 @@ class ColdExpertStore:
        that a swap has happened, and any on-disk reuse must refuse a dirty
        store.
     """
+    # Bytes of contiguous staging this source wants the pipeline to hand it.
+    # 0 means "issue your own copies"; a source that can land its layer in one
+    # contiguous H2D sets it and gets a scratch buffer per slot.
+    staging_nbytes: int = 0
 
     def __init__(
         self,

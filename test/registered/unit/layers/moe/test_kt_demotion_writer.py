@@ -13,6 +13,7 @@ rows; down is copied one hidden row at a time out of the full intermediate
 dimension; scales likewise).
 """
 
+import ctypes
 import importlib.util
 import os
 import re
@@ -730,6 +731,159 @@ class TestColdSourceSatisfiesThePipelineProtocol(unittest.TestCase):
         src = _dw.ArenaDmaColdSource.__new__(_dw.ArenaDmaColdSource)
         self.assertIsNone(src.layer_rows(0, "w13_weight"))
         self.assertIsNone(src.layer_rows(9999, "w2_weight"))
+
+
+# --- the packed cold stream ------------------------------------------------
+# One rank per NUMA partition, which is what makes w2 contiguous (w2_width ==
+# w2_pitch) and is the configuration the arena cold source requires.
+P_HIDDEN, P_GU_W, P_GU_S, P_W2_W, P_W2S_W = 8, 96, 12, 16, 4
+P_WIDTHS = [P_GU_W, P_GU_W, P_HIDDEN * P_W2_W, P_GU_S, P_GU_S, P_HIDDEN * P_W2S_W]
+P_PAD = 7  # trailing slack in the record, so stride > sum(widths)
+P_STRIDE = sum(P_WIDTHS) + P_PAD
+P_COLD = 5
+# The cold run does NOT begin at arena offset 0. Without this the fixture makes
+# min(bases) == 0, the staging-relative offset collapses to the arena-absolute
+# one, and a whole class of translation bug becomes invisible to the test.
+P_START = 64
+
+
+class _PackedGeom:
+    hidden = P_HIDDEN
+    gu_w = P_GU_W
+    gu_s = P_GU_S
+    w2_width = P_W2_W
+    w2_pitch = P_W2_W
+    w2s_width = P_W2S_W
+    part = 0
+
+
+class _PackedOffsets:
+    """kt's bump-packed record layout, cold experts only (cold-only residency)."""
+
+    def __init__(self, cold_ids):
+        self._rows = {}
+        for i, e in enumerate(sorted(cold_ids)):
+            off, row = P_START + i * P_STRIDE, []
+            for w in P_WIDTHS:
+                row.append(off)
+                off += w
+            self._rows[e] = row
+
+    def get(self, expert, part):
+        return self._rows.get(expert)
+
+
+class _FakeCopy:
+    """Faithful stand-in for the CUDA copy lib, on real host addresses."""
+
+    def __init__(self):
+        self.contiguous_calls = 0
+        self.pitched_calls = 0
+
+    def memcpy_h2d(self, dst_ptr, src_ptr, nbytes, stream):
+        self.contiguous_calls += 1
+        ctypes.memmove(dst_ptr, src_ptr, nbytes)
+
+    def memcpy2d_h2d(
+        self, dst_ptr, dst_pitch, src_ptr, src_pitch, width, height, stream
+    ):
+        self.pitched_calls += 1
+        for r in range(height):
+            ctypes.memmove(dst_ptr + r * dst_pitch, src_ptr + r * src_pitch, width)
+
+
+class _FakeDma:
+    def __init__(self, arena, copy):
+        self._base = {0: arena.data_ptr()}
+        self._copy = copy
+
+
+def _packed_source(arena, copy):
+    return _dw.ArenaDmaColdSource(
+        dma=_FakeDma(arena, copy),
+        offsets_by_layer={0: _PackedOffsets(range(P_COLD))},
+        geometry=_PackedGeom(),
+        layers=[0],
+        num_cold=P_COLD,
+        experts=P_COLD,
+    )
+
+
+def _packed_raw():
+    n = P_COLD
+    return {
+        "w13": torch.zeros(n, 2 * P_GU_W, dtype=torch.uint8),
+        "w13_s": torch.zeros(n, 2 * P_GU_S, dtype=torch.uint8),
+        "w2": torch.zeros(n, P_HIDDEN * P_W2_W, dtype=torch.uint8),
+        "w2_s": torch.zeros(n, P_HIDDEN * P_W2S_W, dtype=torch.uint8),
+    }
+
+
+class TestPackedColdStreamMatchesPitched(unittest.TestCase):
+    """One contiguous H2D + a device-side unpack must equal six pitched copies.
+
+    This is a throughput change, so the only thing that makes it safe is that
+    the bytes are provably the same ones. Measured on the node, the pitched form
+    of this transfer runs at 24.9 GB/s against 55.6 GB/s contiguous, and prefill
+    is copy-bound -- so the win is real, and so is the risk of landing an expert
+    one record off and never noticing, because wrong weights produce plausible
+    tokens rather than a crash.
+
+    The record here carries deliberate trailing padding (stride > sum of the six
+    widths), which is the case that would break a naive `n * stride` read: the
+    last expert has no padding behind it to read.
+    """
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.arena = torch.randint(
+            0,
+            256,
+            (P_START + (P_COLD - 1) * P_STRIDE + sum(P_WIDTHS),),
+            dtype=torch.uint8,
+        )
+
+    def test_packed_and_pitched_land_identical_bytes(self):
+        pitched_copy, packed_copy = _FakeCopy(), _FakeCopy()
+        a, b = _packed_raw(), _packed_raw()
+
+        _packed_source(self.arena, pitched_copy).issue_layer_copies(0, a, None)
+        src = _packed_source(self.arena, packed_copy)
+        staging = torch.zeros(src.staging_nbytes, dtype=torch.uint8)
+        src.issue_layer_copies(0, b, None, staging=staging)
+
+        for name in a:
+            self.assertTrue(
+                torch.equal(a[name], b[name]),
+                f"{name}: {int((a[name] != b[name]).sum())} bytes differ",
+            )
+        # and it really is one descriptor instead of six
+        self.assertEqual(pitched_copy.pitched_calls, 6)
+        self.assertEqual(pitched_copy.contiguous_calls, 0)
+        self.assertEqual(packed_copy.pitched_calls, 0)
+        self.assertEqual(packed_copy.contiguous_calls, 1)
+
+    def test_the_bytes_are_actually_the_arena_s(self):
+        """Guard against both paths agreeing on the same wrong record."""
+        raw = _packed_raw()
+        src = _packed_source(self.arena, _FakeCopy())
+        staging = torch.zeros(src.staging_nbytes, dtype=torch.uint8)
+        src.issue_layer_copies(0, raw, None, staging=staging)
+        for i in range(P_COLD):
+            rec = P_START + i * P_STRIDE
+            torch.testing.assert_close(
+                raw["w13"][i, : P_GU_W], self.arena[rec : rec + P_GU_W]
+            )
+            w2_off = rec + 2 * P_GU_W
+            torch.testing.assert_close(
+                raw["w2"][i], self.arena[w2_off : w2_off + P_HIDDEN * P_W2_W]
+            )
+
+    def test_staging_never_reads_past_the_arena(self):
+        """The read must stop at the last kind of the last expert, not a stride."""
+        src = _packed_source(self.arena, _FakeCopy())
+        self.assertEqual(src.staging_nbytes, self.arena.numel() - P_START)
+        self.assertLess(src.staging_nbytes, P_COLD * P_STRIDE)
 
 
 if __name__ == "__main__":
