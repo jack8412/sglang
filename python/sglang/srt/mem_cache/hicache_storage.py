@@ -38,6 +38,14 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Decode context parallel. Under DCP each rank owns a disjoint set of the
+    # tokens inside every page, so -- unlike plain TP with MLA, where the KV is
+    # replicated and one rank may speak for all -- each rank's bytes are its
+    # own and need their own key. Scoped by dcp_rank ONLY, never by tp_rank:
+    # at tp=8/dcp=4 there are two complete replica sets, and they should share
+    # storage rather than write the same shard twice.
+    dcp_rank: int = 0
+    dcp_size: int = 1
 
 
 @dataclass
@@ -386,10 +394,19 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        # Same reasoning for decode context parallel, one axis down: DCP splits
+        # the tokens *inside* a page across ranks, so each rank stores its own
+        # shard. The size is part of the key because a shard is only meaningful
+        # against the world size it was cut for -- reusing a store across a
+        # --dcp-size change must MISS, not return a wrong-shaped tensor.
+        dcp_rank = storage_config.dcp_rank
+        dcp_size = storage_config.dcp_size
+        if dcp_size > 1:
+            self.config_suffix += f"_dcp{dcp_rank}_{dcp_size}"
 
-        if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
-            os.makedirs(self.file_path)
-            logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
+        # Every DCP rank writes now, so the directory can no longer be rank 0's
+        # job alone -- and two ranks racing makedirs() must not be an error.
+        os.makedirs(self.file_path, exist_ok=True)
 
         # Metadata cache positive lookup toggle & TTL
         enable_cache_raw = None
@@ -426,6 +443,7 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix,
             tp_rank=tp_rank,
             is_mla_model=is_mla_model,
+            dcp_size=dcp_size,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

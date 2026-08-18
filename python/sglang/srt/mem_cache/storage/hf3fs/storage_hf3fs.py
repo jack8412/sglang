@@ -219,7 +219,10 @@ class HiCacheHF3FS(HiCacheStorage):
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
-        if self.is_mla_model and self.rank != 0:
+        # Only a REPLICATED MLA cache can be spoken for by rank 0. Under DCP the
+        # ranks hold disjoint shards, so each must write its own -- and must keep
+        # its own rank in the path, or they all collide on prefix.0.bin.
+        if self.is_mla_model and self.rank != 0 and dcp_size == 1:
             self.skip_backup = True
             self.rank = 0
 
@@ -291,6 +294,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 storage_config.is_mla_model,
                 storage_config.is_page_first_layout,
             )
+            dcp_size = storage_config.dcp_size
 
             if storage_config.extra_config is not None:
                 use_mock_client = storage_config.extra_config.get(
@@ -302,6 +306,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 False,
                 False,
             )
+            dcp_size = 1
 
         mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 

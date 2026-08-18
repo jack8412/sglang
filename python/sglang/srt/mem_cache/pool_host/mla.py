@@ -522,11 +522,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        assert self.dcp_size == 1, (
-            "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
-            "need dcp_rank-scoped keys); --hicache-storage-backend with "
-            "--dcp-size > 1 should have been rejected at server start."
-        )
+        # `index` arrives in the widened LOGICAL space the controller works in;
+        # kv_buffer is indexed by PHYSICAL rows. The length below is already
+        # per-rank (self.page_size is physical), so only the offset needs
+        # translating -- do not also divide the size, which would halve the
+        # payload twice.
+        index = self.dcp_page_row(index)
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -554,6 +555,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        # LOGICAL -> PHYSICAL, as in get_data_page. Without this the write lands
+        # on the wrong rows and RETURNS NORMALLY -- tensor slicing clamps, so a
+        # too-large index writes nothing and a small one corrupts a live page.
+        index = self.dcp_page_row(index)
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,
@@ -584,26 +589,30 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """
         meta data for zero copy
         """
-        assert len(indices) % self.page_size == 0
+        # Under DCP the caller passes logical slots, `dcp_size` of them per
+        # physical row, so the run is `dcp_size` times longer than the rows it
+        # describes; the page count is what must stay whole.
+        assert len(indices) % self.logical_page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
         if self.layout == "layer_first":
-            for index in range(0, len(indices), self.page_size):
+            for index in range(0, len(indices), self.logical_page_size):
+                row = self.dcp_page_row(indices[index])
                 for layer_id in range(self.layer_num):
                     k_ptr = (
                         kv_buffer_data_ptr
-                        + indices[index] * self.kv_cache_dim * self.dtype.itemsize
+                        + row * self.kv_cache_dim * self.dtype.itemsize
                         + layer_id * self.size * self.kv_cache_dim * self.dtype.itemsize
                     )
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
         elif self.layout in ["page_first", "page_first_direct"]:
-            for index in range(0, len(indices), self.page_size):
+            for index in range(0, len(indices), self.logical_page_size):
                 k_ptr = (
                     kv_buffer_data_ptr
-                    + indices[index]
+                    + self.dcp_page_row(indices[index])
                     * self.layer_num
                     * self.kv_cache_dim
                     * self.dtype.itemsize

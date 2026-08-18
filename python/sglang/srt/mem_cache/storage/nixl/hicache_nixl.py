@@ -103,7 +103,13 @@ class HiCacheNixl(HiCacheStorage):
         self.is_mla_model = storage_config.is_mla_model
         self.is_zero_copy = False
         self.storage_config = storage_config
-        self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
+        # Replicated-MLA lets one rank speak for all; DCP does not, because
+        # each rank owns a different slice of every page.
+        self.backup_skip = (
+            self.is_mla_model
+            and storage_config.tp_rank != 0
+            and storage_config.dcp_size == 1
+        )
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
 

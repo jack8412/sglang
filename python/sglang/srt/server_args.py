@@ -7517,14 +7517,6 @@ class ServerArgs:
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
             return
-        if self.hicache_storage_backend is not None:
-            raise NotImplementedError(
-                "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
-                "supported yet: under DCP each rank holds a distinct "
-                "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
-                "backup and the storage keys must become dcp_rank-aware "
-                "first. Run HiCache+DCP with L1/L2 only."
-            )
         if self.speculative_algorithm is not None:
             raise NotImplementedError(
                 "HiCache with --dcp-size > 1 does not support speculative "
@@ -7548,9 +7540,9 @@ class ServerArgs:
                 "MHA host pool has none."
             )
         logger.info(
-            "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
-            "logical slot accounting with per-rank physical translation at "
-            "the transfer boundary (dcp_size=%d).",
+            "HiCache + DCP enabled: host pool uses widened logical slot "
+            "accounting with per-rank physical translation at the transfer "
+            "boundary, and L3 storage keys are dcp_rank-scoped (dcp_size=%d).",
             self.dcp_size,
         )
 

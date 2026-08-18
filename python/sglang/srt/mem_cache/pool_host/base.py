@@ -340,6 +340,32 @@ class HostKVCache(abc.ABC):
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
 
+    def dcp_page_row(self, index: int) -> int:
+        """Physical row where the owned shard of one widened page begins.
+
+        The storage paths hand out a single LOGICAL index per page -- always
+        page-aligned, because the controller slices `host_indices` at multiples
+        of its own (widened) page size. This rank owns the slots congruent to
+        `dcp_rank`, and collapsing them by `// dcp_size` is the same reduction
+        `dcp_kernel_indices` performs for the transfer kernels; for an aligned
+        index the `% dcp_size == dcp_rank` filter is implied, since the page
+        starts at a multiple of `logical_page_size` and every residue appears
+        exactly `page_size` times inside it.
+
+        Refuse a non-aligned index rather than translating it: an unaligned page
+        start means the caller is not slicing on widened boundaries, and the
+        resulting row would be wrong in a way that reads back as plausible data.
+        """
+        if self.dcp_size == 1:
+            return index
+        if index % self.logical_page_size != 0:
+            raise ValueError(
+                f"HiCache DCP page translation needs a widened-page-aligned "
+                f"index; got {index} with logical_page_size="
+                f"{self.logical_page_size} (dcp_size={self.dcp_size})."
+            )
+        return index // self.dcp_size
+
     def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Transfer kernels index per-rank rows; callers hold widened logical slots.
 

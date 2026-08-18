@@ -467,11 +467,16 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
+        # for MLA models, only one rank needs to backup the KV cache -- but
+        # only while the KV really is replicated. Under DCP it is not: each rank
+        # holds a disjoint set of the tokens in every page, so a rank that skips
+        # backup silently persists nothing, and 1/dcp_size of the cache is all
+        # that ever reaches storage.
         self.backup_skip = (
             self.storage_config.is_mla_model
             # todo: load balancing
             and self.storage_config.tp_rank != 0
+            and self.storage_config.dcp_size == 1
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -628,6 +633,12 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        # Read straight off the parallel state, the same way the host pool's own
+        # dcp kwargs are sourced (hiradix_cache.py). The attn_cp pair goes
+        # through a ProcessGroup because that code needs the group itself for
+        # collectives; identity is all that is needed here.
+        dcp_rank = get_parallel().attn_dcp_rank
+        dcp_size = get_parallel().attn_dcp_size
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -644,6 +655,8 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            dcp_rank=dcp_rank,
+            dcp_size=dcp_size,
         )
 
     def reset(self):

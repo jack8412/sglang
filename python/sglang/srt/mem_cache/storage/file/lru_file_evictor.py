@@ -70,6 +70,7 @@ class LRUFileEvictor:
         *,
         tp_rank: int,
         is_mla_model: bool,
+        dcp_size: int = 1,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -80,7 +81,12 @@ class LRUFileEvictor:
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
-        self._is_storage_owner = (not is_mla_model) or (tp_rank == 0)
+        # Under DCP every rank has its own dcp-suffixed files too, so every rank
+        # owns its own bookkeeping -- otherwise this refuses ranks 1..N-1 a
+        # reservation and vetoes the writes a fixed backup_skip just enabled.
+        self._is_storage_owner = (
+            (not is_mla_model) or (tp_rank == 0) or (dcp_size > 1)
+        )
 
         # suffixed_key -> file size in bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()

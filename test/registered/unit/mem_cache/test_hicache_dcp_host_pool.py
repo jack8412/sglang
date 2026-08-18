@@ -200,10 +200,87 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         torch.testing.assert_close(kwargs["src_indices"], expected)
         torch.testing.assert_close(kwargs["dst_indices"], expected)
 
-    def test_l3_data_page_is_guarded(self):
+
+class TestL3PageTranslationUnderDcp(CustomTestCase):
+    """The L3 storage entry points, which used to be refused outright.
+
+    These three methods are where DCP does its damage, and the damage is
+    asymmetric: the LENGTHS were always right (page_size is physical), only the
+    OFFSETS were logical. That is exactly why a small smoke test passed while
+    the bytes went to the wrong rows -- tensor slicing clamps, so a wrong index
+    writes plausible-looking garbage and returns normally.
+    """
+
+    def test_data_page_offset_is_translated_to_a_physical_row(self):
+        pool = _make_host_pool(dcp_rank=3)
+        # Second widened page: logical WIDENED_PAGE -> physical PHYSICAL_PAGE.
+        page = pool.get_data_page(WIDENED_PAGE, flat=False)
+        expected = pool.kv_buffer[:, PHYSICAL_PAGE : 2 * PHYSICAL_PAGE, :, :]
+        self.assertEqual(page.shape, expected.shape)
+        self.assertEqual(page.data_ptr(), expected.data_ptr())
+
+    def test_page_length_stays_physical(self):
+        """The 8x bug: a page must be one RANK's shard, not the whole page."""
         pool = _make_host_pool(dcp_rank=0)
-        with self.assertRaises(AssertionError):
-            pool.get_data_page(0)
+        flat = pool.get_data_page(0)
+        self.assertEqual(
+            flat.numel(), pool.layer_num * PHYSICAL_PAGE * pool.kv_cache_dim
+        )
+        self.assertEqual(flat.numel(), pool.get_dummy_flat_data_page().numel())
+
+    def test_set_from_flat_data_page_round_trips_at_the_owned_row(self):
+        pool = _make_host_pool(dcp_rank=6)
+        pool.kv_buffer.zero_()
+        payload = torch.arange(
+            pool.layer_num * PHYSICAL_PAGE * pool.kv_cache_dim, dtype=pool.dtype
+        )
+        pool.set_from_flat_data_page(2 * WIDENED_PAGE, payload)
+        torch.testing.assert_close(pool.get_data_page(2 * WIDENED_PAGE), payload)
+        # and nothing outside that physical page moved
+        self.assertEqual(
+            int(pool.kv_buffer[:, : 2 * PHYSICAL_PAGE, :, :].abs().sum()), 0
+        )
+
+    def test_every_rank_reads_its_own_buffer_at_the_same_row(self):
+        """Disjointness is across buffers, not within one.
+
+        A widened page's slot s belongs to rank s % dcp_size, and each rank
+        stores it at the SAME physical row -- the shards are disjoint because
+        the buffers are per-rank, which is precisely why the storage KEYS have
+        to carry dcp_rank or all eight ranks overwrite one object.
+        """
+        rows = {r: _make_host_pool(dcp_rank=r) for r in range(DCP_SIZE)}
+        offsets = {
+            r: pool.get_data_page(3 * WIDENED_PAGE, flat=False).data_ptr()
+            - pool.kv_buffer.data_ptr()
+            for r, pool in rows.items()
+        }
+        self.assertEqual(len(set(offsets.values())), 1, offsets)
+
+    def test_unaligned_index_is_refused_rather_than_translated(self):
+        pool = _make_host_pool(dcp_rank=1)
+        with self.assertRaises(ValueError):
+            pool.get_data_page(WIDENED_PAGE + 1)
+        with self.assertRaises(ValueError):
+            pool.set_from_flat_data_page(1, pool.get_dummy_flat_data_page())
+
+    def test_without_dcp_offsets_are_untouched(self):
+        """dcp_size == 1 must be bit-for-bit the old behaviour."""
+        pool = MLATokenToKVPoolHost(
+            _fake_mla_device_pool(1024),
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=PHYSICAL_PAGE,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+        )
+        self.assertEqual(pool.dcp_size, 1)
+        for index in (0, 1, PHYSICAL_PAGE, PHYSICAL_PAGE + 7):
+            self.assertEqual(pool.dcp_page_row(index), index)
+        page = pool.get_data_page(PHYSICAL_PAGE, flat=False)
+        expected = pool.kv_buffer[:, PHYSICAL_PAGE : 2 * PHYSICAL_PAGE, :, :]
+        self.assertEqual(page.data_ptr(), expected.data_ptr())
 
 
 if __name__ == "__main__":
