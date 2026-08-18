@@ -67,6 +67,27 @@ class TestSwapSelection(CustomTestCase):
         self.assertEqual(len({s.promote for s in swaps}), len(swaps))
         self.assertEqual(len({s.demote for s in swaps}), len(swaps))
 
+    def test_ties_break_by_ascending_expert_id(self):
+        """Derived property: with every demand equal and every hit equal, the
+        pairing is decided purely by the tie-break, and it must be ascending
+        expert id on BOTH sides -- lowest-id cold expert to lowest-id resident.
+
+        This is not cosmetic. Every TP rank runs this selection independently
+        on its own copy of the counters and they must reach the same pairs, or
+        the ranks' placements diverge and each computes a different model,
+        silently. The python implementation got this from sort() being stable;
+        a whole-tensor rewrite gets it only from an explicitly stable argsort,
+        and nothing else in this file would notice if it were dropped."""
+        p = self._policy(max_swaps=4)
+        p.observe(_cum({}), _cum({}))
+        # all four cold experts equally in demand, all four residents equally
+        # unused: only the tie-break can order this.
+        p.observe(_cum({4: 10, 5: 10, 6: 10, 7: 10}), _cum({}))
+        swaps = p.select(self.MASK)
+        self.assertEqual(
+            [(s.promote, s.demote) for s in swaps], [(4, 0), (5, 1), (6, 2), (7, 3)]
+        )
+
     def test_min_demand_floor_rejects_noise(self):
         p = self._policy(min_demand=10.0)
         p.observe(_cum({}), _cum({}))
@@ -266,6 +287,38 @@ class TestTableUpdate(CustomTestCase):
             apply_swaps_to_tables(t, [ExpertSwap(6, 7, 1.0, 0.0)])
         with self.assertRaises(ValueError):  # promote an already-resident one
             apply_swaps_to_tables(t, [ExpertSwap(0, 1, 1.0, 0.0)])
+
+    def test_rejected_batch_leaves_every_table_untouched(self):
+        """A batch containing one illegal pair must apply NONE of it.
+
+        The per-swap loop this replaced raised on the offending pair with the
+        preceding pairs already written, leaving the four tables disagreeing
+        about experts that were never meant to move -- and a swap window that
+        dies with half-flipped tables is exactly the silently-wrong-weights
+        state the invariant check exists to catch. Red if validation moves back
+        inside the write loop."""
+        from sglang.srt.layers.moe.kt_expert_swap import (
+            ExpertSwap,
+            apply_swaps_to_tables,
+        )
+
+        t = _tables()
+        before = (
+            t.gpu_experts_mask.clone(),
+            t.logical_to_gpu_index.clone(),
+            t.gpu_index_to_logical.clone(),
+        )
+        with self.assertRaises(ValueError):
+            apply_swaps_to_tables(
+                t,
+                [
+                    ExpertSwap(6, 2, 100.0, 0.0),  # legal, and must NOT be applied
+                    ExpertSwap(7, 5, 100.0, 0.0),  # demotes a non-resident
+                ],
+            )
+        self.assertTrue(torch.equal(t.gpu_experts_mask, before[0]))
+        self.assertTrue(torch.equal(t.logical_to_gpu_index, before[1]))
+        self.assertTrue(torch.equal(t.gpu_index_to_logical, before[2]))
 
     def test_invariant_catches_desync(self):
         from sglang.srt.layers.moe.kt_expert_swap import assert_tables_consistent

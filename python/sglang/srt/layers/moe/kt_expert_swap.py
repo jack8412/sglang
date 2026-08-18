@@ -76,32 +76,56 @@ def apply_swaps_to_tables(tables: SwapTables, swaps: List[ExpertSwap]) -> List[i
     takes exactly the demoted expert's row, so no other expert's row moves and
     no other resident weight has to be touched.
     """
-    rows: List[int] = []
-    for s in swaps:
-        row = int(tables.logical_to_gpu_index[s.demote].item())
-        if row < 0:
-            raise ValueError(
-                f"demote target {s.demote} is not GPU-resident (row {row})"
-            )
-        if int(tables.logical_to_gpu_index[s.promote].item()) >= 0:
-            raise ValueError(f"promote target {s.promote} is already resident")
+    if not swaps:
+        return []
+    l2g = tables.logical_to_gpu_index
+    promote = torch.tensor([s.promote for s in swaps], dtype=torch.long)
+    demote = torch.tensor([s.demote for s in swaps], dtype=torch.long)
+    rows_t = l2g[demote].to(torch.long)
 
-        tables.gpu_experts_mask[s.promote] = True
-        tables.gpu_experts_mask[s.demote] = False
-        tables.logical_to_gpu_index[s.promote] = row
-        tables.logical_to_gpu_index[s.demote] = -1
-        tables.gpu_index_to_logical[row] = s.promote
-        if tables.logical_to_slot is not None:
-            # The pair EXCHANGE slots: the promoted expert takes the demoted
-            # one's resident slot (== its row) and the demoted expert takes
-            # the promoted one's cold slot, whose staging row the cold source
-            # will fill with the demoted expert's bytes on the next prefill.
-            # No other entry moves, mirroring the row assignment above.
-            p_slot = int(tables.logical_to_slot[s.promote].item())
-            d_slot = int(tables.logical_to_slot[s.demote].item())
-            tables.logical_to_slot[s.promote] = d_slot
-            tables.logical_to_slot[s.demote] = p_slot
-        rows.append(row)
+    # Validated for the WHOLE batch before anything is written. The per-swap
+    # loop this replaces raised on the first bad pair with the earlier pairs
+    # already applied, i.e. it could leave the tables half-flipped; there is no
+    # caller that wants that, and under fail-fast the process is going down
+    # anyway -- better it goes down with the tables still coherent.
+    bad = (rows_t < 0).nonzero().flatten()
+    if bad.numel():
+        s = swaps[int(bad[0].item())]
+        raise ValueError(
+            f"demote target {s.demote} is not GPU-resident "
+            f"(row {int(rows_t[int(bad[0].item())].item())})"
+        )
+    bad = (l2g[promote] >= 0).nonzero().flatten()
+    if bad.numel():
+        raise ValueError(
+            f"promote target {swaps[int(bad[0].item())].promote} is already "
+            f"resident"
+        )
+
+    # The promoted and demoted sets are disjoint (select pairs non-residents
+    # with residents) and each holds distinct ids, so no index below is written
+    # twice and batching cannot reorder one write against another. Every write
+    # is still in place -- these are index_put_ on the existing storage, not a
+    # rebind. See the note above about the graph and the C++ pointer.
+    tables.gpu_experts_mask[promote] = True
+    tables.gpu_experts_mask[demote] = False
+    l2g[promote] = rows_t.to(l2g.dtype)
+    l2g[demote] = -1
+    tables.gpu_index_to_logical[rows_t] = promote.to(
+        tables.gpu_index_to_logical.dtype
+    )
+    if tables.logical_to_slot is not None:
+        # The pair EXCHANGE slots: the promoted expert takes the demoted
+        # one's resident slot (== its row) and the demoted expert takes
+        # the promoted one's cold slot, whose staging row the cold source
+        # will fill with the demoted expert's bytes on the next prefill.
+        # No other entry moves, mirroring the row assignment above. Cloned
+        # because the two writes below alias the tensor they read.
+        p_slot = tables.logical_to_slot[promote].clone()
+        d_slot = tables.logical_to_slot[demote].clone()
+        tables.logical_to_slot[promote] = d_slot
+        tables.logical_to_slot[demote] = p_slot
+    rows: List[int] = rows_t.tolist()
 
     tables.gpu_experts_mask_cuda.copy_(tables.gpu_experts_mask, non_blocking=True)
     tables.logical_to_gpu_index_cuda.copy_(
@@ -240,6 +264,17 @@ class ExpertSwapPolicy:
         with the least-used resident one, then both are removed from
         consideration, so one evaluation never promotes or demotes the same
         expert twice.
+
+        Whole-tensor for the same reason assert_tables_consistent is. This runs
+        on all 92 layers of an acting window AND of every sampling boundary in
+        between -- five times per window at interval 50 -- and the python form
+        walked 896 experts twice and then called .item() once per candidate
+        inside two sort keys: ~3,000 scalar ops per layer, ~270,000 per window.
+        Inside the scheduler process, where kt's cpuinfer pool and the demotion
+        prefetch readers compete for the GIL, those cost about ten times what
+        they do standalone. Measured at 0.27 s per window, and unlike the rest
+        of the window it does not shrink as the policy converges: it costs the
+        same on a layer that ends up swapping nothing.
         """
         if self.max_swaps <= 0 or not self._observed:
             return []
@@ -252,33 +287,46 @@ class ExpertSwapPolicy:
         # A non-resident expert's demand is meaningful only if it cleared the
         # floor; a resident expert is a candidate victim regardless of hits
         # (zero hits is the strongest case for demoting it).
-        cand_promote = [
-            i
-            for i in range(self.num_experts)
-            if not mask[i] and self.demand_ema[i].item() >= self.min_demand
-        ]
-        cand_demote = [i for i in range(self.num_experts) if mask[i]]
-        if not cand_promote or not cand_demote:
+        cand_promote = (
+            (~mask) & (self.demand_ema >= self.min_demand)
+        ).nonzero().flatten()
+        cand_demote = mask.nonzero().flatten()
+        if cand_promote.numel() == 0 or cand_demote.numel() == 0:
             return []
 
-        cand_promote.sort(key=lambda i: -self.demand_ema[i].item())
-        cand_demote.sort(key=lambda i: self.hits_ema[i].item())
+        # Stable, and that is not a detail: python's sort is stable, so equal
+        # keys stayed in ascending expert id, and every rank must pick the SAME
+        # pairs or their placements diverge silently. argsort(stable=True) over
+        # an ascending candidate list reproduces exactly that.
+        cand_promote = cand_promote[
+            torch.argsort(-self.demand_ema[cand_promote], stable=True)
+        ]
+        cand_demote = cand_demote[
+            torch.argsort(self.hits_ema[cand_demote], stable=True)
+        ]
 
-        swaps: List[ExpertSwap] = []
-        for promote, demote in zip(cand_promote, cand_demote):
-            if len(swaps) >= self.max_swaps:
-                break
-            demand = self.demand_ema[promote].item()
-            hits = self.hits_ema[demote].item()
-            # Dead band: demand must beat the incumbent by the hysteresis
-            # factor. With hits == 0 any demand above the floor wins, which is
-            # the intended behaviour for an unused resident.
-            if demand <= hits * self.hysteresis:
-                break  # sorted, so no later pair can qualify either
-            swaps.append(
-                ExpertSwap(promote=promote, demote=demote, demand=demand, hits=hits)
+        n = min(self.max_swaps, cand_promote.numel(), cand_demote.numel())
+        promote = cand_promote[:n]
+        demote = cand_demote[:n]
+        demand = self.demand_ema[promote]
+        hits = self.hits_ema[demote]
+        # Dead band: demand must beat the incumbent by the hysteresis factor.
+        # With hits == 0 any demand above the floor wins, which is the intended
+        # behaviour for an unused resident. Both lists are sorted, so the first
+        # pair that fails ends the run: this takes a PREFIX, not a filter.
+        failed = (demand <= hits * self.hysteresis).nonzero().flatten()
+        if failed.numel():
+            n = int(failed[0].item())
+
+        return [
+            ExpertSwap(
+                promote=int(promote[i]),
+                demote=int(demote[i]),
+                demand=float(demand[i]),
+                hits=float(hits[i]),
             )
-        return swaps
+            for i in range(n)
+        ]
 
     def note_swapped(self, swaps: List[ExpertSwap]) -> None:
         """Reset EMAs for experts that just changed side.
@@ -460,9 +508,12 @@ def run_swap_window(
             continue
         try:
             _t = time.perf_counter()
-            rows = [
-                int(tables.logical_to_gpu_index[s.demote].item()) for s in swaps
-            ]
+            # One gather, not one index-plus-.item() per swap: every python
+            # statement in this loop is paid 92 times a window under GIL
+            # contention from kt's pool and the prefetch readers.
+            rows = tables.logical_to_gpu_index[
+                torch.tensor([s.demote for s in swaps], dtype=torch.long)
+            ].tolist()
             if phase_timer is not None:
                 phase_timer("rows_s", time.perf_counter() - _t)
             if begin_layer is not None:

@@ -7058,16 +7058,18 @@ def maybe_run_expert_swap_window(
                 # are in trtllm layout, and a raw store must not be given those.
                 staged = _unswizzle_demoted_rows(staged, dtypes)
             _t_store = time.perf_counter()
-            for i, it in enumerate(items):
-                store.write_row(
-                    layer_idx,
-                    it["slot"],
-                    {
-                        n: staged[n][i].view(dtypes[n])
-                        for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
-                    },
-                    logical_id=it["demoted_id"],
-                )
+            # One indexed write per weight name for the whole layer. staged[n]
+            # already carries this layer's rows stacked on dim 0 in items
+            # order, so there is nothing to reshape and nothing to loop.
+            store.write_rows(
+                layer_idx,
+                [it["slot"] for it in items],
+                {
+                    n: staged[n].view(dtypes[n])
+                    for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+                },
+                logical_ids=[it["demoted_id"] for it in items],
+            )
             _timing["flush_store_s"] += time.perf_counter() - _t_store
 
     def _move(layer, dst_row, logical_id, demoted_id):

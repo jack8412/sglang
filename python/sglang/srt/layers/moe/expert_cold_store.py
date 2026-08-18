@@ -153,30 +153,53 @@ class ColdExpertStore:
             n: self._rows[(layer_idx, n)][slot].clone() for n in self._shapes
         }
 
-    def write_row(
+    def write_rows(
         self,
         layer_idx: int,
-        slot: int,
+        slots: Sequence[int],
         values: Dict[str, torch.Tensor],
         *,
-        logical_id: int,
+        logical_ids: Sequence[int],
     ) -> None:
-        """Install ``values`` (GPU-layout bytes) at ``slot`` and rebind it."""
+        """Install one layer's demoted rows (GPU-layout bytes) and rebind them.
+
+        Batched over the layer's slots, not called per slot. A window demotes
+        up to 8 experts per layer and ~736 per window, and the per-slot form
+        spent eight python statements on each -- ~5,900 per window, measured at
+        0.24 s. Inside the scheduler process every one of those is paid at
+        roughly ten times its standalone cost, because kt's cpuinfer pool and
+        the demotion prefetch readers are competing for the GIL. Four indexed
+        writes per layer do the same work.
+
+        ``values[n]`` carries the layer's rows stacked on dim 0, in the same
+        order as ``slots``. The slots within one layer are distinct (they come
+        from distinct demoted experts), so no index is written twice.
+        """
+        if len(slots) == 0:
+            return
+        if len(logical_ids) != len(slots):
+            raise ValueError(
+                f"cold-store write at layer {layer_idx}: {len(slots)} slots but "
+                f"{len(logical_ids)} logical ids"
+            )
+        idx = torch.as_tensor(list(slots), dtype=torch.long)
         for n in self._shapes:
             src = values[n]
-            dst = self._rows[(layer_idx, n)][slot]
-            if src.shape != dst.shape or src.dtype != dst.dtype:
+            dst = self._rows[(layer_idx, n)]
+            want = (len(slots),) + tuple(dst.shape[1:])
+            if tuple(src.shape) != want or src.dtype != dst.dtype:
                 raise ValueError(
-                    f"cold-store row mismatch at layer {layer_idx} slot {slot} "
-                    f"{n}: got {tuple(src.shape)}/{src.dtype}, "
-                    f"expected {tuple(dst.shape)}/{dst.dtype}"
+                    f"cold-store row mismatch at layer {layer_idx} slots "
+                    f"{list(slots)} {n}: got {tuple(src.shape)}/{src.dtype}, "
+                    f"expected {want}/{dst.dtype}"
                 )
-            dst.copy_(src.to("cpu", non_blocking=False))
-        old = self._slot_to_logical[layer_idx][slot]
-        if old != logical_id:
-            self._logical_to_slot[layer_idx].pop(old, None)
-            self._slot_to_logical[layer_idx][slot] = logical_id
-            self._logical_to_slot[layer_idx][logical_id] = slot
+            dst[idx] = src.to("cpu", non_blocking=False)
+        for slot, logical_id in zip(slots, logical_ids):
+            old = self._slot_to_logical[layer_idx][slot]
+            if old != logical_id:
+                self._logical_to_slot[layer_idx].pop(old, None)
+                self._slot_to_logical[layer_idx][slot] = logical_id
+                self._logical_to_slot[layer_idx][logical_id] = slot
         # Any demotion makes the store diverge from the checkpoint.
         self.dirty = True
 
