@@ -884,6 +884,42 @@ class DirectDmaSource:
 # -- construction ------------------------------------------------------------
 
 
+def host_mem_ledger(tag: str) -> str:
+    """One line of host memory accounting, for attributing a boot's growth.
+
+    Written because two boots on a 2,267 GB host were lost to host memory and
+    neither could be attributed afterwards: the process is dead by the time the
+    number is noticed, and an external sampler can only say WHEN memory
+    appeared, not WHICH allocation made it. Called at the boot milestones, this
+    says both.
+
+    Shmem is the field that matters and the one that is easy to miss. kt's
+    BufferB arena is memfd-backed and CUDA pinned host memory is MAP_SHARED, so
+    BOTH of this config's large host allocations land in Shmem and NEITHER
+    shows up in AnonPages -- a budget checked against AnonPages reads as ~100 GB
+    while the real figure is over a terabyte.
+    """
+    try:
+        vals = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, rest = line.partition(":")
+                if k in ("Shmem", "AnonPages", "MemAvailable", "Cached"):
+                    vals[k] = int(rest.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        return f"[host-mem] {tag}: unavailable"
+    head = cgroup_headroom_bytes()
+    msg = (
+        f"[host-mem] {tag}: shmem {vals.get('Shmem', 0) / 1e9:.0f} GB, "
+        f"anon {vals.get('AnonPages', 0) / 1e9:.0f} GB, "
+        f"cache {vals.get('Cached', 0) / 1e9:.0f} GB, "
+        f"avail {vals.get('MemAvailable', 0) / 1e9:.0f} GB"
+    )
+    if head is not None:
+        msg += f", cgroup headroom {head / 1e9:.0f} GB"
+    return msg
+
+
 def cgroup_headroom_bytes() -> Optional[int]:
     """memory.max - memory.current for this container, or None.
 

@@ -8391,6 +8391,7 @@ def finalize_split_prefill(server_args) -> bool:
             # remaining allocations from arriving as one 409 GiB burst.
             from sglang.srt.layers.moe.kt_direct_dma import (
                 cgroup_headroom_bytes,
+                host_mem_ledger,
                 reclaim_checkpoint_cache,
             )
 
@@ -8404,6 +8405,7 @@ def finalize_split_prefill(server_args) -> bool:
                     "[cold-store] cgroup headroom before allocation: %.0f GB",
                     head / 1e9,
                 )
+            logger.info("%s", host_mem_ledger("before cold-store build"))
             time.sleep(3.0 * get_parallel().tp_rank)
             # Swapping used to be refused here: the swap path reads and writes
             # these same rows, and against a raw store that mixed layouts
@@ -8426,6 +8428,7 @@ def finalize_split_prefill(server_args) -> bool:
                 raw_layout=dynamic,
             )
             source = store
+            logger.info("%s", host_mem_ledger("after cold-store build"))
         pipeline = ColdExpertPipeline(
             store=source,
             device=device,
@@ -8434,6 +8437,11 @@ def finalize_split_prefill(server_args) -> bool:
             swizzle_plan=swizzle_plan,
             raw_shapes=raw_shapes,
         )
+        from sglang.srt.layers.moe.kt_direct_dma import (
+            host_mem_ledger as _host_mem_ledger,
+        )
+
+        logger.info("%s", _host_mem_ledger("after cold-pipeline ctor"))
     except Exception:
         logger.exception(
             "[split-prefill] build failed; falling back to the margin-routed "
