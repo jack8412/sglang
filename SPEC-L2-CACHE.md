@@ -17,16 +17,38 @@ we can replay from host RAM instead of recomputing is worth ~3 minutes.
 sglang's HiCache already implements exactly this, including the hybrid case:
 
 * `--enable-hierarchical-cache` builds a `HostPoolGroup` carrying **both**
-  `PoolName.KV` and `PoolName.MAMBA`. For a hybrid model the radix cache
-  becomes `HiMambaRadixCache`, which offloads the KDA recurrent state
-  alongside the MLA KV pages. One flag covers both halves of K3.
-* **DCP is supported for L1/L2.** `_resolve_hicache_dcp_compatibility` blocks
-  only the L3 storage backend under `--dcp-size > 1`; the device<->host path is
-  DCP-aware (`dcp_size`/`dcp_rank` reach the host pool, which divides the
-  widened page back down).
-* Our `page_size=64` (MEASURED) satisfies the host pool's
-  `page_size % dcp_size == 0` assert (64 % 8 == 0).
+  `PoolName.KV` and `PoolName.MAMBA`, so one flag offloads the KDA recurrent
+  state alongside the MLA KV pages.
+  NOT via `HiMambaRadixCache` -- that class is **dead code**, constructed
+  nowhere in `python/` (`registry.py:114-115` short-circuits every
+  `is_hybrid_ssm` model to `_create_unified_radix_cache` before the
+  hierarchical branch). The live path is `UnifiedRadixCache` +
+  `ComponentType.MAMBA` (`registry.py:175-176,188-192`) -> `init_hicache`
+  (`unified_radix_cache.py:321-357`) -> `_MambaStrategy`
+  (`hybrid_pool_assembler.py:1191-1245`) -> `build_hybrid_mamba_stack`
+  (`:612-700`), which builds the group at `:663-684`. Grep the log and write
+  any assertion against THAT, never against `HiMambaRadixCache`.
+* **DCP is supported for L1/L2**, and the device<->host path is DCP-aware
+  (`dcp_size`/`dcp_rank` reach the host pool, which divides the widened page
+  back down; `logical_size = size * dcp_size`).
+  But `_resolve_hicache_dcp_compatibility` (`server_args.py:7517-7550`) refuses
+  **five** things under `--dcp-size > 1`, not just L3:
+  L3 storage backend (`:7520`), **speculative decoding** (`:7528`),
+  `--enable-lmcache` (`:7534`), `--enable-hisparse` (`:7539`), and non-MLA
+  (`:7544`). A separate refusal also exists for PD-decode + DCP + hicache
+  (`arg_groups/pd_disaggregation_hook.py:49-52`).
+* Our `page_size=64` is correct even though no k3ops file sets it: K3+DCP forces
+  `tokenspeed_mla`, and `_mla_backend_page_constraints` snaps page_size to 64
+  (`arg_groups/overrides.py:2087-2115`, running before `_page_size_default`).
+  The host pool's `page_size % dcp_size == 0` assert fires on the ALREADY
+  WIDENED page (512 % 8, via `kv_cache_configurator.py:1564-1566`), so it is
+  satisfied by construction for any page size -- it can only trip if a caller
+  forgets to widen.
 * K3 is MLA, satisfying "HiCache + DCP is only wired for the MLA host pool".
+* Keep `--hicache-mem-layout` at the default `page_first`: `MambaPoolHost`
+  asserts `page_first`/`page_first_direct` only (`memory_pool_host.py:80-83`),
+  and `--hicache-io-backend direct` would silently rewrite the layout
+  (`server_args.py:7566-7573`).
 
 So the first milestone is a boot with one extra flag, not a patch.
 
@@ -47,7 +69,7 @@ allocates its own pool. It overrides `--hicache-ratio` entirely.
 | 100 | 800 GB | 6.33M | 50.6M | 10.5x | 48 | 419 |
 | 128 | 1,024 GB | 8.10M | 64.8M | 13.5x | 62 | 537 |
 
-Recommend **64 GB/rank (512 GB total)**: it is 6.7x the device pool, and leaves
+Recommend **64 GB/rank (512 GB = 477 GiB total; the flag is DECIMAL GB)**: it is 6.7x the device pool, and leaves
 ~400 GB of the ~900 GB headroom unspent against the cgroup cap.
 
 ## What this does and does not buy
@@ -77,28 +99,42 @@ one. **Gate S4 below is the test that this actually holds on K3.**
 
 ## Blockers and traps, in the order they will bite
 
-1. **HiCache + DCP + speculative decoding raises NotImplementedError**
-   ("the draft-model host pool has no DCP index translation"). L2 and DSpark are
-   **mutually exclusive today**. DSpark is a separate target, but any plan that
-   wants both needs that translation written first.
-2. **The host-memory guard is per process.** Each rank checks
-   `psutil.virtual_memory().available - 10 GiB` on its own; all 8 see the same
-   free memory, all 8 pass, and 8 pools get allocated. The guard cannot see the
-   other seven. Size deliberately with `--hicache-size` and do the x8 by hand --
-   this is the same shape as the over-allocation that OOM-killed ai.v8.pro.
+1. **HiCache + speculative decoding is refused UNDER DCP** ("the draft-model
+   host pool has no DCP index translation", `server_args.py:7528-7533`). So L2
+   and DSpark are mutually exclusive **in our 1M config**, not in general: at
+   `--dcp-size 1` the two are wired together on purpose
+   (`speculative/base_spec_worker.py:234-266` builds a PACKED/SIDECAR draft plan
+   when hierarchical cache is on). Any plan wanting both AT 1M needs that
+   translation written first.
+2. **The host-memory guard cannot save you.** Each rank checks
+   `psutil.virtual_memory().available - 10 GiB` on its own, once per pool
+   (`pool_host/base.py:140-151`, `memory_pool_host.py:123-131`), with no
+   barrier -- all 8 see the same free memory, all 8 pass, 8 pools get allocated.
+   Worse, psutil reads `/proc/meminfo`, so it is blind to the **1,916 GiB cgroup
+   cap** that is the real limit here. Size deliberately and do the x8 by hand --
+   this is the shape of the over-allocation that OOM-killed ai.v8.pro.
 3. **`--hicache-storage-backend` must stay unset** (L3 is refused under DCP 8).
-4. **Pinning cost at boot is UNMEASURED.** The pool is `pin_memory=True`, i.e.
-   `cudaHostRegister` over 56 GB/rank at N=64. Boot is already 16.9 min. S1
-   measures this before we scale N.
+4. **Pinning cost at boot is UNMEASURED.** Both pools are pinned via
+   `cudaHostRegister` (`pool_host/mla.py:62`, `memory_pool_host.py:72`,
+   `pool_host/common.py:120-130`), so at N=64 that is the full **64 GB/rank**
+   (56 KV + 8 mamba), not 56. Boot is already 17.5 min.
+   The allocation is `mmap(MAP_SHARED|MAP_ANONYMOUS|MAP_POPULATE)` +
+   `MADV_POPULATE_WRITE` (`storage/mmap/mmap_allocator.py:120-131`), so it lands
+   in **Shmem** -- the same `free -g` bucket as the 410 GB kt arena -- and is
+   fully resident the moment it is allocated. Watch `shared`, not `used`.
 5. **Page-cache eviction.** A pinned pool displaces the checkpoint page cache.
    Harmless *now* only because the swap path no longer reads the checkpoint
    (rank-write demotion + arena promotion). Do not reintroduce a disk read.
 
 Checked and clear: `--enable-int8-mamba-checkpoint` conflicts with hierarchical
 cache (we do not use it); `--disable-radix-cache` conflicts (we do not use it);
-and the L1/L2 path spawns **no new Python threads** in the scheduler process --
-only the L3 backends (mooncake/umbp/nixl) do. So the GIL tax that made
-`assert_tables_consistent` cost 1.80 s does not apply here.
+and the L1/L2 path spawns **no new Python threads** in the scheduler process:
+`HybridCacheController` starts none, and transfers ride CUDA streams
+(`managers/cache_controller.py:305-306,696,806`). The threads belong to
+`HiCacheController` and start for **any** `--hicache-storage-backend` value
+(`cache_controller.py:367-389`, started at `:516`) -- not, as first written,
+only for mooncake/umbp/nixl. With the backend unset none start, so the GIL tax
+that made `assert_tables_consistent` cost 1.80 s does not apply.
 
 ## One boot, four gates
 
