@@ -8172,6 +8172,18 @@ def finalize_split_prefill(server_args) -> bool:
     """
     if not _KT_SPLIT_PREFILL_LAYERS:
         return False
+    if _KT_SPLIT_PREFILL_STATE["pipeline"] is not None:
+        # Already armed. Defence in depth behind the draft-worker gate in
+        # ModelRunner: a second call here does not re-arm anything, it builds a
+        # WHOLE SECOND cold store (51.1 GiB per rank, 439 GB across TP8) whose
+        # only visible symptom is host memory, because the layer list and the
+        # arming consensus both look exactly the same the second time.
+        logger.info(
+            "[split-prefill] already armed on %d layers; ignoring a second "
+            "finalize rather than rebuilding the store",
+            len(_KT_SPLIT_PREFILL_LAYERS),
+        )
+        return True
 
     from sglang.srt.layers.moe.expert_cold_store import (
         WEIGHT_NAMES,

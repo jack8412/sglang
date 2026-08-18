@@ -759,6 +759,16 @@ class ModelRunner:
             self.apply_torch_tp()
 
     def maybe_init_split_prefill(self):
+        # NOT on the draft runner. The gate below is a process-global snapshot,
+        # so it reads True in the draft worker too -- and the draft shares this
+        # process with the target, whose split-prefill layers are still
+        # registered (reset_split_prefill has no callers). finalize would
+        # therefore build a SECOND cold-expert store for the target's layers:
+        # another 51.1 GiB per rank, 439 GB across TP8, on top of the first,
+        # which is still referenced. That is what took a 996 GB boot to 1.4 TB
+        # and got rank 0 OOM-killed once speculative decoding was enabled.
+        if self.is_draft_worker:
+            return
         if not get_exec().moe.kt_expert_split_prefill:
             return
         from sglang.srt.layers.moe.kt_ep_wrapper import finalize_split_prefill
