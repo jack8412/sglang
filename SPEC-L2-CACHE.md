@@ -1,6 +1,7 @@
 # SPEC: host-RAM L2 cache for KV **and** mamba state
 
-Status: PLAN. Nothing built yet. Every number below is either measured on this
+Status: MEASURED 2026-08-18 on gpusrv (V14, sglang e8132a02a0). The sizing
+below is no longer a prediction -- see "Measured" at the end. Every number below is either measured on this
 node (marked MEASURED) or derived from those measurements (marked DERIVED).
 
 ## The opportunity
@@ -175,3 +176,47 @@ would remain, and because the pool is **pinned** it is unreclaimable -- an
 overshoot is an OOM kill costing a 17.5-minute boot, not a slowdown. 64 is the
 largest round figure that keeps a real margin, and it is already 6.7x the
 device pool.
+
+
+## Measured (V14, `--enable-hierarchical-cache --hicache-size 25`)
+
+The boot was clean: `HiCache + DCP enabled (L1/L2 only) ... dcp_size=8`, and the
+cache path taken was `UnifiedRadixCache` -- confirming the correction above that
+`HiMambaRadixCache` is never constructed.
+
+| | predicted | actual |
+|---|---|---|
+| KV host pool, per rank | 1,582,392 tok / 21.875 GB | **1,582,208 tok / 21.87 GB** |
+| mamba host pool, per rank | 3.125 GB | **3.14 GB** |
+| host total | 200 GB decimal = 186 GiB | `shared` 0 -> **596 GiB** = 410 (kt arena) + **186** |
+
+0.01% off on the KV pool. `--hicache-size 25` is per rank, so 8 x 25 = the 200 GB
+asked for; passing 200 would have requested 1,600 GB.
+
+**It costs prefill and decode nothing measurable.** Against V12 (same config, no
+L2): prefill 2,561 / 5,013 / 8,113 / 7,522 tok/s vs 2,662 / 5,025 / 7,744 /
+7,480; decode best 58.6 / median 54.8 vs 60.1 / 56.3. Within noise both ways.
+`write_through` pushes ~1.6 GB/rank D2H per 1M prefill against a 171.6 s prefill,
+and it runs opposite the cold-expert H2D stream on a full-duplex link.
+
+Still UNPROVEN, and the reason the G3/G4 gates exist: that a prefix actually
+comes BACK from L2, and that the KDA state comes back with the KV. Forcing that
+needs the prefix evicted from the device pool, i.e. pushing more than 4.82M
+tokens of distinct prefixes through -- about 16 minutes of node time.
+
+## Not available on this node: huge pages for the kt arena
+
+Checked 2026-08-18, because the 173-183 s of `cudaHostRegister` at every boot is
+13.4M 4 KiB pages per rank and 2 MiB pages would cut that by 512x:
+
+    thp enabled:    [always] madvise never      AnonHugePages:  9.9 GiB
+    shmem_enabled:  always within_size advise [never] deny force
+    ShmemHugePages: 0 kB
+
+kt's arena is a **memfd**, i.e. shmem, and shmem THP is `never` here. kt already
+calls `madvise(MADV_HUGEPAGE)` on it and that call is inert -- as its own comment
+predicts. Reordering it before `MAP_POPULATE` (it currently runs after, so every
+page is already faulted at 4 KiB) would still buy nothing while shmem_enabled
+says never. The routes out are a host-wide sysfs change, which affects other
+tenants on a rented box, or `MFD_HUGETLB` against a reserved hugetlb pool, which
+needs root. Neither is ours to take here.
