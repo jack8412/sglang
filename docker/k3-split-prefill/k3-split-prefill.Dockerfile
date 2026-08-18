@@ -200,12 +200,15 @@ ARG BUILD_JOBS=
 # UV_LINK_MODE=copy: the uv cache lives on a BuildKit cache mount, i.e. a
 # different filesystem from the image layer, so uv cannot hardlink into the
 # venv and warns on every install. Copying is what it falls back to anyway.
+# UV_HTTP_TIMEOUT=600: the sglang wheel index (docs.sglang.ai -> .io) has
+# stalled mid-build twice; the default timeout gives up too eagerly.
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     WS=/workspace \
     VENV=/workspace/venv-k3 \
     PATH="/usr/local/cuda/bin:${PATH}" \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_HTTP_TIMEOUT=600
 
 # --- 0. system packages -----------------------------------------------------
 # No-op on the default base, which already has all of these. numactl and
@@ -274,8 +277,19 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv venv ${VENV} --python 3.12 --seed \
     && . ${VENV}/bin/activate \
     && [ "$(command -v pip)" = "${VENV}/bin/pip" ] || { echo "FATAL: pip outside venv"; exit 9; } \
-    && uv pip install --prerelease=allow --index-strategy unsafe-best-match \
-         --extra-index-url https://docs.sglang.ai/whl/cu130/ -e ${WS}/sglang/python/ \
+    # RETRY: docs.sglang.ai (301 -> docs.sglang.io) flakes. uv's own 3 retries
+    # give up after ~125 s and fail the whole build, having already resolved 206
+    # packages -- observed twice, on different packages ('datasets', 'timm'), so
+    # it is the index, not one bad wheel. Retry the install itself; the uv cache
+    # mount makes each attempt cheap because only the missing packages refetch.
+    && for attempt in 1 2 3 4 5; do \
+         uv pip install --prerelease=allow --index-strategy unsafe-best-match \
+           --extra-index-url https://docs.sglang.ai/whl/cu130/ -e ${WS}/sglang/python/ \
+         && break; \
+         echo "uv pip install attempt $attempt failed; retrying in 20s"; \
+         [ "$attempt" = "5" ] && { echo "FATAL: sglang install failed after 5 attempts" >&2; exit 6; }; \
+         sleep 20; \
+       done \
     && python -c "import torch; assert torch.__version__.startswith('${TORCH_PIN}'), torch.__version__; print('STEP1 torch', torch.__version__, torch.version.cuda)"
 
 # --- 3. flashinfer cubin + jit cache ---------------------------------------
