@@ -374,28 +374,6 @@ class ArenaDmaColdSource:
                 bases.append(vals[0])
             self._plan[int(layer_idx)] = (int(stride), bases)
 
-        # The six kinds are six ranges inside one per-expert record. Their
-        # widths never vary by layer, so derive them once here and reuse them
-        # for both the pitched path and the packed one.
-        self._widths = [
-            g.gu_w,                 # gate weight
-            g.gu_w,                 # up weight
-            g.hidden * g.w2_width,  # down weight
-            g.gu_s,                 # gate scale
-            g.gu_s,                 # up scale
-            g.hidden * g.w2s_width,  # down scale
-        ]
-        # Bytes one layer's whole cold set spans, measured from the lowest base
-        # to the far end of the last expert's last kind. Sized this way rather
-        # than as n*stride so the read cannot run off the end of the arena when
-        # the final record carries no trailing padding.
-        self.staging_nbytes = max(
-            (self.num_cold - 1) * stride
-            + max(b + w for b, w in zip(bases, self._widths))
-            - min(bases)
-            for stride, bases in self._plan.values()
-        )
-
     # -- ColdExpertStore-compatible lifecycle -----------------------------
     def after_enqueue(self, layer_idx: int, stream) -> None:
         return
@@ -415,24 +393,8 @@ class ArenaDmaColdSource:
         """
         return None
 
-    def issue_layer_copies(self, layer_idx: int, raw, stream, staging=None) -> None:
-        """Land one layer's whole cold set in ``raw``.
-
-        With ``staging`` this is ONE contiguous H2D followed by a device-side
-        unpack; without it, six pitched copies straight into ``raw``.
-
-        Why the extra hop is faster, measured on this node: a contiguous H2D out
-        of registered host memory runs at 55.6 GB/s, while the pitched form of
-        the same bytes manages 24.9 GB/s -- the descriptor-per-row work, not
-        PCIe, is the limit. The unpack that buys that back is device-to-device
-        over ~1.1 GB at HBM bandwidth, i.e. tenths of a millisecond against the
-        ~14 ms of link time saved per layer. Prefill is copy-bound (the compute
-        stream sits blocked for 88-94% of the window it can see), so this lands
-        almost 1:1 on prefill throughput.
-        """
-        if staging is not None:
-            self._issue_packed(layer_idx, raw, stream, staging)
-            return
+    def issue_layer_copies(self, layer_idx: int, raw, stream) -> None:
+        """Gather one layer's whole cold set into ``raw``, six pitched copies."""
         g = self._g
         stride, bases = self._plan[int(layer_idx)]
         base = self._dma._base[int(layer_idx)]
@@ -455,48 +417,6 @@ class ArenaDmaColdSource:
                         base + bases[2], stride, g.hidden * g.w2_width, n, stream)
         cp.memcpy2d_h2d(w2_s.data_ptr(), g.hidden * g.w2s_width,
                         base + bases[5], stride, g.hidden * g.w2s_width, n, stream)
-
-    def _issue_packed(self, layer_idx: int, raw, stream, staging) -> None:
-        """One contiguous H2D of the layer's cold run, then unpack on device."""
-        g = self._g
-        stride, bases = self._plan[int(layer_idx)]
-        base = self._dma._base[int(layer_idx)]
-        n = self.num_cold
-        lo = min(bases)
-        span = (
-            (n - 1) * stride + max(b + w for b, w in zip(bases, self._widths)) - lo
-        )
-        names = list(raw.keys())
-        w13, w13_s, w2, w2_s = (raw[k] for k in names[:4])
-
-        # 1. the link leg: one descriptor for the whole run.
-        self._dma._copy.memcpy_h2d(staging.data_ptr(), base + lo, span, stream)
-
-        # 2. the HBM leg: scatter the records into the layout the swizzle reads.
-        #    as_strided (not view) because the run is addressed in records, and
-        #    the tail record may be shorter than a full stride.
-        #
-        #    Everything here is in BYTES, via a uint8 view of each destination.
-        #    The widths and bases come from kt's arena and are byte counts, and
-        #    the pitched path they replace addressed these same buffers as raw
-        #    bytes (`w13.data_ptr() + g.gu_w`). Indexing them as ELEMENTS would
-        #    agree only while every raw dtype happens to be one byte wide, and
-        #    would silently halve the copy the day one is not.
-        def _bytes(t):
-            return t.view(torch.uint8).reshape(n, -1)
-
-        with torch.cuda.stream(stream):
-            for dst, kind in (
-                (_bytes(w13)[:, : g.gu_w], 0),
-                (_bytes(w13)[:, g.gu_w :], 1),
-                (_bytes(w2), 2),
-                (_bytes(w13_s)[:, : g.gu_s], 3),
-                (_bytes(w13_s)[:, g.gu_s :], 4),
-                (_bytes(w2_s), 5),
-            ):
-                width = self._widths[kind]
-                src = staging.as_strided((n, width), (stride, 1), bases[kind] - lo)
-                dst.copy_(src, non_blocking=True)
 
 
 class RankShardWriter:

@@ -714,10 +714,6 @@ class DirectDmaSource:
     immutable and the only mutable input is logical_to_slot, folded in via
     ``invalidate_plans`` after each swap window.
     """
-    # Bytes of contiguous staging this source wants the pipeline to hand it.
-    # 0 means "issue your own copies"; a source that can land its layer in one
-    # contiguous H2D sets it and gets a scratch buffer per slot.
-    staging_nbytes: int = 0
 
     def __init__(
         self,
@@ -814,18 +810,12 @@ class DirectDmaSource:
         layer_idx: int,
         raw: Dict[str, torch.Tensor],
         stream: torch.cuda.Stream,
-        staging: Optional[torch.Tensor] = None,
     ) -> None:
         """Enqueue the whole layer's H2D on ``stream``; then compact scales.
 
         Caller (the pipeline) is inside ``torch.cuda.stream(stream)`` with
         the slot's WAR event already waited, exactly like the ring path.
-
-        ``staging`` is always None here: this source declares
-        ``staging_nbytes = 0``, so the pipeline allocates nothing for it. The
-        parameter exists so both sources share one call signature.
         """
-        assert staging is None, "DirectDmaSource declares staging_nbytes = 0"
         plan = self._plan(layer_idx)
         s = stream.cuda_stream
         t0 = time.perf_counter()

@@ -63,10 +63,6 @@ class ArenaColdSource:
     snapshots it at issue time, and passes never straddle a window (the
     window quiesces between batches), so a pass is internally consistent.
     """
-    # Bytes of contiguous staging this source wants the pipeline to hand it.
-    # 0 means "issue your own copies"; a source that can land its layer in one
-    # contiguous H2D sets it and gets a scratch buffer per slot.
-    staging_nbytes: int = 0
 
     NUM_STAGE = 3
     # NOT more workers = faster: the per-expert slicing holds the GIL and the
@@ -432,24 +428,6 @@ class ColdExpertPipeline:
             if swizzle_plan is not None and raw_shapes is not None
             else None
         )
-        # Contiguous landing ground, when the source asks for one. Per slot, for
-        # the same reason the raw buffers are: layer n+1's H2D is in flight while
-        # layer n is still being unpacked and read.
-        self._staging: Optional[List[torch.Tensor]] = (
-            [
-                torch.empty(store.staging_nbytes, dtype=torch.uint8, device=device)
-                for _ in range(self.NUM_SLOTS)
-            ]
-            if store.staging_nbytes and self._raw_buffers is not None
-            else None
-        )
-        if self._staging is not None:
-            logger.info(
-                "[cold-pipeline] contiguous staging: %d slots x %.0f MiB device "
-                "-- one H2D per layer instead of six pitched copies",
-                self.NUM_SLOTS,
-                store.staging_nbytes / (1 << 20),
-            )
 
         # Which layer currently occupies each slot (None = never filled).
         self._slot_layer: List[Optional[int]] = [None] * self.NUM_SLOTS
@@ -553,12 +531,7 @@ class ColdExpertPipeline:
             # meaning is unchanged. Duck-typed rather than isinstance so both
             # the direct-DMA transport and the arena cold source qualify
             # without this file importing either.
-            self._store.issue_layer_copies(
-                layer_idx,
-                raw,
-                self._copy_stream,
-                staging=None if self._staging is None else self._staging[slot],
-            )
+            self._store.issue_layer_copies(layer_idx, raw, self._copy_stream)
         else:
             for name in WEIGHT_NAMES:
                 raw[name].copy_(
