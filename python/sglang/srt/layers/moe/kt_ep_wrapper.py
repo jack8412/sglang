@@ -7171,10 +7171,26 @@ def maybe_run_expert_swap_window(
             _dev = getattr(
                 layer, _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]
             ).data.device
-            _staged_row = {
-                n: torch.empty(tuple(_raw[n][0]), dtype=_raw[n][1], device=_dev)
-                for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
-            }
+            # REUSED LANDING BUFFERS, one set per position in the layer's swap
+            # budget. Allocating four fresh device tensors per expert cost
+            # 6.4 ms each -- 2,944 allocations per window against a caching
+            # allocator that is nearly full at mem-fraction 0.89, so the misses
+            # force a free/synchronize. That was 4.72 s of a 5.14 s window,
+            # while the copies themselves are 0.075 ms of it. The buffers are
+            # identical in shape for every expert, so one set per slot serves
+            # the whole run.
+            _pool = _pending.setdefault("dma_bufs", [])
+            _k = len(_pending["items"])
+            while len(_pool) <= _k:
+                _pool.append(
+                    {
+                        n: torch.empty(
+                            tuple(_raw[n][0]), dtype=_raw[n][1], device=_dev
+                        )
+                        for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+                    }
+                )
+            _staged_row = _pool[_k]
             _rw._dma.read(
                 layer_idx=layer_idx,
                 row=_row,
