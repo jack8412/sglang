@@ -7514,9 +7514,28 @@ class ServerArgs:
         # Step 3: DCP compatibility for the L2 (device<->host) path.
         self._resolve_hicache_dcp_compatibility()
 
+    # L3 backends whose storage keys are dcp_rank-scoped. Under DCP each rank
+    # holds a disjoint shard of every page, so a backend that does not put the
+    # rank in its key has all ranks overwriting one object with different bytes
+    # -- at the right length, so the reader gets whichever wrote last and
+    # nothing errors. Only add a backend here once its key carries dcp_rank.
+    _DCP_AWARE_STORAGE_BACKENDS = frozenset({"file"})
+
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
             return
+        if (
+            self.hicache_storage_backend is not None
+            and self.hicache_storage_backend
+            not in self._DCP_AWARE_STORAGE_BACKENDS
+        ):
+            raise NotImplementedError(
+                f"--hicache-storage-backend {self.hicache_storage_backend!r} "
+                f"with --dcp-size > 1 is not supported: its storage keys are "
+                f"not dcp_rank-scoped, so all ranks would collide on one object "
+                f"per page. Supported under DCP: "
+                f"{sorted(self._DCP_AWARE_STORAGE_BACKENDS)}."
+            )
         if self.speculative_algorithm is not None:
             raise NotImplementedError(
                 "HiCache with --dcp-size > 1 does not support speculative "

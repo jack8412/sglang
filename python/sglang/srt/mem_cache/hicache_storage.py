@@ -729,7 +729,14 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         try:
+            # Only this rank's own objects. The directory is shared, and under
+            # DCP every rank writes into it -- a rank that unlinked everything
+            # would silently destroy seven peers' shards, with no barrier to
+            # order it against their in-flight writes. The suffix is exactly
+            # the identity that makes a file this rank's, so filter on it.
             for filename in os.listdir(self.file_path):
+                if self.config_suffix and self.config_suffix not in filename:
+                    continue
                 file_path = os.path.join(self.file_path, filename)
                 if os.path.isfile(file_path):
                     os.remove(file_path)
