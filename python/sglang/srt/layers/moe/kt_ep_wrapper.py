@@ -8444,11 +8444,29 @@ def finalize_split_prefill(server_args) -> bool:
             )
         elif not use_export and not use_direct:
             dynamic = envs.SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE.get()
+            # DIRECT DMA NEEDS THE PLAN EVEN WHEN THE STORE IS PRE-SWIZZLED.
+            # A pinned store holds resident-layout bytes, so neither the plan
+            # nor the raw shapes are built for it -- but DMA promotion reads
+            # kt's ARENA, which is checkpoint layout, and cannot turn those
+            # into a resident row without both. Building the plan is
+            # independent of how the store is laid out, so this asks for it
+            # WITHOUT setting `dynamic`, which would also flip the store to raw
+            # and change split prefill's path as a side effect. (V9 died here:
+            # promotion indexed raw_shapes and got None.)
+            _need_plan = dynamic or envs.SGLANG_KT_DEMOTION_DIRECT_DMA.get()
             raw_shapes, swizzle_plan = (
                 _build_dynamic_swizzle_plan(anchor, device)
-                if dynamic
+                if _need_plan
                 else (None, None)
             )
+            if envs.SGLANG_KT_DEMOTION_DIRECT_DMA.get() and swizzle_plan is None:
+                # No fallback: the operator asked for DMA promotion and the
+                # layout transform it depends on is unavailable.
+                raise RuntimeError(
+                    "direct DMA promotion needs the swizzle plan and it could "
+                    "not be built; the arena holds checkpoint layout and there "
+                    "is no way to write a resident row without it"
+                )
             # The plan builder falls back rather than guessing, so honour that
             # here too: without it, `dynamic` would size the store by a None
             # shape map.
