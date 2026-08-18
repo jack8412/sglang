@@ -349,6 +349,44 @@ class TestTableUpdate(CustomTestCase):
             assert_tables_consistent(t, 4)
 
 
+class TestTablesOnCuda(CustomTestCase):
+    """Bug regression: the membership tables are not guaranteed to be CPU.
+
+    SwapTables documents them as CPU and every test here built them that way,
+    so a whole-tensor rewrite of assert_tables_consistent shipped with
+    torch.arange() on the default device and killed a live server:
+
+        RuntimeError: Expected all tensors to be on the same device, but got
+        other is on cpu, different from other tensors on cuda:5
+
+    The per-expert version it replaced was device-agnostic for free, because
+    .item() pulls a scalar off any device. Whole-tensor ops are not, and no
+    CPU-only test can tell the difference -- which is the whole point of this
+    one."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_invariant_and_apply_accept_cuda_tables(self):
+        from sglang.srt.layers.moe.kt_expert_swap import (
+            ExpertSwap,
+            apply_swaps_to_tables,
+            assert_tables_consistent,
+        )
+
+        t = _tables()
+        cuda = torch.device("cuda")
+        t = t._replace(
+            gpu_experts_mask=t.gpu_experts_mask.to(cuda),
+            logical_to_gpu_index=t.logical_to_gpu_index.to(cuda),
+            gpu_index_to_logical=t.gpu_index_to_logical.to(cuda),
+        )
+        assert_tables_consistent(t, 4)
+        rows = apply_swaps_to_tables(t, [ExpertSwap(6, 2, 100.0, 0.0)])
+        self.assertEqual(rows, [2])
+        assert_tables_consistent(t, 4)
+        self.assertTrue(bool(t.gpu_experts_mask[6]))
+        self.assertEqual(int(t.gpu_index_to_logical[2]), 6)
+
+
 class TestSwapWindow(CustomTestCase):
     """Critical-path bookkeeping for the window driver. Red if weights stop
     being written BEFORE the tables flip (a window where a row is advertised

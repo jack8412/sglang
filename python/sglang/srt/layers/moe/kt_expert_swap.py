@@ -79,8 +79,16 @@ def apply_swaps_to_tables(tables: SwapTables, swaps: List[ExpertSwap]) -> List[i
     if not swaps:
         return []
     l2g = tables.logical_to_gpu_index
-    promote = torch.tensor([s.promote for s in swaps], dtype=torch.long)
-    demote = torch.tensor([s.demote for s in swaps], dtype=torch.long)
+    # Same device rule as assert_tables_consistent: an index tensor must live
+    # on the tensor it indexes, and these tables are not guaranteed to be CPU.
+    _p = [s.promote for s in swaps]
+    _d = [s.demote for s in swaps]
+
+    def _idx(vals, like):
+        return torch.as_tensor(vals, dtype=torch.long, device=like.device)
+
+    promote = _idx(_p, l2g)
+    demote = _idx(_d, l2g)
     rows_t = l2g[demote].to(torch.long)
 
     # Validated for the WHOLE batch before anything is written. The per-swap
@@ -107,13 +115,13 @@ def apply_swaps_to_tables(tables: SwapTables, swaps: List[ExpertSwap]) -> List[i
     # twice and batching cannot reorder one write against another. Every write
     # is still in place -- these are index_put_ on the existing storage, not a
     # rebind. See the note above about the graph and the C++ pointer.
-    tables.gpu_experts_mask[promote] = True
-    tables.gpu_experts_mask[demote] = False
+    _mask = tables.gpu_experts_mask
+    _mask[_idx(_p, _mask)] = True
+    _mask[_idx(_d, _mask)] = False
     l2g[promote] = rows_t.to(l2g.dtype)
     l2g[demote] = -1
-    tables.gpu_index_to_logical[rows_t] = promote.to(
-        tables.gpu_index_to_logical.dtype
-    )
+    _g2l = tables.gpu_index_to_logical
+    _g2l[rows_t.to(_g2l.device)] = _idx(_p, _g2l).to(_g2l.dtype)
     if tables.logical_to_slot is not None:
         # The pair EXCHANGE slots: the promoted expert takes the demoted
         # one's resident slot (== its row) and the demoted expert takes
@@ -121,10 +129,12 @@ def apply_swaps_to_tables(tables: SwapTables, swaps: List[ExpertSwap]) -> List[i
         # will fill with the demoted expert's bytes on the next prefill.
         # No other entry moves, mirroring the row assignment above. Cloned
         # because the two writes below alias the tensor they read.
-        p_slot = tables.logical_to_slot[promote].clone()
-        d_slot = tables.logical_to_slot[demote].clone()
-        tables.logical_to_slot[promote] = d_slot
-        tables.logical_to_slot[demote] = p_slot
+        _l2s = tables.logical_to_slot
+        _sp, _sd = _idx(_p, _l2s), _idx(_d, _l2s)
+        p_slot = _l2s[_sp].clone()
+        d_slot = _l2s[_sd].clone()
+        _l2s[_sp] = d_slot
+        _l2s[_sd] = p_slot
     rows: List[int] = rows_t.tolist()
 
     tables.gpu_experts_mask_cuda.copy_(tables.gpu_experts_mask, non_blocking=True)
@@ -159,15 +169,24 @@ def assert_tables_consistent(tables: SwapTables, num_gpu_experts: int) -> None:
     l2g = tables.logical_to_gpu_index
     g2l = tables.gpu_index_to_logical
 
-    resident = mask.nonzero(as_tuple=False).flatten()
+    # DEVICE. These four tables are documented as CPU, but a caller can hand
+    # over CUDA ones (V4 died here on a cuda:5 logical_to_gpu_index). The
+    # per-expert version this replaced was device-agnostic for free, because
+    # .item() pulls a scalar off any device; whole-tensor ops are not, so the
+    # device has to be carried explicitly. Everything below lands on the index
+    # table's device, and .to() is a no-op when it already matches.
+    dev = l2g.device
+    resident = mask.to(dev).nonzero(as_tuple=False).flatten()
     if resident.numel() != num_gpu_experts:
         raise AssertionError(
             f"mask says {resident.numel()} residents, expected {num_gpu_experts}"
         )
     rows = l2g[resident].to(torch.int64)
-    if not torch.equal(rows.sort().values, torch.arange(num_gpu_experts)):
+    if not torch.equal(
+        rows.sort().values, torch.arange(num_gpu_experts, device=dev)
+    ):
         raise AssertionError("resident rows are not a permutation of 0..N-1")
-    broken = (g2l[rows].to(torch.int64) != resident).nonzero().flatten()
+    broken = (g2l.to(dev)[rows].to(torch.int64) != resident).nonzero().flatten()
     if broken.numel():
         i = int(broken[0].item())
         expert, row = int(resident[i].item()), int(rows[i].item())
@@ -175,7 +194,7 @@ def assert_tables_consistent(tables: SwapTables, num_gpu_experts: int) -> None:
             f"round trip broken: expert {expert} -> row {row} -> "
             f"{int(g2l[row].item())}"
         )
-    non_resident = (~mask).nonzero(as_tuple=False).flatten()
+    non_resident = (~mask).to(dev).nonzero(as_tuple=False).flatten()
     if non_resident.numel() and int(l2g[non_resident].max().item()) >= 0:
         raise AssertionError("a non-resident expert still maps to a GPU row")
 
