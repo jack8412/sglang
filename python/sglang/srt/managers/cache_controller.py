@@ -770,9 +770,21 @@ class HiCacheController:
         )
 
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
-        """Total bytes moved by a merged transfer op (draft piggyback included)."""
-        num_tokens = len(op.device_indices)
-        num_bytes = num_tokens * self.mem_pool_host.size_per_token
+        """Total bytes moved by a merged transfer op (draft piggyback included).
+
+        ``device_indices`` are LOGICAL slots. Under DCP that space is widened by
+        ``dcp_size`` and this rank owns one residue class of it, so counting the
+        indices directly reports ``dcp_size`` times the bytes that actually
+        crossed the link -- 8x on a --dcp-size 8 server.
+
+        The ratio is taken from the pool rather than a ``dcp_size`` attribute
+        because the unified path hands us a ``HostPoolGroup``, which forwards
+        ``size``/``logical_size`` but has no dcp surface of its own.
+        """
+        pool = self.mem_pool_host
+        dcp_size = max(1, pool.logical_size // pool.size)
+        num_tokens = len(op.device_indices) // dcp_size
+        num_bytes = num_tokens * pool.size_per_token
         if self.has_draft:
             num_bytes += num_tokens * self.mem_pool_host_draft.size_per_token
         return num_bytes
