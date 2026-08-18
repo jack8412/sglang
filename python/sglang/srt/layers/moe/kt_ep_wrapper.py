@@ -9120,14 +9120,44 @@ def _get_or_create_rank_writer(entry):
                     cudart_register_fns,
                 )
 
+                # NO FALLBACK. Direct DMA is opt-in, so a failure here means
+                # the operator asked for a transport the machine will not give
+                # -- and the alternatives are both bad in a way that hides it:
+                # degrading to the staged host path silently returns the DRAM
+                # hop this exists to delete, and the outer handler disarms
+                # rank-write entirely and sends every demotion back to the
+                # checkpoint read (~28 s per window against ~0.5 s). Neither
+                # should be discovered from a throughput graph a day later.
+                #
+                # THE FAILURE YOU WILL ACTUALLY SEE, and it is not a bug in
+                # this code: cudaHostRegister rc=1 partway through the arenas.
+                # It pins EXISTING pages, so it is charged against
+                # RLIMIT_MEMLOCK -- unlike the cudaHostAlloc backing the pinned
+                # store, which is why a 51.1 GiB store allocates fine on a box
+                # where registering a 2.2 GiB arena does not. `ulimit -l` is
+                # 8 MB on an unprivileged vast.ai container, hard limit
+                # included, so nothing can be done from inside it; docker needs
+                # `--ulimit memlock=-1`.
                 _t_reg = time.perf_counter()
-                reg_fn, _ = cudart_register_fns()
-                dma = ArenaDmaWriter(
-                    arena_by_layer=arenas,
-                    geometry=geom,
-                    copy_lib=CudaCopyLib(),
-                    register_fn=reg_fn,
-                )
+                try:
+                    reg_fn, _ = cudart_register_fns()
+                    dma = ArenaDmaWriter(
+                        arena_by_layer=arenas,
+                        geometry=geom,
+                        copy_lib=CudaCopyLib(),
+                        register_fn=reg_fn,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[kt-rankwrite] direct DMA was requested "
+                        "(SGLANG_KT_DEMOTION_DIRECT_DMA=1) and could not arm; "
+                        "check `ulimit -l` -- cudaHostRegister is charged "
+                        "against RLIMIT_MEMLOCK"
+                    )
+                    _fatal_swap_failure(
+                        "direct DMA requested but the arena could not be "
+                        "registered"
+                    )
                 logger.info(
                     "[kt-rankwrite] direct DMA armed: registered %d arena "
                     "mapping(s), %.0f GiB, in %.1fs -- demotions go GPU -> kt "
