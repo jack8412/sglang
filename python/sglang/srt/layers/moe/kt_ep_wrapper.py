@@ -5167,12 +5167,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "(no expert_buffer_pointers on this wrapper?)"
             )
             return
-        n = source.experts
         # SLOT ids: raw_shard is slot-indexed and verify translates only the
         # checkpoint side. Pre-mapping the ids here compared raw_shard(p2l[s])
         # against checkpoint p2l[s] -- wrong on both sides of a non-identity
         # map, and invisible under the identity maps it was written against.
-        ids = sorted({0, n // 3, (2 * n) // 3, n - 1})
+        #
+        # Sample only slots that hold buffers. Spreading the picks across the
+        # whole id space instead made this probe raise on every hot expert under
+        # cold-only residency -- V14 logged 27 tracebacks at boot for a check
+        # that is supposed to be read-only and quiet.
+        live = source.resident_slots()
+        if not live:
+            logger.error("[kt-ram] no CPU-resident expert to verify on this rank")
+            return
+        n = len(live)
+        ids = sorted({live[0], live[n // 3], live[(2 * n) // 3], live[n - 1]})
         verify_against_checkpoint(
             source,
             weight_path=self.kt_config.weight_path,

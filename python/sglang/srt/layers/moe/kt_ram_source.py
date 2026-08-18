@@ -171,6 +171,15 @@ class KtRamExpertSource:
             pieces.append(block[:, s - p0 : e - p0])
         return pieces
 
+    def resident_slots(self) -> List[int]:
+        """Slots that actually hold buffers on this rank.
+
+        Under cold-only residency only the cold experts do, so anything that
+        samples the whole id space -- a verification probe, say -- mostly hits
+        holes and reports them as failures.
+        """
+        return [e for e in range(self.experts) if not self._absent(e)]
+
     def raw_shard(self, logical_id: int) -> Dict[str, torch.Tensor]:
         """This rank's TP shard of one expert, in checkpoint layout.
 
