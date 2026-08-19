@@ -412,7 +412,7 @@ class TestDirectDmaMatchesTheHostPath(unittest.TestCase):
     def test_dma_and_host_writes_are_bitwise_equal(self):
         ArenaDmaWriter = _dw.ArenaDmaWriter
         _blit, _blit_strided = _dw._blit, _dw._blit_strided
-        from sglang.srt.layers.moe.kt_direct_dma import (
+        from sglang.srt.layers.moe.kt_arena_geometry import (
             CudaCopyLib,
             cudart_register_fns,
         )
@@ -516,7 +516,7 @@ class TestDirectDmaRoundTrip(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_write_then_read_is_identity(self):
         ArenaDmaWriter = _dw.ArenaDmaWriter
-        from sglang.srt.layers.moe.kt_direct_dma import (
+        from sglang.srt.layers.moe.kt_arena_geometry import (
             CudaCopyLib,
             cudart_register_fns,
         )
@@ -613,7 +613,7 @@ class TestDirectDmaRoundTripContiguous(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_contiguous_branch_round_trips(self):
         ArenaDmaWriter = _dw.ArenaDmaWriter
-        from sglang.srt.layers.moe.kt_direct_dma import (
+        from sglang.srt.layers.moe.kt_arena_geometry import (
             CudaCopyLib,
             cudart_register_fns,
         )

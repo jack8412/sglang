@@ -1397,16 +1397,6 @@ class Envs:
     # demotion is already a nop). Falls back per layer to the checkpoint path.
     SGLANG_KT_DEMOTION_RANK_WRITE = EnvBool(False)
     SGLANG_KT_DEMOTION_DIRECT_DMA = EnvBool(False)
-    # Minimum free VRAM (GiB) a rank must still have, after the projected
-    # page-table cost (8 B per 4K page, measured exact on dense ranges),
-    # before the direct-DMA cold transport is allowed to arm. NOTE the
-    # timing: arming runs inside ModelRunner.initialize, BEFORE the KV pool
-    # is carved, so free VRAM here is pre-pool (tens of GiB) and the pool
-    # sizing that follows measures free memory AFTER registration -- the PTE
-    # cost is absorbed by the pool, not by the serving margin. The floor is
-    # therefore a sanity bound against grossly wrong projections, not the
-    # post-pool-margin guard an operator might assume.
-    SGLANG_KT_DMA_FREE_VRAM_FLOOR_GB = EnvFloat(1.0)
     # Hold the split-prefill cold store in CHECKPOINT layout and swizzle each
     # layer on device as it is prefetched, instead of storing pre-swizzled
     # bytes. Costs ~1.0 ms per layer (~+4.4% of the ~2.07 s/forward copy floor)

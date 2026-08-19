@@ -398,17 +398,16 @@ def _receive_layer(*, method, layer_idx: int, tp_rank: int, tp_size: int) -> Non
         if n_fds == 0:
             return  # this layer exports no arenas; nothing to map
         meta = pickle.loads(_recv_exact(sock, meta_len))
-        # Direct-DMA needs a WRITABLE mapping: cudaHostRegister's page pinning
+        # Rank-write needs a WRITABLE mapping: cudaHostRegister's page pinning
         # requires write access (attr cudaDevAttrHostRegisterReadOnlySupported
         # is 0 on this platform -- measured, Probe A session), so PROT_READ
         # mappings cannot be registered. The read-only containment ("a
         # consumer rank cannot corrupt the weights") is knowingly given up in
         # that mode and only in that mode; nothing ever writes by
-        # construction.
+        # construction. (The deleted direct-dma transport was the other reason
+        # this could be writable; rank-write is now the only one.)
         prot = mmap.PROT_READ
-        if method.kt_config.cold_transport == "direct-dma" or (
-            envs.SGLANG_KT_DEMOTION_RANK_WRITE.get()
-        ):
+        if envs.SGLANG_KT_DEMOTION_RANK_WRITE.get():
             prot |= mmap.PROT_WRITE
         arenas = []
         for fd, size in zip(fds, meta["sizes"]):

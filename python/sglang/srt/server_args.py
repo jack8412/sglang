@@ -3049,8 +3049,8 @@ class ServerArgs:
         NS("exec.moe"),
     ] = 0
     kt_cold_transport: A[
-        Literal["ring-export", "direct-dma"],
-        "How --kt-expert-split-prefill moves cold-expert weights to the GPUs each layer. 'ring-export' (default): kt's CPU pool copies each layer's slices into per-rank pinned rings and the ranks DMA those (3 DRAM transits/byte). 'direct-dma': every rank cudaHostRegisters its read-set of kt's memfd arenas (requires KT_BUFFER_B_MEMFD=1) and its copy engine reads the weights in place -- one transit, no CPU prepare stage. Falls back to ring-export, then to the margin-routed CPU path, if arming fails on any rank.",
+        Literal["ring-export"],
+        "How --kt-expert-split-prefill moves cold-expert weights to the GPUs each layer. Only 'ring-export' remains, and it applies only WITHOUT --kt-cold-only-cpu-experts: kt's CPU pool copies each layer's slices into per-rank pinned rings and the ranks DMA those. Under --kt-cold-only-cpu-experts the cold set streams by DMA straight out of kt's memfd arenas instead (KT_BUFFER_B_MEMFD=1 plus SGLANG_KT_DEMOTION_DIRECT_DMA and SGLANG_KT_DEMOTION_RANK_WRITE), which is what production runs and what this flag does NOT select.",
         NS("exec.moe"),
     ] = "ring-export"
     record_kt_gpu_expert_distribution: A[
