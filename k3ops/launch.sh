@@ -110,6 +110,27 @@ PHYS=$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
 NUMAN=$(numactl --hardware 2>/dev/null | awk '/^available:/{print $2}')
 [ -n "$NUMAN" ] || NUMAN=2
 
+# kt PARTITIONS MUST EQUAL TP -- this is a correctness knob, not a tuning one.
+# kt shards w2 by COLUMN per partition (its down buffer is a compacted
+# [hidden, per_numa]), so a GPU rank's w2 slice is one contiguous block only
+# when per_numa == per_gpu. Below that -- e.g. the NUMA node count, which is
+# what this used to pass -- every expert's w2 becomes H strided
+# (per_gpu/2)-byte reads, the DMA-efficiency trap that makes --kt-cold-transport
+# direct-dma unusable. The NUMA node count is unrelated to the partition count:
+# place the pools explicitly with --kt-numa-nodes (ai.v8.pro, GPUs on nodes
+# 0,0,2,2,3,3,5,5: `--kt-numa-nodes 0 0 2 2 3 3 5 5`).
+KTPOOLS=8
+
+# Per-node threads must stay within that node's physical cores or the pin
+# fails SILENTLY. With 8 pools over the GPU-local nodes two pools share a
+# node, so a pool may take at most half a node. On gpusrv (96 cores / 2 nodes)
+# this is slack and cpuinfer is unchanged; on ai.v8.pro (144 / 6) it caps
+# 122 -> 96, which costs nothing: the cpuinfer sweep at 48/81/96/144 is flat
+# on AMX, where CPU expert compute stopped being the bottleneck.
+CPUINF=$(( PHYS * 85 / 100 ))
+CPUINF_MAX=$(( KTPOOLS * (PHYS / NUMAN) / 2 ))
+[ "$CPUINF" -le "$CPUINF_MAX" ] || CPUINF=$CPUINF_MAX
+
 # PLACEMENT PROFILES REMOVED (2026-08-14). The launcher no longer discovers or
 # loads an expert-distribution dump, and no longer arms the recorder.
 #
@@ -160,7 +181,7 @@ exec python -m sglang.launch_server \
   --model-path $WS/k3 --trust-remote-code --tp 8 --port ${K3_PORT:-30000} --host 127.0.0.1 \
   --kt-method MXFP4 --kt-weight-path $WS/k3 \
   --kt-num-gpu-experts 620 \
-  --kt-threadpool-count $NUMAN --kt-cpuinfer $((PHYS * 85 / 100)) \
+  --kt-threadpool-count $KTPOOLS --kt-cpuinfer $CPUINF \
   --kt-transport doorbell \
   "${ROUTING[@]}" \
   --moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4 \
