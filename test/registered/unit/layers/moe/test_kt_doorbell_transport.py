@@ -335,7 +335,6 @@ class TestTransportConfigRails(CustomTestCase):
         kt_gpu_prefill_token_threshold=None,
         kt_max_deferred_experts_per_token=None,
         kt_cold_only_cpu_experts=False,
-        kt_cold_transport="ring-export",
         kt_expert_swap_transitions=0,
         kt_expert_swap_max=0,
         kt_routing_full_override=False,
