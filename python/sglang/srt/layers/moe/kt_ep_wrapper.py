@@ -6922,6 +6922,7 @@ def maybe_run_expert_swap_window(
         "arm_s": 0.0,         # the rank-write arming all_reduce (rank skew)
         "quiesce_s": 0.0,     # torch.cuda.synchronize: drain the in-flight fwd
         "barrier_s": 0.0,     # the end-of-window barrier (rank skew again)
+        "d2h_sync_s": 0.0,    # waiting for this rank's demotion D2H to land
     }
     _window_t0 = time.perf_counter()
 
@@ -7602,16 +7603,33 @@ def maybe_run_expert_swap_window(
         _flush_moves()
         # Rank-write demotions: every rank's slices must have LANDED before
         # serving resumes, or kt computes a demoted expert with another
-        # rank's hole still in it. The natural TP lockstep of the next
-        # forward would mostly cover it, but "mostly" is not a memory
-        # ordering -- one plan-independent barrier here costs ~1 ms and is
-        # symmetric on every path out of the window, including the raising
-        # one.
+        # rank's hole still in it. TWO orderings are needed and they are not
+        # interchangeable:
+        #
+        #   1. THIS rank's D2H copies must be visible to THIS rank's CPU.
+        #      RankShardWriter issues them with cudaMemcpyAsync on the current
+        #      stream and never synchronizes, so nothing had made them
+        #      host-visible: kt reads the arena from the CPU, and an async D2H
+        #      is not complete just because the launching thread moved on.
+        #   2. Every OTHER rank's slice must be in before anyone reads the
+        #      whole expert -- that is the barrier.
+        #
+        # The stream sync must come FIRST. Barrier-then-sync lets a rank clear
+        # the barrier with copies still in flight, which is the same hole in a
+        # different place. This was previously carried by the barrier alone
+        # plus the next forward's natural lockstep -- and the comment here
+        # already said why that is not enough: "mostly" is not a memory
+        # ordering. It is also where the demotion transfer was hiding, ~6.3 GB
+        # per window at swap-max 32 that no span could see.
+        #
         # Keyed to the WINDOW consensus, never to this rank's writer: a
         # barrier some ranks skip is a hang, and the writer is the one
         # precondition that is per-rank fallible.
         _rw = _KT_SWAP_STATE.get("rank_writer")
         if _KT_SWAP_STATE.get("rank_write_armed"):
+            _t_sync = time.perf_counter()
+            torch.cuda.current_stream().synchronize()
+            _timing["d2h_sync_s"] += time.perf_counter() - _t_sync
             if dist.is_initialized() and get_parallel().tp_size > 1:
                 _t_bar = time.perf_counter()
                 dist.barrier(group=get_tp_group().cpu_group)
@@ -7665,6 +7683,7 @@ def maybe_run_expert_swap_window(
             "select_s", "rows_s", "begin_s", "move_s", "stage_s",
             "flush_gpu_s", "finish_s", "apply_s",
             "tables_s", "after_s", "arm_s", "quiesce_s", "barrier_s",
+            "d2h_sync_s",
         )
         _attributed = sum(_timing[k] for k in _phases)
         logger.info(
