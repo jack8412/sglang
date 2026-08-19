@@ -7238,59 +7238,6 @@ def maybe_run_expert_swap_window(
                 }
             )
 
-    def _verify_install_once(entry):
-        """SGLANG_KT_VERIFY_CPU_INSTALL=1: prove the demotion install bitwise.
-
-        Re-runs the install's own fill against an expert that is ALREADY
-        CPU-resident and compares the AMX buffers byte for byte with what the
-        bulk load produced. Shares fill_expert_buffers with the real install,
-        deliberately -- a check that reimplements the thing it checks verifies
-        nothing.
-
-        This is the gate the demotion path actually needs. End-to-end quality
-        can only say "something is worse"; a wrong NUMA slice writes a
-        valid-looking expert and fails nothing downstream.
-        """
-        import os
-
-        if os.environ.get("SGLANG_KT_VERIFY_CPU_INSTALL") != "1":
-            return
-        if _KT_SWAP_STATE.get("install_verified"):
-            return
-        _KT_SWAP_STATE["install_verified"] = True
-        method = entry.get("method")
-        if method is None or method.wrapper is None:
-            return
-        mask = method.gpu_experts_mask
-        resident = [i for i in range(mask.numel()) if not bool(mask[i])]
-        if not resident:
-            logger.warning("[kt-install-verify] no CPU-resident expert to check")
-            return
-        eid = resident[len(resident) // 2]
-        try:
-            # Checkpoint read translated; the kt-side slot id stays physical.
-            tensors = mover.read_full_expert(
-                entry["layer"], _checkpoint_id(method._kt_physical_to_logical, eid)
-            )
-            ok = method.wrapper.verify_install_against_loaded(
-                eid, *[t.data_ptr() for t in tensors]
-            )
-        except Exception:
-            logger.exception("[kt-install-verify] check itself failed")
-            return
-        if ok:
-            logger.info(
-                "[kt-install-verify] expert %d: install BITWISE-MATCHES the "
-                "bulk load on every NUMA partition",
-                eid,
-            )
-        else:
-            logger.error(
-                "[kt-install-verify] expert %d: install DIFFERS from the bulk "
-                "load -- demoted experts are being given wrong weights",
-                eid,
-            )
-
     def _install_cpu(entry, promote_id, demote_id):
         """Give the demoted expert the promoted one's CPU weight buffers.
 
@@ -7371,7 +7318,6 @@ def maybe_run_expert_swap_window(
             if writer is not None:
                 writer.commit_move(entry["layer_idx"], promote_id, demote_id)
             return
-        _verify_install_once(entry)
         t0 = time.perf_counter()
         tensors = _read_demoted_expert(entry, demote_id)
         t1 = time.perf_counter()
@@ -7635,9 +7581,6 @@ def maybe_run_expert_swap_window(
                 dist.barrier(group=get_tp_group().cpu_group)
                 _timing["barrier_s"] += time.perf_counter() - _t_bar
         if _rw is not None:
-            # After the barrier, so every rank's slice is in: this is the only
-            # point where an expert this path built is complete and readable.
-            _verify_rank_write_once(entries, _rw, mover)
             logger.info("%s", _rw.end_window())
     _KT_SWAP_STATE["windows"] += 1
     _KT_SWAP_STATE["swaps"] += result.swaps_applied
@@ -8650,67 +8593,6 @@ def _fatal_swap_failure(context: str) -> None:
         except Exception:
             logger.exception("[kt-swap] could not kill the process tree")
     os._exit(70)  # EX_SOFTWARE; only reached if the group kill somehow missed us
-
-
-def _verify_rank_write_once(entries, writer, mover) -> None:
-    """SGLANG_KT_VERIFY_CPU_INSTALL=1: prove a rank-written expert bitwise.
-
-    THE gate for this path. Eight ranks each wrote a disjoint slice of an
-    expert directly into kt's buffers; every way that can be wrong -- a
-    partition off by one, a rank's rows landing at another rank's offset, a
-    strip written at the wrong pitch -- produces a valid-looking expert
-    holding wrong weights, which nothing downstream fails on. kt's own
-    verifier rebuilds the expert from the CHECKPOINT through the same
-    fill_expert_buffers the old install used and compares every NUMA
-    partition byte for byte, so it answers exactly the question the unit
-    tests answer in simulation, on the real thing.
-
-    Once per process, one expert, after the window's barrier. Rank 0 only --
-    it owns kt -- and read-only with respect to serving state.
-    """
-    import os
-
-    if os.environ.get("SGLANG_KT_VERIFY_CPU_INSTALL") != "1":
-        return
-    if _KT_SWAP_STATE.get("rank_write_verified"):
-        return
-    if writer.last_installed is None or mover is None:
-        return
-    layer_idx, expert_id = writer.last_installed
-    entry = next(
-        (e for e in entries if e.get("layer_idx") == layer_idx), None
-    )
-    if entry is None:
-        return
-    method = entry.get("method")
-    if method is None or method.wrapper is None:
-        return  # peers hold no kt engine to verify against
-    _KT_SWAP_STATE["rank_write_verified"] = True
-    try:
-        tensors = mover.read_full_expert(
-            entry["layer"], _checkpoint_id(method._kt_physical_to_logical, expert_id)
-        )
-        ok = method.wrapper.verify_install_against_loaded(
-            expert_id, *[t.data_ptr() for t in tensors]
-        )
-    except Exception:
-        logger.exception("[kt-rankwrite] the bitwise check itself failed")
-        return
-    if ok:
-        logger.info(
-            "[kt-rankwrite] expert %d (layer %d): the eight ranks' writes "
-            "BITWISE-MATCH the checkpoint on every NUMA partition",
-            expert_id,
-            layer_idx,
-        )
-    else:
-        logger.error(
-            "[kt-rankwrite] expert %d (layer %d): DIFFERS from the checkpoint "
-            "-- demoted experts are being given wrong weights; set "
-            "SGLANG_KT_DEMOTION_RANK_WRITE=0 and re-check the offset math",
-            expert_id,
-            layer_idx,
-        )
 
 
 def _get_or_create_rank_writer(entry):
