@@ -679,7 +679,7 @@ class TestColdSourceSatisfiesThePipelineProtocol(unittest.TestCase):
     So do not hardcode the method list. Derive it from the pipeline source, and
     treat a name as REQUIRED unless the pipeline guards it with hasattr (which
     is how the optional ``issue_layer_copies`` fast path is dispatched). A new
-    unguarded ``self._store.foo()`` then fails here rather than on the node.
+    unguarded ``self._source.foo()`` then fails here rather than on the node.
     """
 
     def _pipeline_source(self):
@@ -695,9 +695,9 @@ class TestColdSourceSatisfiesThePipelineProtocol(unittest.TestCase):
 
     def test_arena_source_implements_every_unguarded_store_call(self):
         src = self._pipeline_source()
-        called = set(re.findall(r"self\._store\.([A-Za-z_][A-Za-z0-9_]*)", src))
+        called = set(re.findall(r"self\._source\.([A-Za-z_][A-Za-z0-9_]*)", src))
         optional = set(
-            re.findall(r'hasattr\(\s*self\._store\s*,\s*"([^"]+)"', src)
+            re.findall(r'hasattr\(\s*self\._source\s*,\s*"([^"]+)"', src)
         )
         required = called - optional
 

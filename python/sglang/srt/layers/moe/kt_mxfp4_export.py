@@ -37,6 +37,11 @@ import torch
 _E8M0_MANTISSA_MASK = 0x7F
 _MXFP4_GROUP_SIZE = 32
 
+# The four MXFP4 expert tensors, in the order every cold-path buffer, gather
+# and copy uses. Lives here because this module owns the layout; it used to
+# live in expert_cold_store.py, which was deleted with the pinned store.
+WEIGHT_NAMES = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+
 
 class Mxfp4ExpertBytes(msgspec.Struct):
     """Raw exported bytes for one expert (one GPU-TP shard).

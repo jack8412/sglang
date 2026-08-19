@@ -71,14 +71,14 @@ def _load_kt_direct_dma():
         setattr(sys.modules["sglang.srt.layers.moe"], mod_name.split(".")[-1], mod)
         return mod
 
-    cold = stub("sglang.srt.layers.moe.expert_cold_store")
-    cold.WEIGHT_NAMES = (
+    names = stub("sglang.srt.layers.moe.kt_mxfp4_export")
+    names.WEIGHT_NAMES = (
         "w13_weight",
         "w13_weight_scale",
         "w2_weight",
         "w2_weight_scale",
     )
-    sys.modules["sglang.srt.layers.moe"].expert_cold_store = cold
+    sys.modules["sglang.srt.layers.moe"].kt_mxfp4_export = names
     load("sglang.srt.layers.moe.kt_ram_source", "kt_ram_source.py")
     return load("sglang.srt.layers.moe.kt_direct_dma", "kt_direct_dma.py")
 

@@ -32,7 +32,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.expert_cold_store import WEIGHT_NAMES, ColdExpertStore
+from sglang.srt.layers.moe.kt_mxfp4_export import WEIGHT_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class ArenaColdSource:
     without registering the multi-hundred-GB arena mapping (that direct-DMA
     variant stays a measured follow-up, not a prerequisite).
 
-    Duck-compatible with ColdExpertStore where ColdExpertPipeline touches it
+    Duck-compatible with the other cold sources where ColdExpertPipeline touches it
     (``num_cold``, ``layer_rows``) plus the lifecycle hooks the pipeline calls
     on both (``after_enqueue``, ``reset``).
 
@@ -384,14 +384,14 @@ class ColdExpertPipeline:
     def __init__(
         self,
         *,
-        store,  # ColdExpertStore or ArenaColdSource (num_cold/layer_rows/hooks)
+        source,  # a cold source: num_cold / layer_rows / lifecycle hooks
         device: torch.device,
         per_expert_shapes: Dict[str, tuple],
         moe_layer_indices: Sequence[int],
         swizzle_plan=None,
         raw_shapes: Optional[Dict[str, tuple]] = None,
     ):
-        self._store = store
+        self._source = source
         self._device = device
         self._layers = sorted(moe_layer_indices)
         self._pos = {layer: i for i, layer in enumerate(self._layers)}
@@ -423,7 +423,7 @@ class ColdExpertPipeline:
         self._buffers: List[Dict[str, torch.Tensor]] = [
             {
                 n: torch.empty(
-                    (store.num_cold,) + tuple(shape), dtype=dtype, device=device
+                    (source.num_cold,) + tuple(shape), dtype=dtype, device=device
                 )
                 for n, (shape, dtype) in per_expert_shapes.items()
             }
@@ -433,7 +433,7 @@ class ColdExpertPipeline:
             [
                 {
                     n: torch.empty(
-                        (store.num_cold,) + tuple(shape), dtype=dtype, device=device
+                        (source.num_cold,) + tuple(shape), dtype=dtype, device=device
                     )
                     for n, (shape, dtype) in raw_shapes.items()
                 }
@@ -474,7 +474,7 @@ class ColdExpertPipeline:
         logger.info(
             "[cold-pipeline] %d cold experts: %d resident + %d raw = %.2f GiB "
             "device (%.2f resident + %.2f raw)",
-            store.num_cold,
+            source.num_cold,
             len(self._buffers),
             0 if self._raw_buffers is None else len(self._raw_buffers),
             _gib(self._buffers) + raw_gib,
@@ -503,7 +503,7 @@ class ColdExpertPipeline:
             # copy_end goes back to measuring the transfer alone. A plain
             # store pays a dict lookup.
             t0 = time.perf_counter()
-            self._store.layer_rows(layer_idx, WEIGHT_NAMES[0])
+            self._source.layer_rows(layer_idx, WEIGHT_NAMES[0])
             self._probe.gather_wait(
                 self._pos[layer_idx], (time.perf_counter() - t0) * 1e3
             )
@@ -518,7 +518,7 @@ class ColdExpertPipeline:
                 dst = self._buffers[slot]
                 for name in WEIGHT_NAMES:
                     dst[name].copy_(
-                        self._store.layer_rows(layer_idx, name), non_blocking=True
+                        self._source.layer_rows(layer_idx, name), non_blocking=True
                     )
             else:
                 # TRANSFER ONLY. The swizzle is a gather kernel and this stream
@@ -532,24 +532,24 @@ class ColdExpertPipeline:
             self._prefetch_events[slot].record(self._copy_stream)
         # After the copies are enqueued: an arena source uses this to recycle
         # its staging slot once the DMA completes; the store's is a no-op.
-        self._store.after_enqueue(layer_idx, self._copy_stream)
+        self._source.after_enqueue(layer_idx, self._copy_stream)
         self._slot_layer[slot] = layer_idx
 
     def _issue_raw(self, slot: int, layer_idx: int) -> None:
         """Enqueue this layer's checkpoint-layout block into its raw slot."""
         raw = self._raw_buffers[slot]
-        if hasattr(self._store, "issue_layer_copies"):
+        if hasattr(self._source, "issue_layer_copies"):
             # The source owns the H2D issue: there is no host staging to hand
             # back, because the bytes are read straight out of kt's registered
             # arena. Enqueued on the SAME copy stream so the prefetch event's
             # meaning is unchanged. Duck-typed rather than isinstance so both
             # the direct-DMA transport and the arena cold source qualify
             # without this file importing either.
-            self._store.issue_layer_copies(layer_idx, raw, self._copy_stream)
+            self._source.issue_layer_copies(layer_idx, raw, self._copy_stream)
         else:
             for name in WEIGHT_NAMES:
                 raw[name].copy_(
-                    self._store.layer_rows(layer_idx, name), non_blocking=True
+                    self._source.layer_rows(layer_idx, name), non_blocking=True
                 )
 
     def _swizzle_into(self, slot: int, dst: Dict[str, torch.Tensor]) -> None:
@@ -646,4 +646,4 @@ class ColdExpertPipeline:
             self._probe = None
         # Both streams are idle (synchronized above), so the source can drain
         # its gather threads without racing any in-flight DMA.
-        self._store.reset()
+        self._source.reset()

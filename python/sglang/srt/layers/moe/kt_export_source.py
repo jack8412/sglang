@@ -53,7 +53,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 
-from sglang.srt.layers.moe.expert_cold_store import WEIGHT_NAMES
+from sglang.srt.layers.moe.kt_mxfp4_export import WEIGHT_NAMES
 
 logger = logging.getLogger(__name__)
 
