@@ -373,8 +373,10 @@ class _OverlapProbe:
 class ColdExpertPipeline:
     """Streams each layer's cold experts to device, one layer ahead.
 
-    ``device_buffers`` is ``[slot][name] -> [num_cold, *shape]`` on device;
-    two slots, alternating by MoE-layer position.
+    The copy stream carries the H2D transfer ONLY. In dynamic-swizzle mode the
+    gather that turns checkpoint layout into trtllm layout runs on the COMPUTE
+    stream instead, because the copy stream is the floor (~25 ms/layer against
+    4-7 ms of MoE) and the compute stream has the slack to hide it.
     """
 
     NUM_SLOTS = 2
@@ -403,6 +405,21 @@ class ColdExpertPipeline:
         # layer it is ~1.0 ms, ~0.092 s per forward. Same bytes, 14x apart.
         self._swizzle_plan = swizzle_plan
 
+        # WHICH buffer the copy stream writes decides how many of each is
+        # needed, and the two modes differ:
+        #
+        #   swizzling  copy stream -> raw[slot]; the compute stream gathers
+        #              raw -> resident. Resident is written AND read by the
+        #              compute stream, in order, so ONE is enough. Raw needs
+        #              NUM_SLOTS: layer L's raw is being gathered while L+1's
+        #              is still landing.
+        #   plain      the store already holds resident layout, so the copy
+        #              stream writes resident directly and it needs NUM_SLOTS.
+        #
+        # Either way the copy-stream-written buffer is NUM_SLOTS deep, which is
+        # what _slot() indexes. 2 raw + 1 resident costs 1.66 GiB/rank where
+        # 2 + 2 cost 2.22.
+        self._swizzling = swizzle_plan is not None and raw_shapes is not None
         self._buffers: List[Dict[str, torch.Tensor]] = [
             {
                 n: torch.empty(
@@ -410,11 +427,8 @@ class ColdExpertPipeline:
                 )
                 for n, (shape, dtype) in per_expert_shapes.items()
             }
-            for _ in range(self.NUM_SLOTS)
+            for _ in range(1 if self._swizzling else self.NUM_SLOTS)
         ]
-        # Raw landing buffers, only in dynamic-swizzle mode. One per slot, so a
-        # layer's raw block can land while the previous layer's swizzled block
-        # is still being read.
         self._raw_buffers: Optional[List[Dict[str, torch.Tensor]]] = (
             [
                 {
@@ -425,7 +439,7 @@ class ColdExpertPipeline:
                 }
                 for _ in range(self.NUM_SLOTS)
             ]
-            if swizzle_plan is not None and raw_shapes is not None
+            if self._swizzling
             else None
         )
 
@@ -451,16 +465,21 @@ class ColdExpertPipeline:
             else None
         )
 
-        nbytes = sum(
-            t.numel() * t.element_size()
-            for buf in self._buffers
-            for t in buf.values()
-        )
+        def _gib(bufs) -> float:
+            return sum(
+                t.numel() * t.element_size() for buf in bufs for t in buf.values()
+            ) / (1024**3)
+
+        raw_gib = _gib(self._raw_buffers) if self._raw_buffers is not None else 0.0
         logger.info(
-            "[cold-pipeline] %d slots x %d cold experts = %.2f GiB device",
-            self.NUM_SLOTS,
+            "[cold-pipeline] %d cold experts: %d resident + %d raw = %.2f GiB "
+            "device (%.2f resident + %.2f raw)",
             store.num_cold,
-            nbytes / (1024**3),
+            len(self._buffers),
+            0 if self._raw_buffers is None else len(self._raw_buffers),
+            _gib(self._buffers) + raw_gib,
+            _gib(self._buffers),
+            raw_gib,
         )
 
     # -- layer bookkeeping -------------------------------------------------
@@ -495,19 +514,19 @@ class ColdExpertPipeline:
             # queueing behind the previous occupant.
             if self._probe is not None:
                 self._probe.copy_begin(self._pos[layer_idx], self._copy_stream)
-            dst = self._buffers[slot]
             if self._raw_buffers is None:
+                dst = self._buffers[slot]
                 for name in WEIGHT_NAMES:
                     dst[name].copy_(
                         self._store.layer_rows(layer_idx, name), non_blocking=True
                     )
             else:
-                # Land the checkpoint-layout bytes, then swizzle the whole
-                # layer into the resident-layout buffer. Both stay on the copy
-                # stream, so the existing prefetch event still means exactly
-                # "this layer's weights are ready to read" and wait_prefetch
-                # needs no change.
-                self._swizzle_into(slot, layer_idx, dst)
+                # TRANSFER ONLY. The swizzle is a gather kernel and this stream
+                # is the floor, so running it here puts compute on the critical
+                # path; it moves to wait_prefetch on the compute stream, which
+                # idles most of every layer. The prefetch event therefore now
+                # means "the raw block has landed", not "resident is ready".
+                self._issue_raw(slot, layer_idx)
             if self._probe is not None:
                 self._probe.copy_end(self._pos[layer_idx], self._copy_stream)
             self._prefetch_events[slot].record(self._copy_stream)
@@ -516,14 +535,9 @@ class ColdExpertPipeline:
         self._store.after_enqueue(layer_idx, self._copy_stream)
         self._slot_layer[slot] = layer_idx
 
-    def _swizzle_into(
-        self, slot: int, layer_idx: int, dst: Dict[str, torch.Tensor]
-    ) -> None:
-        """H2D the raw block, then swizzle it into ``dst`` in four gathers."""
-        from sglang.srt.layers.moe.kt_mxfp4_export import apply_batched_swizzle
-
+    def _issue_raw(self, slot: int, layer_idx: int) -> None:
+        """Enqueue this layer's checkpoint-layout block into its raw slot."""
         raw = self._raw_buffers[slot]
-
         if hasattr(self._store, "issue_layer_copies"):
             # The source owns the H2D issue: there is no host staging to hand
             # back, because the bytes are read straight out of kt's registered
@@ -537,6 +551,16 @@ class ColdExpertPipeline:
                 raw[name].copy_(
                     self._store.layer_rows(layer_idx, name), non_blocking=True
                 )
+
+    def _swizzle_into(self, slot: int, dst: Dict[str, torch.Tensor]) -> None:
+        """Gather the raw block into ``dst`` on the CALLER's stream.
+
+        Four gathers, no per-expert loop. Runs on the compute stream: the same
+        kernels, moved off the bottleneck.
+        """
+        from sglang.srt.layers.moe.kt_mxfp4_export import apply_batched_swizzle
+
+        raw = self._raw_buffers[slot]
         out = apply_batched_swizzle(
             plan=self._swizzle_plan,
             raw_w13=raw[WEIGHT_NAMES[0]],
@@ -567,7 +591,17 @@ class ColdExpertPipeline:
         cur.wait_event(self._prefetch_events[slot])
         if self._probe is not None:
             self._probe.stall_end(self._pos[layer_idx], cur)
-        return self._buffers[slot]
+        if self._raw_buffers is None:
+            return self._buffers[slot]
+        # One resident buffer is enough because this stream both writes and
+        # reads it: the previous layer's MoE was enqueued before this call, so
+        # it has already read the buffer by the time this gather overwrites it.
+        dst = self._buffers[0]
+        self._swizzle_into(slot, dst)
+        # The raw slot dies as soon as the gather has read it -- earlier than
+        # the MoE, so the copy stream waits less than it used to.
+        self._consume_events[slot].record(cur)
+        return dst
 
     def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
         """Release this layer's slot and start the layer two ahead."""
@@ -575,7 +609,11 @@ class ColdExpertPipeline:
         cur = torch.cuda.current_stream(self._device)
         if self._probe is not None:
             self._probe.compute_end(self._pos[layer_idx], cur)
-        self._consume_events[slot].record(cur)
+        if self._raw_buffers is None:
+            # Plain store: the copy stream writes the resident buffer itself,
+            # so the slot is free only once the MoE has read it. When
+            # swizzling, wait_prefetch already released the raw slot.
+            self._consume_events[slot].record(cur)
         nxt = self._next_layer(layer_idx)
         if nxt is not None:
             nxt2 = self._next_layer(nxt)
