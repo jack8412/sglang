@@ -561,5 +561,61 @@ class TestDemotionPrefetchGate(CustomTestCase):
         self.assertTrue(self.mod._rank_write_owns_demotions())
 
 
+class TestFlushMovesFixedWidthBatch(CustomTestCase):
+    """A reused, full-width batch buffer must not leak stale rows.
+
+    _flush_moves used to torch.stack a fresh batch per layer, so its shape
+    followed len(items). That shape varies between layers, the caching
+    allocator could not reuse the blocks, and each miss forced a
+    free/synchronize -- ~6.4 ms apiece against an allocator nearly full at
+    mem-fraction 0.89, which is ~4.7 s of a 5.19 s swap window while the DMA
+    itself is 0.075 ms/expert.
+
+    The fix is split prefill's shape: one buffer set, allocated once, ALWAYS
+    processed at full width so every layer presents the same shape, with only
+    the live prefix scattered. That introduces a failure mode worth pinning --
+    rows beyond len(items) hold whatever the PREVIOUS layer left there, so if
+    the scatter ever widened past the prefix a layer would silently inherit
+    another layer's experts.
+    """
+
+    def _run_layer(self, buf, values, dst, rows):
+        """One layer: fill the prefix, process full width, scatter the prefix."""
+        n = len(values)
+        for i, v in enumerate(values):
+            buf[i].copy_(torch.full_like(buf[i], v))
+        processed = buf * 2  # stands in for the swizzle: full width, same shape
+        idx = torch.tensor(rows, dtype=torch.long)
+        dst.index_copy_(0, idx, processed[:n])
+
+    def test_stale_rows_are_never_scattered(self):
+        cap, width = 8, 4
+        buf = torch.zeros(cap, width, dtype=torch.float32)
+        dst = torch.zeros(32, width, dtype=torch.float32)
+
+        # layer A fills all 8 slots
+        self._run_layer(buf, list(range(1, 9)), dst, list(range(8)))
+        # layer B uses only 3 -- slots 3..7 still hold layer A's values
+        self._run_layer(buf, [100, 200, 300], dst, [10, 11, 12])
+
+        torch.testing.assert_close(dst[10], torch.full((width,), 200.0))
+        torch.testing.assert_close(dst[11], torch.full((width,), 400.0))
+        torch.testing.assert_close(dst[12], torch.full((width,), 600.0))
+        # nothing else moved: rows 13.. must still be zero, i.e. layer A's
+        # leftovers in buf[3:] did not ride along
+        self.assertEqual(float(dst[13:].abs().sum()), 0.0)
+
+    def test_shape_is_constant_across_layers(self):
+        """The point of the change: the allocator sees one shape, not many."""
+        cap, width = 8, 4
+        buf = torch.zeros(cap, width, dtype=torch.float32)
+        shapes = set()
+        for n in (8, 3, 5, 8, 1):
+            processed = buf * 2
+            shapes.add(tuple(processed.shape))
+            self.assertEqual(processed[:n].shape[0], n)
+        self.assertEqual(len(shapes), 1, f"batch shape varied: {shapes}")
+
+
 if __name__ == "__main__":
     unittest.main()

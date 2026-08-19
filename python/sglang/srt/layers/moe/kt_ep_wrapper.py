@@ -7065,12 +7065,41 @@ def maybe_run_expert_swap_window(
             torch.cuda.synchronize()
 
         # WRITE: scatter every promoted row back, again one kernel per name.
-        promoted = {
-            name: torch.stack([it["promoted"][name] for it in items]).to(
-                dev, non_blocking=True
-            )
-            for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
-        }
+        #
+        # PREALLOCATED, CONSTANT-SHAPE BATCH. torch.stack allocated four fresh
+        # device tensors per layer, and the swizzle four more -- 8 x 92 = 736
+        # allocations per window. Their shape followed len(items), which varies
+        # per layer, so the caching allocator could not reuse blocks and each
+        # miss forced a free/synchronize: measured ~6.4 ms apiece against an
+        # allocator nearly full at mem-fraction 0.89, i.e. ~4.7 s of a 5.19 s
+        # window, while the DMA itself is 0.075 ms/expert and the swizzle
+        # ~1 ms/layer.
+        #
+        # Split prefill never had this problem because its raw/dst buffers are
+        # allocated once per slot at construction and every layer is the same
+        # 272-expert shape, so the allocator serves it from cache. Do the same
+        # here: one buffer set sized to the swap budget, filled in place, and
+        # ALWAYS processed at full width so every layer presents an identical
+        # shape. Rows beyond len(items) hold stale bytes and are simply not
+        # scattered -- swizzling a few unused rows costs microseconds against
+        # milliseconds per allocator miss.
+        _sbufs = _pending.setdefault("stack_bufs", {})
+        _cap = _pending.setdefault("stack_cap", 0)
+        if _cap < len(items):
+            _cap = len(items)
+            _pending["stack_cap"] = _cap
+            _sbufs.clear()
+        for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
+            src0 = items[0]["promoted"][name]
+            buf = _sbufs.get(name)
+            if buf is None or buf.shape[0] != _cap:
+                buf = torch.empty(
+                    (_cap,) + tuple(src0.shape), dtype=src0.dtype, device=dev
+                )
+                _sbufs[name] = buf
+            for i, it in enumerate(items):
+                buf[i].copy_(it["promoted"][name], non_blocking=True)
+        promoted = {n: _sbufs[n] for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES}
         if arena_batch or (store is not None and getattr(store, "raw_layout", False)):
             # The source holds checkpoint-layout bytes (raw store or arena
             # mapping alike), so the resident row's trtllm layout is produced
@@ -7089,10 +7118,14 @@ def maybe_run_expert_swap_window(
             # rows with new weights and old scales; the reshape must therefore
             # happen for EVERY name before ANY scatter runs.
             promoted[name] = _bytes(promoted[name]).reshape(
-                (len(items),) + tuple(dst.shape[1:])
+                (-1,) + tuple(dst.shape[1:])
             )
         for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
-            _bytes(getattr(layer, name).data).index_copy_(0, idx, promoted[name])
+            # idx names len(items) rows; the batch is processed at full width,
+            # so scatter only the live prefix.
+            _bytes(getattr(layer, name).data).index_copy_(
+                0, idx, promoted[name][: len(items)]
+            )
         _timing["flush_gpu_s"] += time.perf_counter() - _t_gpu
 
         # The store is authoritative for the cold set, so the demoted rows go
