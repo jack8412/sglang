@@ -124,7 +124,7 @@ NUMAN=$(numactl --hardware 2>/dev/null | awk '/^available:/{print $2}')
 #  - A profile is workload-specific and goes stale as the served domain shifts,
 #    which in production it does continuously. The cost is paid per capture; the
 #    benefit decays from the moment it is taken.
-#  - Expert SWAPPING (--kt-expert-swap-interval) already adapts the resident set
+#  - Expert SWAPPING (--kt-expert-swap-transitions) already adapts the resident set
 #    at runtime from live insist/override counters. That is the same objective
 #    pursued continuously instead of frozen at capture time, so a static profile
 #    is redundant next to it, not merely stale.
@@ -142,9 +142,9 @@ NUMAN=$(numactl --hardware 2>/dev/null | awk '/^available:/{print $2}')
 PROFILE=${K3_PROFILE:-prod}
 case "$PROFILE" in
   prod)     ROUTING=(--kt-routing-margin 0.5 --kt-cold-only-cpu-experts
-                     --kt-expert-swap-interval 50 --kt-expert-swap-max 8) ;;
+                     --kt-expert-swap-transitions 5 --kt-expert-swap-max 8) ;;
   prod01)   ROUTING=(--kt-routing-margin 0.1 --kt-cold-only-cpu-experts
-                     --kt-expert-swap-interval 50 --kt-expert-swap-max 8) ;;
+                     --kt-expert-swap-transitions 5 --kt-expert-swap-max 8) ;;
   margin10) ROUTING=(--kt-routing-margin 10) ;;
   ceiling)  ROUTING=(--kt-routing-full-override) ;;
   bare)     ROUTING=() ;;

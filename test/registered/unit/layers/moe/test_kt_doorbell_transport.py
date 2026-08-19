@@ -354,7 +354,7 @@ class TestTransportConfigRails(CustomTestCase):
         args = self._args(
             kt_transport="doorbell",
             kt_routing_margin=0.5,
-            kt_expert_swap_interval=50,
+            kt_expert_swap_transitions=5,
             kt_expert_swap_max=8,
         )
         self.assertEqual(args.kt_transport, "doorbell")

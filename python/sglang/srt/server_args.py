@@ -3018,9 +3018,9 @@ class ServerArgs:
         "Skip a layer's CPU-expert branch device-side, via a CUDA conditional node, when no routed slot in the batch names a CPU-resident expert. Under margin routing a large share of layer-steps route entirely to GPU-resident experts; kt's inline-empty check already makes the poller cheap for those, but the GPU still pays the staging D2H, the round trip, the result H2D and the merge. Applies to captured decode graphs only -- an eager forward has no graph to splice a conditional into and runs the branch as before. Requires --kt-transport doorbell.",
         NS("exec.moe"),
     ] = False
-    kt_expert_swap_interval: A[
+    kt_expert_swap_transitions: A[
         int,
-        "Run an expert-swap window every N/10 prefill->decode transitions (0 disables). At the window the pipeline is briefly quiesced, high-demand offloaded experts are promoted into the GPU rows of low-use resident experts, and both sides of each pair are re-sourced from the checkpoint. Counted in transitions rather than seconds because every TP rank must reach the same decision -- a wall-clock gate lets ranks straddling the threshold disagree and diverge their expert membership. Does NOT require --kt-routing-margin: the demand it acts on is a function of the routed ids and the residency mask alone (SPEC-SWAP-DEMAND).",
+        "Run an expert-swap window every N prefill->decode transitions (0 disables). At the window the pipeline is briefly quiesced, high-demand offloaded experts are promoted into the GPU rows of low-use resident experts, and both sides of each pair are re-sourced from the checkpoint. Counted in transitions rather than seconds because every TP rank must reach the same decision -- a wall-clock gate lets ranks straddling the threshold disagree and diverge their expert membership. Does NOT require --kt-routing-margin: the demand it acts on is a function of the routed ids and the residency mask alone (SPEC-SWAP-DEMAND). Demand is sampled every 2N eager forwards so the EMA already carries history when the first window acts.",
         NS("exec.moe"),
     ] = 0
     kt_expert_swap_max: A[
@@ -7031,7 +7031,7 @@ class ServerArgs:
                 "SPEC-DOORBELL-TRANSPORT.md."
             )
 
-        # --kt-expert-swap-interval no longer requires --kt-routing-margin.
+        # --kt-expert-swap-transitions no longer requires --kt-routing-margin.
         # The swap policy reads demand (router asked for a non-resident expert)
         # and hits (asked for a resident one); both are functions of the routed
         # ids and the residency mask alone. Margin only decides how demand
@@ -7072,10 +7072,10 @@ class ServerArgs:
                     "raises mid-request; on the other layouts it silently "
                     "prefills from uninitialised memory. Drop one of them."
                 )
-            if self.kt_expert_swap_interval > 0:
+            if self.kt_expert_swap_transitions > 0:
                 raise ValueError(
                     "--kt-routing-full-override is incompatible with "
-                    "--kt-expert-swap-interval: no token can reach a CPU "
+                    "--kt-expert-swap-transitions: no token can reach a CPU "
                     "expert, so there is no demand signal to swap on, and the "
                     "swap window would call into kt-kernel for weights full "
                     "override never loaded (C++ 'Not Loaded'). Set the "

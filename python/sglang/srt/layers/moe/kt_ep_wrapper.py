@@ -208,7 +208,7 @@ class KTConfig:
     transport_pollers: int = 2
     conditional_cpu_branch: bool = False
     cold_only_cpu_experts: bool = False
-    expert_swap_interval: int = 0
+    expert_swap_transitions: int = 0
     expert_swap_max: int = 4
     expert_swap_hysteresis: float = 2.0
     split_prefill: bool = False
@@ -3791,7 +3791,7 @@ def create_kt_config_from_server_args(
         transport_pollers=server_args.kt_transport_pollers,
         conditional_cpu_branch=server_args.kt_conditional_cpu_branch,
         cold_only_cpu_experts=server_args.kt_cold_only_cpu_experts,
-        expert_swap_interval=server_args.kt_expert_swap_interval,
+        expert_swap_transitions=server_args.kt_expert_swap_transitions,
         expert_swap_max=server_args.kt_expert_swap_max,
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
         split_prefill=server_args.kt_expert_split_prefill,
@@ -4671,7 +4671,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Profiling put them at ~5.2% of decode GPU time, so "always on" is a
         # real price, not bookkeeping noise.
         self._counters_enabled = bool(
-            kt_config.expert_swap_interval > 0 or kt_config.routing_full_override
+            kt_config.expert_swap_transitions > 0 or kt_config.routing_full_override
         )
         self._cond_enabled = kt_config.conditional_cpu_branch
         self._cond_flag: Optional[torch.Tensor] = None
@@ -4893,7 +4893,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # exact routing + adaptive placement is now a legal configuration.
         # See SPEC-SWAP-DEMAND.md.
         if self._counters_enabled and (
-            self._margin is not None or self.kt_config.expert_swap_interval > 0
+            self._margin is not None or self.kt_config.expert_swap_transitions > 0
         ):
             # Demand the router asked for and we did NOT substitute away. With
             # margin unset nothing is ever substituted, so this holds all of it;
@@ -5060,7 +5060,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Swap driver registry: keep the layer with the method, since the
         # weight mover writes into the layer's resident parameter rows.
-        if self.kt_config.expert_swap_interval > 0 and self._margin is not None:
+        if self.kt_config.expert_swap_transitions > 0 and self._margin is not None:
             self._swap_layer = layer
             self._swap_policy = None  # built lazily, needs num_experts
             _KT_EP_METHODS.append(self)
@@ -6697,7 +6697,7 @@ def _kt_swap_tables(method) -> "object":
 # Phase-3 boundary state (SPEC-SWAP-DEMAND). Module-level for the same reason
 # _KT_SWAP_STATE is: the driver is a free function over the registered wrappers,
 # not a method on any one of them.
-# Act on one boundary in every interval/_KT_BOUNDARY_DIVISOR.
+# Act on one boundary in every `expert_swap_transitions`.
 #
 # MUST BE DETERMINISTIC ACROSS TP RANKS. Every rank runs its own scheduler
 # process and calls this independently, and all ranks hold the same resident
@@ -6708,7 +6708,6 @@ def _kt_swap_tables(method) -> "object":
 # transitions cannot, because every rank sees the same batches in the same
 # order. This is why the original gate counted eager forwards rather than
 # seconds, and the reason survives the move to the scheduler.
-_KT_BOUNDARY_DIVISOR = 10
 
 # How long a demotion will wait on the background disk prefetch before giving
 # up and reading the expert itself. Generous on purpose: the read is already in
@@ -6748,7 +6747,7 @@ def maybe_run_expert_swap_at_decode_boundary(is_decode: bool, is_extend: bool) -
         return
     anchor = _KT_EP_METHODS[0]
     cfg = anchor.kt_config
-    if cfg.expert_swap_interval <= 0:
+    if cfg.expert_swap_transitions <= 0:
         _KT_BOUNDARY_STATE["last_was_extend"] = is_extend
         return
 
@@ -6775,7 +6774,7 @@ def maybe_run_expert_swap_at_decode_boundary(is_decode: bool, is_extend: bool) -
     if crossed:
         _KT_BOUNDARY_STATE["transitions"] += 1
         n = _KT_BOUNDARY_STATE["transitions"]
-        every = max(1, cfg.expert_swap_interval // _KT_BOUNDARY_DIVISOR)
+        every = max(1, cfg.expert_swap_transitions)
         # Observe on every transition, act on every `every`-th, and never on
         # the first: a cumulative counter's first delta is the whole launch
         # history, so acting on it is acting on a baseline.
@@ -6847,7 +6846,7 @@ def maybe_run_expert_swap_window(
     # sample. Sampling at interval/5 means the EMA already has history when
     # the first window acts -- and a short run still swaps instead of doing
     # nothing at all, which is how three separate runs came back empty.
-    sample_every = max(1, cfg.expert_swap_interval // 5)
+    sample_every = max(1, 2 * cfg.expert_swap_transitions)
     if not force and n % sample_every:
         return
     # A boundary call has already decided WHETHER to act -- it fires once
@@ -6856,7 +6855,7 @@ def maybe_run_expert_swap_window(
     # still passes act=False for its first call, because a cumulative
     # counter's first delta is the whole launch history and acting on that
     # baseline is what the interval//5 sampling exists to prevent.
-    act = act if act is not None else (n % cfg.expert_swap_interval) == 0
+    act = act if act is not None else (n % cfg.expert_swap_transitions) == 0
 
     entries = []
     for method in _KT_EP_METHODS:

@@ -440,7 +440,7 @@ class Scheduler(
         self.enable_hisparse = server_args.enable_hisparse
         # Init-static: server args are frozen for the scheduler's lifetime, so
         # resolve this once rather than re-reading it on every run_batch.
-        self.enable_kt_expert_swap = bool(server_args.kt_expert_swap_interval)
+        self.enable_kt_expert_swap = bool(server_args.kt_expert_swap_transitions)
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
 
@@ -3546,7 +3546,7 @@ class Scheduler(
         Orchestration only: the scheduler contributes the one fact no layer can
         see -- that this batch is decode and the previous was extend -- and the
         policy, rate limit and transfers live in kt_ep_wrapper. Inert (a dict
-        lookup and a return) unless --kt-expert-swap-interval is set.
+        lookup and a return) unless --kt-expert-swap-transitions is set.
 
         It has to be here rather than in a layer's apply(): the window needs
         Python and a device sync, and under --kt-expert-split-prefill neither
