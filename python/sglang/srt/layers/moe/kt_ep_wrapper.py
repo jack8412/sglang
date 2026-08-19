@@ -7775,21 +7775,40 @@ class _GpuResidentExpertReader:
 
         Every row must still hold its DEMOTED occupant: call before any move.
         """
-        from sglang.srt.layers.moe.kt_mxfp4_export import unswizzle_trtllm_expert
+        from sglang.srt.layers.moe.kt_mxfp4_export import (
+            Mxfp4ExpertBytes,
+            apply_batched_unswizzle,
+        )
 
         inverse, w13_scale_shape, w2_scale_shape = self._prepare(layer)
         w13_n, w13_s_n, w2_n, w2_s_n = self.param_names
+        if not dst_rows:
+            return []
+        # ONE KERNEL PER TENSOR, not one per expert. This was a Python loop
+        # calling the per-expert unswizzle, and at 92 layers x
+        # --kt-expert-swap-max it measured 0.23 s of a 1.40 s swap window --
+        # the same per-expert-vs-per-batch gap the forward swizzle already
+        # closed. The returned rows are VIEWS into the batched result, so the
+        # caller's per-expert loop stays free.
+        dev = getattr(layer, w13_n).data.device
+        idx = torch.tensor(list(dst_rows), dtype=torch.long, device=dev)
+        b13, b13s, b2, b2s = apply_batched_unswizzle(
+            inverse=inverse,
+            w13=torch.index_select(getattr(layer, w13_n).data, 0, idx),
+            w13_scale=torch.index_select(getattr(layer, w13_s_n).data, 0, idx),
+            w2=torch.index_select(getattr(layer, w2_n).data, 0, idx),
+            w2_scale=torch.index_select(getattr(layer, w2_s_n).data, 0, idx),
+            w13_scale_shape=w13_scale_shape,
+            w2_scale_shape=w2_scale_shape,
+        )
         return [
-            unswizzle_trtllm_expert(
-                w13=getattr(layer, w13_n).data[r],
-                w13_scale=getattr(layer, w13_s_n).data[r],
-                w2=getattr(layer, w2_n).data[r],
-                w2_scale=getattr(layer, w2_s_n).data[r],
-                inverse=inverse,
-                w13_scale_shape=w13_scale_shape,
-                w2_scale_shape=w2_scale_shape,
+            Mxfp4ExpertBytes(
+                w13=b13[i],
+                w13_scale_e8m0=b13s[i],
+                w2=b2[i],
+                w2_scale_e8m0=b2s[i],
             )
-            for r in dst_rows
+            for i in range(len(dst_rows))
         ]
 
     def _gather_shards(self, shards, n_rows: int):
@@ -8138,13 +8157,12 @@ def finalize_split_prefill(server_args) -> bool:
     # _swizzle_promoted_rows wants exactly these shapes.
     _KT_SPLIT_PREFILL_STATE["raw_shapes"] = raw_shapes
     _KT_SPLIT_PREFILL_STATE["swizzle_inverse"] = None
+    # Unconditional: the arena hands back checkpoint layout, always, so the
+    # raw scale shapes always exist. This used to be gated on a `dynamic` flag
+    # that the deleted store/export branches set.
     _KT_SPLIT_PREFILL_STATE["raw_scale_shapes"] = (
-        None
-        if not dynamic
-        else (
-            tuple(raw_shapes["w13_weight_scale"][0]),
-            tuple(raw_shapes["w2_weight_scale"][0]),
-        )
+        tuple(raw_shapes["w13_weight_scale"][0]),
+        tuple(raw_shapes["w2_weight_scale"][0]),
     )
     for method, _ in _KT_SPLIT_PREFILL_LAYERS:
         method._cold_pipeline = pipeline

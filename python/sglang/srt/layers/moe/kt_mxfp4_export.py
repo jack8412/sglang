@@ -437,6 +437,54 @@ def trtllm_inverse_indices(
     )
 
 
+def apply_batched_unswizzle(
+    *,
+    inverse: "TrtllmInverseIndices",
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_scale_shape,
+    w2_scale_shape,
+) -> tuple:
+    """:func:`unswizzle_trtllm_expert` over a STACK of resident rows.
+
+    Same maps, same order, same bytes -- one kernel per tensor instead of one
+    per expert. The forward direction learned this lesson already
+    (:class:`TrtllmBatchedSwizzle`: ~52 us per expert against ~1.0 ms for a
+    whole layer, "same bytes, 14x apart"), and the demotion capture was still
+    paying the per-expert price: at 92 layers x --kt-expert-swap-max it was
+    measured at 0.23 s of a 1.40 s swap window.
+
+    Returns ``(w13, w13_scale_e8m0, w2, w2_scale_e8m0)``, each ``[n, ...]``
+    uint8 and contiguous, so a caller can slice row ``i`` as a view.
+
+    Bitwise-identical to looping the per-expert function -- asserted in
+    test_kt_mxfp4_export, because a wrong inverse here does not crash, it
+    writes right-shaped wrong bytes into kt's arena.
+    """
+    n = w13.shape[0]
+
+    def _rows(t, idx):
+        b = t.reshape(n, -1, t.shape[-1]).view(torch.uint8)
+        return torch.index_select(b, 1, idx).contiguous()
+
+    def _scales(t, unlace, idx, shape):
+        flat = t.reshape(n, -1).view(torch.uint8)
+        back = torch.empty_like(flat)
+        # out = in[src]  =>  in[src] = out, along the expert-major axis.
+        back.index_copy_(1, unlace, flat)
+        back = back.reshape((n,) + tuple(shape))
+        return torch.index_select(back, 1, idx).contiguous()
+
+    return (
+        _rows(w13, inverse.w13_weight),
+        _scales(w13_scale, inverse.w13_scale_unlace, inverse.w13_scale, w13_scale_shape),
+        _rows(w2, inverse.w2_weight),
+        _scales(w2_scale, inverse.w2_scale_unlace, inverse.w2_scale, w2_scale_shape),
+    )
+
+
 def unswizzle_trtllm_expert(
     *,
     w13: torch.Tensor,

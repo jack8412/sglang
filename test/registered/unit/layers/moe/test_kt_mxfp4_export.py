@@ -741,5 +741,61 @@ class TestPipelineLayoutDetection(CustomTestCase):
                     )
 
 
+class TestBatchedUnswizzleMatchesPerExpert(unittest.TestCase):
+    """The batched demotion inverse must equal the per-expert one, bitwise.
+
+    read_own_shards used to loop unswizzle_trtllm_expert once per expert and
+    that cost 0.23 s of a 1.40 s swap window at 92 layers x swap-max 32. The
+    batched form is one kernel per tensor instead. A wrong inverse does not
+    crash here -- it writes right-shaped wrong bytes into kt's arena and the
+    demoted expert computes garbage -- so equality is asserted, not argued.
+    """
+
+    def test_bitwise_equal_to_the_per_expert_loop(self):
+        import torch
+
+        from sglang.srt.layers.moe.kt_mxfp4_export import (
+            TrtllmInverseIndices,
+            apply_batched_unswizzle,
+            unswizzle_trtllm_expert,
+        )
+
+        torch.manual_seed(0)
+        n, rows, cols, srows, scols = 5, 64, 32, 64, 8
+        shape = (srows, scols)
+        perm = lambda k: torch.randperm(k, dtype=torch.long)
+        inv = TrtllmInverseIndices(
+            w13_weight=perm(rows),
+            w13_scale=perm(srows),
+            w2_weight=perm(rows),
+            w2_scale=perm(srows),
+            w13_scale_unlace=perm(srows * scols),
+            w2_scale_unlace=perm(srows * scols),
+        )
+        mk = lambda *sh: torch.randint(0, 255, sh, dtype=torch.uint8)
+        r13, r13s = mk(n, rows, cols), mk(n, srows, scols)
+        r2, r2s = mk(n, rows, cols), mk(n, srows, scols)
+
+        ref = [
+            unswizzle_trtllm_expert(
+                w13=r13[i], w13_scale=r13s[i], w2=r2[i], w2_scale=r2s[i],
+                inverse=inv, w13_scale_shape=shape, w2_scale_shape=shape,
+            )
+            for i in range(n)
+        ]
+        got = apply_batched_unswizzle(
+            inverse=inv, w13=r13, w13_scale=r13s, w2=r2, w2_scale=r2s,
+            w13_scale_shape=shape, w2_scale_shape=shape,
+        )
+        for i in range(n):
+            for j, want in enumerate(
+                (ref[i].w13, ref[i].w13_scale_e8m0, ref[i].w2, ref[i].w2_scale_e8m0)
+            ):
+                a = got[j][i].reshape(-1)
+                b = want.reshape(-1).view(torch.uint8)
+                self.assertEqual(a.shape, b.shape)
+                self.assertTrue(torch.equal(a, b), f"expert {i} tensor {j}")
+
+
 if __name__ == "__main__":
     unittest.main()
