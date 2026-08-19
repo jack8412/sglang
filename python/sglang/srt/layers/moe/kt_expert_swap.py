@@ -553,10 +553,18 @@ def run_swap_window(
                         skipped += 1
                         continue
             for s, row in zip(swaps, rows):
+                # EXCLUSIVE of stage_s, which move_weights accumulates from
+                # inside this very call -- the same relationship finish_s has
+                # with flush_gpu_s. Counting both made the phases sum to MORE
+                # than the window: a 11,614-swap window reported "-0.13s
+                # unattributed", which is how the overlap was noticed.
                 _t = time.perf_counter()
+                _st0 = phase_timing["stage_s"] if phase_timing is not None else 0.0
                 move_weights(entry["layer"], row, s.promote, s.demote)
                 if phase_timing is not None:
-                    phase_timing["move_s"] += time.perf_counter() - _t
+                    phase_timing["move_s"] += (time.perf_counter() - _t) - (
+                        phase_timing["stage_s"] - _st0
+                    )
                 if install_cpu_expert is not None:
                     # BEFORE the tables flip: the demoted expert must not be
                     # routable on the CPU until its weights are actually
