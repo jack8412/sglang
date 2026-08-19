@@ -572,19 +572,17 @@ def run_swap_window(
                             f"{entry.get('layer_idx')}"
                         ) from exc
             if finish_layer is not None:
-                # EXCLUSIVE of flush_gpu_s/flush_store_s, which the flush hook
-                # accumulates from inside this very call. What remains is the
-                # unswizzle and the bookkeeping around them -- the part no
-                # other span covers.
+                # EXCLUSIVE of flush_gpu_s, which the flush hook accumulates
+                # from inside this very call. What remains is the bookkeeping
+                # around it -- the part no other span covers. (There used to be
+                # a flush_store_s term here too, for the cold store's write-back
+                # of demoted rows; the store is gone and so is the write-back.)
                 _t = time.perf_counter()
                 _g0 = phase_timing["flush_gpu_s"] if phase_timing is not None else 0.0
-                _s0 = phase_timing["flush_store_s"] if phase_timing is not None else 0.0
                 finish_layer()
                 if phase_timing is not None:
-                    phase_timing["finish_s"] += (
-                        (time.perf_counter() - _t)
-                        - (phase_timing["flush_gpu_s"] - _g0)
-                        - (phase_timing["flush_store_s"] - _s0)
+                    phase_timing["finish_s"] += (time.perf_counter() - _t) - (
+                        phase_timing["flush_gpu_s"] - _g0
                     )
             _t = time.perf_counter()
             apply_swaps_to_tables(tables, swaps)
