@@ -6916,6 +6916,12 @@ def maybe_run_expert_swap_window(
         "apply_s": 0.0,       # apply_swaps_to_tables (4 tables + 3 H2D)
         "tables_s": 0.0,      # assert_tables_consistent
         "after_s": 0.0,       # after_flip bookkeeping
+        # THE RESIDUE, split out. These three were inside the window timer and
+        # outside every span, and together they were a third of the window.
+        # None is swap work: they are what the window WAITS on.
+        "arm_s": 0.0,         # the rank-write arming all_reduce (rank skew)
+        "quiesce_s": 0.0,     # torch.cuda.synchronize: drain the in-flight fwd
+        "barrier_s": 0.0,     # the end-of-window barrier (rank skew again)
     }
     _window_t0 = time.perf_counter()
 
@@ -6933,9 +6939,11 @@ def maybe_run_expert_swap_window(
     # (entries and act are plan data), and every later branch keys off the
     # result instead: the barrier, the per-layer capture, and the install.
     _rank_writer = _get_or_create_rank_writer(entries[0])
+    _t_arm = time.perf_counter()
     _KT_SWAP_STATE["rank_write_armed"] = _all_tp_ranks_succeeded(
         _rank_writer is not None
     )
+    _timing["arm_s"] += time.perf_counter() - _t_arm
     if _rank_writer is not None and not _KT_SWAP_STATE["rank_write_armed"]:
         logger.error(
             "[kt-rankwrite] disarmed for this window: another rank has no "
@@ -7568,6 +7576,15 @@ def maybe_run_expert_swap_window(
     # transport's provisional page pins. Both hooks are optional, so with that
     # transport gone they are not replaced by no-ops -- there is nothing left
     # to reconcile: the arena sources pin nothing per swap.
+    def _timed_quiesce():
+        # A full device sync: it drains whatever forward was in flight at the
+        # decode boundary. Timed because it sits inside the window and is not
+        # swap work -- charging it to the swap made the window look worse than
+        # it is.
+        _t = time.perf_counter()
+        torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device)
+        _timing["quiesce_s"] += time.perf_counter() - _t
+
     try:
         result = run_swap_window(
             entries,
@@ -7576,7 +7593,7 @@ def maybe_run_expert_swap_window(
             begin_layer=_begin_layer,
             finish_layer=_flush_moves,
             phase_timing=_timing,
-            quiesce=lambda: torch.cuda.synchronize(anchor.gpu_experts_mask_cuda.device),
+            quiesce=_timed_quiesce,
         )
     finally:
         # Drain the last layer. In a finally because staged items surviving a
@@ -7596,7 +7613,9 @@ def maybe_run_expert_swap_window(
         _rw = _KT_SWAP_STATE.get("rank_writer")
         if _KT_SWAP_STATE.get("rank_write_armed"):
             if dist.is_initialized() and get_parallel().tp_size > 1:
+                _t_bar = time.perf_counter()
                 dist.barrier(group=get_tp_group().cpu_group)
+                _timing["barrier_s"] += time.perf_counter() - _t_bar
         if _rw is not None:
             # After the barrier, so every rank's slice is in: this is the only
             # point where an expert this path built is complete and readable.
@@ -7645,7 +7664,7 @@ def maybe_run_expert_swap_window(
         _phases = (
             "select_s", "rows_s", "begin_s", "move_s", "stage_s",
             "flush_gpu_s", "finish_s", "apply_s",
-            "tables_s", "after_s",
+            "tables_s", "after_s", "arm_s", "quiesce_s", "barrier_s",
         )
         _attributed = sum(_timing[k] for k in _phases)
         logger.info(
