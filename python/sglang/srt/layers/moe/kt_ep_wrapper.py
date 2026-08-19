@@ -7083,23 +7083,35 @@ def maybe_run_expert_swap_window(
         # shape. Rows beyond len(items) hold stale bytes and are simply not
         # scattered -- swizzling a few unused rows costs microseconds against
         # milliseconds per allocator miss.
-        _sbufs = _pending.setdefault("stack_bufs", {})
-        _cap = _pending.setdefault("stack_cap", 0)
-        if _cap < len(items):
-            _cap = len(items)
-            _pending["stack_cap"] = _cap
-            _sbufs.clear()
-        for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
-            src0 = items[0]["promoted"][name]
-            buf = _sbufs.get(name)
-            if buf is None or buf.shape[0] != _cap:
-                buf = torch.empty(
-                    (_cap,) + tuple(src0.shape), dtype=src0.dtype, device=dev
-                )
-                _sbufs[name] = buf
-            for i, it in enumerate(items):
-                buf[i].copy_(it["promoted"][name], non_blocking=True)
-        promoted = {n: _sbufs[n] for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES}
+        _bat = _KT_SWAP_STATE.get("batch_bufs")
+        if arena_batch and _bat is not None:
+            # The DMA already wrote row i of every buffer; nothing to gather.
+            promoted = _bat
+        else:
+            # Store / export path: the bytes are host or store tensors, so they
+            # still have to be brought together. Use the same run-scoped pool at
+            # the same constant width so the shape the swizzle sees never
+            # changes, and only the live prefix is scattered later.
+            src0 = items[0]["promoted"][_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]]
+            _cap = max(len(items), 1 if _bat is None else _bat[
+                _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]
+            ].shape[0])
+            if _bat is None or _bat[
+                _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]
+            ].shape[0] != _cap:
+                _bat = {
+                    n: torch.empty(
+                        (_cap,) + tuple(items[0]["promoted"][n].shape),
+                        dtype=items[0]["promoted"][n].dtype,
+                        device=dev,
+                    )
+                    for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+                }
+                _KT_SWAP_STATE["batch_bufs"] = _bat
+            for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
+                for i, it in enumerate(items):
+                    _bat[name][i].copy_(it["promoted"][name], non_blocking=True)
+            promoted = _bat
         if arena_batch or (store is not None and getattr(store, "raw_layout", False)):
             # The source holds checkpoint-layout bytes (raw store or arena
             # mapping alike), so the resident row's trtllm layout is produced
@@ -7249,18 +7261,34 @@ def maybe_run_expert_swap_window(
             # while the copies themselves are 0.075 ms of it. The buffers are
             # identical in shape for every expert, so one set per slot serves
             # the whole run.
-            _pool = _pending.setdefault("dma_bufs", [])
+            # DMA STRAIGHT INTO THE BATCH ROW. This used to land in a separate
+            # per-slot buffer that _flush_moves then copied into the batch --
+            # two device buffers and a full D2D copy of every promoted expert,
+            # for no reason beyond the two pools having been added at different
+            # times. The batch row is contiguous and exactly the landing shape,
+            # so the copy engine can write it directly.
+            #
+            # RUN-SCOPED, not per window: _pending is local to this function, so
+            # a pool kept there is rebuilt on every window. The shapes depend
+            # only on the swap budget and the layer geometry, both fixed for the
+            # process, so one set serves the whole run.
+            _cap = max(1, cfg.expert_swap_max)
+            _bat = _KT_SWAP_STATE.get("batch_bufs")
+            if _bat is None or _bat[_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]].shape[0] != _cap:
+                _bat = {
+                    n: torch.empty(
+                        (_cap,) + tuple(_raw[n][0]), dtype=_raw[n][1], device=_dev
+                    )
+                    for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+                }
+                _KT_SWAP_STATE["batch_bufs"] = _bat
             _k = len(_pending["items"])
-            while len(_pool) <= _k:
-                _pool.append(
-                    {
-                        n: torch.empty(
-                            tuple(_raw[n][0]), dtype=_raw[n][1], device=_dev
-                        )
-                        for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
-                    }
+            if _k >= _cap:
+                raise RuntimeError(
+                    f"swap batch overflow: {_k + 1} promotions in one layer "
+                    f"against --kt-expert-swap-max {cfg.expert_swap_max}"
                 )
-            _staged_row = _pool[_k]
+            _staged_row = {n: _bat[n][_k] for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES}
             _rw._dma.read(
                 layer_idx=layer_idx,
                 row=_row,
@@ -8941,7 +8969,10 @@ def _swizzle_promoted_rows(promoted):
     back as bytes. Doing the transform on device instead touches no CPU at all
     and reuses the same four-gather form split prefill uses.
     """
-    from sglang.srt.layers.moe.kt_mxfp4_export import apply_batched_swizzle
+    from sglang.srt.layers.moe.kt_mxfp4_export import (
+        apply_batched_swizzle,
+        swizzle_out_buffers,
+    )
 
     plan = _KT_SPLIT_PREFILL_STATE.get("swizzle_plan")
     if plan is None:
@@ -8950,7 +8981,23 @@ def _swizzle_promoted_rows(promoted):
             "to a resident row without one"
         )
     names = _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
+    # Reuse the gather destinations across layers. Their shape is fixed by the
+    # plan and the batch width, and the batch is now processed at a constant
+    # width, so one set serves every layer of every window. Without this the
+    # four gathers allocate on each call -- the other half of the per-layer
+    # allocation cost that the fixed-width batch addressed.
+    _swz = _KT_SWAP_STATE.get("swizzle_out")
+    if _swz is None or _swz[0].shape[0] != promoted[names[0]].shape[0]:
+        _swz = swizzle_out_buffers(
+            plan=plan,
+            raw_w13=promoted[names[0]],
+            raw_w13_scale=promoted[names[1]],
+            raw_w2=promoted[names[2]],
+            raw_w2_scale=promoted[names[3]],
+        )
+        _KT_SWAP_STATE["swizzle_out"] = _swz
     out = apply_batched_swizzle(
+        out=_swz,
         plan=plan,
         raw_w13=promoted[names[0]],
         raw_w13_scale=promoted[names[1]],

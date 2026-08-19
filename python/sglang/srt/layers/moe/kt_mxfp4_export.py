@@ -271,7 +271,7 @@ def trtllm_batched_swizzle(
     )
 
 
-def apply_batched_swizzle(
+def swizzle_out_buffers(
     *,
     plan: TrtllmBatchedSwizzle,
     raw_w13: torch.Tensor,
@@ -279,24 +279,78 @@ def apply_batched_swizzle(
     raw_w2: torch.Tensor,
     raw_w2_scale: torch.Tensor,
 ) -> tuple:
+    """Destination buffers for :func:`apply_batched_swizzle`'s ``out``.
+
+    Shapes are fixed by the plan and the raw stack, so a caller that swizzles
+    the same width every time can allocate these once and stop touching the
+    allocator on the hot path. Returned in gather order -- w13, w13_scale, w2,
+    w2_scale -- which is the order ``out`` is consumed in, NOT WEIGHT_NAMES
+    order (that is what the return value is arranged in).
+    """
+    e = raw_w13.shape[0]
+    b13 = raw_w13.view(torch.uint8)
+    b2 = raw_w2.view(torch.uint8)
+    dev = b13.device
+    return (
+        torch.empty(
+            (e, plan.w13_rows.numel(), b13.shape[2]), dtype=torch.uint8, device=dev
+        ),
+        torch.empty((e, plan.w13_scale_map.numel()), dtype=torch.uint8, device=dev),
+        torch.empty(
+            (e, plan.w2_rows.numel(), b2.shape[2]), dtype=torch.uint8, device=dev
+        ),
+        torch.empty((e, plan.w2_scale_map.numel()), dtype=torch.uint8, device=dev),
+    )
+
+
+def apply_batched_swizzle(
+    *,
+    plan: TrtllmBatchedSwizzle,
+    raw_w13: torch.Tensor,
+    raw_w13_scale: torch.Tensor,
+    raw_w2: torch.Tensor,
+    raw_w2_scale: torch.Tensor,
+    out: Optional[Sequence[torch.Tensor]] = None,
+) -> tuple:
     """Swizzle ``[num_experts, ...]`` raw stacks. Four gathers, no per-expert loop.
 
     Returns tensors shaped like the resident device buffers the MoE kernel
     reads, in ``WEIGHT_NAMES`` order.
+
+    ``out`` takes the four destination buffers from :func:`swizzle_out_buffers`
+    and writes the gathers into them instead of allocating. Advanced indexing
+    allocates its result, so on a caller that runs this per layer those four
+    tensors are four fresh device allocations every time -- and when their width
+    varies the caching allocator cannot reuse the blocks, so each miss costs a
+    free/synchronize. index_select(..., out=) is the same gather without that.
+    Passing None keeps the allocating form, which is what a caller with a
+    constant width and a warm cache already gets for free.
     """
     e = raw_w13.shape[0]
-    w13 = raw_w13.view(torch.uint8)[:, plan.w13_rows, :].contiguous()
-    w2 = raw_w2.view(torch.uint8)[:, plan.w2_rows, :].contiguous()
-    w13_scale = (
-        raw_w13_scale.reshape(e, -1).view(torch.uint8)[:, plan.w13_scale_map]
-        .reshape((e,) + plan.w13_scale_out_shape)
-        .contiguous()
-    )
-    w2_scale = (
-        raw_w2_scale.reshape(e, -1).view(torch.uint8)[:, plan.w2_scale_map]
-        .reshape((e,) + plan.w2_scale_out_shape)
-        .contiguous()
-    )
+    b13 = raw_w13.view(torch.uint8)
+    b2 = raw_w2.view(torch.uint8)
+    s13 = raw_w13_scale.reshape(e, -1).view(torch.uint8)
+    s2 = raw_w2_scale.reshape(e, -1).view(torch.uint8)
+
+    if out is None:
+        w13 = b13[:, plan.w13_rows, :].contiguous()
+        w2 = b2[:, plan.w2_rows, :].contiguous()
+        w13_scale = s13[:, plan.w13_scale_map]
+        w2_scale = s2[:, plan.w2_scale_map]
+    else:
+        o13, o13s, o2, o2s = out
+        # index_select validates the destination shape and raises on a
+        # mismatch, which is the failure this wants: a stale buffer from a
+        # different expert count must not be written into silently.
+        w13 = torch.index_select(b13, 1, plan.w13_rows, out=o13)
+        w2 = torch.index_select(b2, 1, plan.w2_rows, out=o2)
+        w13_scale = torch.index_select(s13, 1, plan.w13_scale_map, out=o13s)
+        w2_scale = torch.index_select(s2, 1, plan.w2_scale_map, out=o2s)
+
+    # Reshapes below are views on contiguous gathers, so they allocate nothing
+    # in either branch.
+    w13_scale = w13_scale.reshape((e,) + plan.w13_scale_out_shape)
+    w2_scale = w2_scale.reshape((e,) + plan.w2_scale_out_shape)
     return w13, w13_scale, w2, w2_scale
 
 
