@@ -133,10 +133,14 @@ KTPOOLS=8
 #
 # so, per node:  threads_per_pool = (cores - ranks - pollers - 2) / pools
 #
-#   gpusrv    (96/2):  (48 - 4 - 2 - 2) / 4 = 10  ->  80
-#   ai.v8.pro (144/6): (24 - 2 - 2 - 2) / 2 =  9  ->  72   (was 96 = 24/node,
-#                      i.e. exactly the node's cores with nothing left for the
-#                      two schedulers pinned there)
+#   gpusrv    (96/2):  (48 - 4 - 2) / 4 = 10  ->  80
+#   ai.v8.pro (144/6): (24 - 2 - 2) / 2 = 10  ->  80   (was 96 = 24 threads on a
+#                      24-core node, i.e. the whole node with nothing left for
+#                      the two schedulers pinned there)
+#
+# Both hosts land on 10 threads per pool, which is worth having deliberately:
+# it removes one variable when comparing a measurement taken on one against
+# the other.
 #
 # Erring low is free: the cpuinfer sweep at 48/81/96/144 is FLAT on AMX, where
 # CPU expert compute stopped being the bottleneck. Cores left to the schedulers
@@ -144,7 +148,7 @@ KTPOOLS=8
 POLLERS=2
 CORES_PER_NODE=$(( PHYS / NUMAN ))
 POOLS_PER_NODE=$(( (KTPOOLS + NUMAN - 1) / NUMAN ))
-RESERVE=$(( POOLS_PER_NODE + POLLERS + 2 ))
+RESERVE=$(( POOLS_PER_NODE + POLLERS ))
 PER_POOL=$(( (CORES_PER_NODE - RESERVE) / POOLS_PER_NODE ))
 [ "$PER_POOL" -ge 1 ] || PER_POOL=1
 CPUINF=$(( PER_POOL * KTPOOLS ))
