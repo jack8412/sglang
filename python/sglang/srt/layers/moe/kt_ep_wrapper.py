@@ -8334,6 +8334,18 @@ def _try_build_direct_dma(
         return None, None, None
 
 
+class DirectDmaArmFailed(RuntimeError):
+    """--kt-cold-transport direct-dma was asked for and could not be armed.
+
+    Fatal on purpose. Falling back to ring-export serves a DIFFERENT transport
+    under the name of the one that was requested: the run boots, produces
+    plausible throughput, and every number taken from it is attributed to
+    direct-dma. The partial rollback is also not free -- ranks that fail
+    unregister and continue while the rest wait, which has already deadlocked
+    a boot rather than degrading it.
+    """
+
+
 def finalize_split_prefill(server_args) -> bool:
     """Build the cold-expert store and prefetch pipeline, then arm every layer.
 
@@ -8444,20 +8456,18 @@ def finalize_split_prefill(server_args) -> bool:
                 cold_slot_expert_ids=cold_slot_expert_ids,
                 arena_source_for=arena_source_for,
             )
-            use_direct = _all_tp_ranks_succeeded(direct_source is not None)
-            if not use_direct and direct_source is not None:
-                logger.error(
-                    "[kt-dma] disarmed: another rank failed to build; every "
-                    "rank falls back to the ring-export transport"
-                )
+            _mine_ok = direct_source is not None
+            use_direct = _all_tp_ranks_succeeded(_mine_ok)
             if not use_direct:
-                if direct_source is not None:
-                    try:
-                        direct_source.close()
-                    except Exception:
-                        logger.exception("[kt-dma] teardown on disarm failed")
-                direct_source = None
-                raw_shapes = swizzle_plan = None
+                raise DirectDmaArmFailed(
+                    "--kt-cold-transport direct-dma could not arm "
+                    f"(this rank built: {_mine_ok}); refusing to fall back to "
+                    "ring-export. If the log shows cudaHostRegister rc=2, the "
+                    "cause is host memory, not the transport: direct-dma "
+                    "excludes --kt-cold-only-cpu-experts, so kt keeps ALL "
+                    "experts resident and its memfd arenas are ~3.3x the "
+                    "cold-only footprint, leaving too little to pin."
+                )
             else:
                 source = direct_source
                 dynamic = True
@@ -8649,11 +8659,15 @@ def finalize_split_prefill(server_args) -> bool:
             swizzle_plan=swizzle_plan,
             raw_shapes=raw_shapes,
         )
-    except Exception:
-        logger.exception(
-            "[split-prefill] build failed; falling back to the margin-routed "
-            "CPU path for every layer"
-        )
+    except Exception as _build_exc:
+        _fatal = isinstance(_build_exc, DirectDmaArmFailed)
+        if _fatal:
+            logger.error("[split-prefill] %s", _build_exc)
+        else:
+            logger.exception(
+                "[split-prefill] build failed; falling back to the margin-routed "
+                "CPU path for every layer"
+            )
         # Release what the failed build already owns -- most importantly the
         # direct source's registrar (pinned pages + VRAM page tables), which
         # has no finalizer and would otherwise leak until process exit.
@@ -8664,6 +8678,10 @@ def finalize_split_prefill(server_args) -> bool:
                 except Exception:
                     logger.exception("[split-prefill] teardown after failed build")
         store = source = pipeline = export_source = direct_source = None
+        if _fatal:
+            # Teardown is done; now stop the boot instead of serving a
+            # transport nobody asked for.
+            raise
 
     # Arming is all-or-nothing ACROSS RANKS. The hot gate is rank-local, and a
     # split rank set is silent corruption, not a crash: armed ranks contribute
