@@ -318,12 +318,38 @@ class TestTransportConfigRails(CustomTestCase):
     or hangs at serving time, so it is refused where the operator can still
     read the reason."""
 
+    # Defaults for the fields _handle_kt reads. Full ServerArgs construction is
+    # deliberately avoided: it resolves model_path, and "/dummy" is not a real
+    # checkpoint, so every test in this class died on
+    #   OSError: Repo id must use alphanumeric chars ... '/dummy'
+    # before reaching the rail under test. The rails live in _handle_kt, so
+    # drive that directly and keep the class independent of any checkpoint.
+    _KT_DEFAULTS = dict(
+        model_path="/dummy",
+        kt_weight_path="/dummy",
+        kt_method="MXFP4",
+        kt_transport="hostnode",
+        kt_gpu_experts_ratio=None,
+        kt_num_gpu_experts=0,
+        kt_routing_margin=None,
+        kt_gpu_prefill_token_threshold=None,
+        kt_max_deferred_experts_per_token=None,
+        kt_cold_only_cpu_experts=False,
+        kt_cold_transport="ring-export",
+        kt_expert_swap_transitions=0,
+        kt_expert_swap_max=0,
+        kt_routing_full_override=False,
+        enable_pdmux=False,
+    )
+
     def _args(self, **kw):
         from sglang.srt.server_args import ServerArgs
 
-        base = dict(model_path="/dummy", kt_weight_path="/dummy", kt_method="MXFP4")
-        base.update(kw)
-        return ServerArgs(**base)
+        args = ServerArgs.__new__(ServerArgs)
+        for name, value in {**self._KT_DEFAULTS, **kw}.items():
+            setattr(args, name, value)
+        args._handle_kt()
+        return args
 
     def test_pdmux_is_refused(self):
         # One global ring word is only safe while at most one doorbell is
