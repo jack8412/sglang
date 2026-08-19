@@ -1395,8 +1395,6 @@ class Envs:
     # collective, no disk, ~1.6 GB per rank in parallel. Requires
     # KT_BUFFER_B_MEMFD=1 and cold-only residency (with full kt residency a
     # demotion is already a nop). Falls back per layer to the checkpoint path.
-    SGLANG_KT_DEMOTION_RANK_WRITE = EnvBool(False)
-    SGLANG_KT_DEMOTION_DIRECT_DMA = EnvBool(False)
     # Hold the split-prefill cold store in CHECKPOINT layout and swizzle each
     # layer on device as it is prefetched, instead of storing pre-swizzled
     # bytes. Costs ~1.0 ms per layer (~+4.4% of the ~2.07 s/forward copy floor)

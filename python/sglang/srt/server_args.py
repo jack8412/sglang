@@ -3043,6 +3043,11 @@ class ServerArgs:
         "During prefill, compute EVERY expert on GPU by evaluating the resident and CPU-resident sets as two disjoint expert slices and merging the deferred-finalize partials. Quality-identical to a full-expert model (no routing substitution), unlike --kt-routing-margin / --kt-routing-full-override. Cold-expert weights are held in a pinned host cache and streamed one layer ahead. Decode is unaffected.",
         NS("exec.moe"),
     ] = False
+    kt_cold_transport: A[
+        Literal["cpu", "arena-dma"],
+        "How --kt-expert-split-prefill gets each layer's CPU-resident ('cold') expert weights onto the GPUs. 'cpu' (default): no streaming -- prefill falls back to the margin-routed CPU path. 'arena-dma': every rank's copy engine reads the weights IN PLACE out of kt's memfd arenas, six pitched copies per layer, one DRAM transit, no staging buffer and no pinned host copy. arena-dma REQUIRES --kt-cold-only-cpu-experts (kt must hold only the cold set; at full residency its arenas are ~3.3x larger and there is nothing left to pin) and sets KT_BUFFER_B_MEMFD=1 for kt. It replaces the SGLANG_KT_DEMOTION_DIRECT_DMA and SGLANG_KT_DEMOTION_RANK_WRITE environment variables, which selected the same transport by a different name.",
+        NS("exec.moe"),
+    ] = "cpu"
     kt_expert_split_prefill_token_tile: A[
         int,
         "Run the --kt-expert-split-prefill MoE in token tiles of this many tokens (0 = the whole chunk in one call). A token's MoE output depends only on its own row, so tiling changes no value, but the two large transients -- the gemm2 buffer the kernel sizes for ALL T*top_k slots, and the fp32 finalize accumulator -- then scale with the tile instead of the chunk. Measured at a 49152 chunk: 7.01 GiB peak untiled vs 2.94 GiB at a 16384 tile, for ~7% more MoE time (~1.3% of the forward). This is what lets a large prefill chunk coexist with a long-context KV pool. Ignored unless --kt-expert-split-prefill is set.",
@@ -6913,6 +6918,36 @@ class ServerArgs:
                 f"--kt-routing-margin must be a number >= 0.0 (0.0 = "
                 f"count-only), got {self.kt_routing_margin}."
             )
+
+        if self.kt_cold_transport == "arena-dma":
+            if not self.kt_cold_only_cpu_experts:
+                raise ValueError(
+                    "--kt-cold-transport arena-dma requires "
+                    "--kt-cold-only-cpu-experts. The transport reads kt's "
+                    "memfd arenas in place, and at full residency kt holds "
+                    "all experts (~3.3x the arena bytes), which is what "
+                    "exhausts pinnable host memory."
+                )
+            if not self.kt_expert_split_prefill:
+                raise ValueError(
+                    "--kt-cold-transport arena-dma has no effect without "
+                    "--kt-expert-split-prefill: it exists to stream the cold "
+                    "expert set that split prefill computes."
+                )
+            # KT_BUFFER_B_MEMFD is kt's OWN gate, read by its C++ (moe_base.hpp)
+            # and by kt_arena_share, so it stays an env var per the env-var
+            # conventions -- but the operator should not have to know that.
+            # Setting it here is what makes the flag sufficient on its own.
+            # Assumption: post-init runs in the parent before the scheduler
+            # subprocesses are spawned and they inherit os.environ. True for
+            # the current spawn path; if that ever changes this becomes a
+            # silent fallback to the CPU path, which the arming log would show.
+            if os.environ.get("KT_BUFFER_B_MEMFD") in (None, "", "0"):
+                os.environ["KT_BUFFER_B_MEMFD"] = "1"
+                logger.info(
+                    "[kt] --kt-cold-transport arena-dma: set "
+                    "KT_BUFFER_B_MEMFD=1 for kt"
+                )
 
         if self.kt_gpu_prefill_token_threshold and self.kt_routing_margin is not None:
             # The full-GPU sweep predates margin routing and is strictly worse

@@ -208,6 +208,7 @@ class KTConfig:
     transport_pollers: int = 2
     conditional_cpu_branch: bool = False
     cold_only_cpu_experts: bool = False
+    cold_transport: str = "cpu"
     expert_swap_transitions: int = 0
     expert_swap_max: int = 4
     expert_swap_hysteresis: float = 2.0
@@ -3772,6 +3773,7 @@ def create_kt_config_from_server_args(
         transport_pollers=server_args.kt_transport_pollers,
         conditional_cpu_branch=server_args.kt_conditional_cpu_branch,
         cold_only_cpu_experts=server_args.kt_cold_only_cpu_experts,
+        cold_transport=server_args.kt_cold_transport,
         expert_swap_transitions=server_args.kt_expert_swap_transitions,
         expert_swap_max=server_args.kt_expert_swap_max,
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
@@ -8050,19 +8052,13 @@ def finalize_split_prefill(server_args) -> bool:
         num_cold = anchor.global_num_experts - num_gpu
 
         _dma_writer = None
-        if (
-            envs.SGLANG_KT_DEMOTION_DIRECT_DMA.get()
-            and envs.SGLANG_KT_DEMOTION_RANK_WRITE.get()
-            and anchor.kt_config.cold_only_cpu_experts
-        ):
+        if anchor.kt_config.cold_transport == "arena-dma":
             _dma_writer = _get_or_create_rank_writer({"method": anchor})
         if _dma_writer is None or getattr(_dma_writer, "_dma", None) is None:
             raise RuntimeError(
-                "split prefill has no cold source. The arena DMA transport "
-                "needs all of: --kt-cold-only-cpu-experts, KT_BUFFER_B_MEMFD=1, "
-                "SGLANG_KT_DEMOTION_DIRECT_DMA=1 and "
-                "SGLANG_KT_DEMOTION_RANK_WRITE=1. Read the [kt-rankwrite] and "
-                "[kt] KT_BUFFER_B_MEMFD lines above to see which did not arm."
+                "split prefill has no cold source: --kt-cold-transport "
+                "arena-dma did not arm. Read the [kt-rankwrite] and "
+                "[kt] KT_BUFFER_B_MEMFD lines above to see why."
             )
 
         raw_shapes, swizzle_plan = _build_dynamic_swizzle_plan(anchor, device)
@@ -8615,9 +8611,8 @@ def _get_or_create_rank_writer(entry):
     try:
         method = entry.get("method")
         if (
-            envs.SGLANG_KT_DEMOTION_RANK_WRITE.get()
-            and method is not None
-            and method.kt_config.cold_only_cpu_experts
+            method is not None
+            and method.kt_config.cold_transport == "arena-dma"
         ):
             from sglang.srt.layers.moe.kt_arena_share import (
                 arena_write_source_for,
@@ -8658,7 +8653,7 @@ def _get_or_create_rank_writer(entry):
             geom = ArenaExpertRanges(next(iter(sources.values())))
             arenas = {li: s._arenas[geom.part] for li, s in sources.items()}
             dma = None
-            if envs.SGLANG_KT_DEMOTION_DIRECT_DMA.get():
+            if method.kt_config.cold_transport == "arena-dma":
                 # One registration per (layer, partition) MAPPING -- 92 of
                 # ~2275 MiB, not the 150,144 per-expert ranges that made the
                 # direct-DMA transport fail with rc=2. Cost is per page, so
@@ -8699,7 +8694,7 @@ def _get_or_create_rank_writer(entry):
                 except Exception:
                     logger.exception(
                         "[kt-rankwrite] direct DMA was requested "
-                        "(SGLANG_KT_DEMOTION_DIRECT_DMA=1) and could not arm; "
+                        "(--kt-cold-transport arena-dma) and could not arm; "
                         "check `ulimit -l` -- cudaHostRegister is charged "
                         "against RLIMIT_MEMLOCK"
                     )

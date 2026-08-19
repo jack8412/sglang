@@ -407,7 +407,7 @@ def _receive_layer(*, method, layer_idx: int, tp_rank: int, tp_size: int) -> Non
         # construction. (The deleted direct-dma transport was the other reason
         # this could be writable; rank-write is now the only one.)
         prot = mmap.PROT_READ
-        if envs.SGLANG_KT_DEMOTION_RANK_WRITE.get():
+        if method.kt_config.cold_transport == "arena-dma":
             prot |= mmap.PROT_WRITE
         arenas = []
         for fd, size in zip(fds, meta["sizes"]):
@@ -461,8 +461,9 @@ def share_layer_arenas(*, method) -> None:
     # than assumed away. kt_config and the env gate are identical on every
     # rank, so this branch is symmetric and nobody enters the broadcast
     # alone.
-    if method.kt_config.cold_only_cpu_experts and not (
-        envs.SGLANG_KT_DEMOTION_RANK_WRITE.get()
+    if (
+        method.kt_config.cold_only_cpu_experts
+        and method.kt_config.cold_transport != "arena-dma"
     ):
         if not _STATE.get("warned_cold_only"):
             _STATE["warned_cold_only"] = True

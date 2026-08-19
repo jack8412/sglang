@@ -121,15 +121,33 @@ NUMAN=$(numactl --hardware 2>/dev/null | awk '/^available:/{print $2}')
 # 0,0,2,2,3,3,5,5: `--kt-numa-nodes 0 0 2 2 3 3 5 5`).
 KTPOOLS=8
 
-# Per-node threads must stay within that node's physical cores or the pin
-# fails SILENTLY. With 8 pools over the GPU-local nodes two pools share a
-# node, so a pool may take at most half a node. On gpusrv (96 cores / 2 nodes)
-# this is slack and cpuinfer is unchanged; on ai.v8.pro (144 / 6) it caps
-# 122 -> 96, which costs nothing: the cpuinfer sweep at 48/81/96/144 is flat
-# on AMX, where CPU expert compute stopped being the bottleneck.
-CPUINF=$(( PHYS * 85 / 100 ))
-CPUINF_MAX=$(( KTPOOLS * (PHYS / NUMAN) / 2 ))
-[ "$CPUINF" -le "$CPUINF_MAX" ] || CPUINF=$CPUINF_MAX
+# CPUINFER, DERIVED. It used to be PHYS*0.85, which is a guess that happens to
+# be right here and over-subscribes elsewhere. What actually constrains it:
+#
+#   * AMX computes on PHYSICAL cores -- two HT siblings share the tile
+#     registers -- so the budget is physical cores, never `nproc`.
+#   * kt splits cpuinfer evenly across its pools, and the pools pinned to one
+#     NUMA node must fit that node, or the pin fails SILENTLY.
+#   * The ranks whose GPUs sit on that node need cores too: one scheduler main
+#     thread each, plus the doorbell pollers, plus driver/IO slack.
+#
+# so, per node:  threads_per_pool = (cores - ranks - pollers - 2) / pools
+#
+#   gpusrv    (96/2):  (48 - 4 - 2 - 2) / 4 = 10  ->  80
+#   ai.v8.pro (144/6): (24 - 2 - 2 - 2) / 2 =  9  ->  72   (was 96 = 24/node,
+#                      i.e. exactly the node's cores with nothing left for the
+#                      two schedulers pinned there)
+#
+# Erring low is free: the cpuinfer sweep at 48/81/96/144 is FLAT on AMX, where
+# CPU expert compute stopped being the bottleneck. Cores left to the schedulers
+# are worth more than cores added to a pool that is not the constraint.
+POLLERS=2
+CORES_PER_NODE=$(( PHYS / NUMAN ))
+POOLS_PER_NODE=$(( (KTPOOLS + NUMAN - 1) / NUMAN ))
+RESERVE=$(( POOLS_PER_NODE + POLLERS + 2 ))
+PER_POOL=$(( (CORES_PER_NODE - RESERVE) / POOLS_PER_NODE ))
+[ "$PER_POOL" -ge 1 ] || PER_POOL=1
+CPUINF=$(( PER_POOL * KTPOOLS ))
 
 # PLACEMENT PROFILES REMOVED (2026-08-14). The launcher no longer discovers or
 # loads an expert-distribution dump, and no longer arms the recorder.
