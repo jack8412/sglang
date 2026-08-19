@@ -25,9 +25,15 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestFinalizeSplitPrefillIsIdempotent(CustomTestCase):
-    def test_second_finalize_does_not_rebuild_the_store(self):
-        """Red if the idempotence guard is dropped: the second call would fall
-        through to build_cold_store and allocate another 439 GB."""
+    def test_second_finalize_does_not_rebuild_the_pipeline(self):
+        """Red if the idempotence guard is dropped.
+
+        The second call would fall through to the whole cold-source build.
+        That used to mean 439 GB of pinned store; the store is gone, but the
+        rebuild is still wrong -- it re-registers kt's arena and reallocates
+        the pipeline's device buffers underneath a serving model. The guard is
+        asserted by making the builder explode if it is reached at all.
+        """
         from sglang.srt.layers.moe import kt_ep_wrapper as m
 
         layers = list(m._KT_SPLIT_PREFILL_LAYERS)
@@ -38,13 +44,10 @@ class TestFinalizeSplitPrefillIsIdempotent(CustomTestCase):
             m._KT_SPLIT_PREFILL_LAYERS.append((0, object()))
             m._KT_SPLIT_PREFILL_STATE["pipeline"] = object()
 
-            from sglang.srt.layers.moe import expert_cold_store
-
-            # The store build is what costs 439 GB; assert it is never reached.
             with patch.object(
-                expert_cold_store,
-                "build_cold_store",
-                side_effect=AssertionError("rebuilt the cold store"),
+                m,
+                "_build_dynamic_swizzle_plan",
+                side_effect=AssertionError("rebuilt the cold source"),
             ):
                 self.assertTrue(m.finalize_split_prefill(object()))
         finally:

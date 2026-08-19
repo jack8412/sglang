@@ -7714,7 +7714,7 @@ def maybe_run_expert_swap_window(
         # both wrong -- the GPU flush measures 0.09 s per window on this node.
         _phases = (
             "select_s", "rows_s", "begin_s", "move_s", "stage_s",
-            "flush_gpu_s", "flush_store_s", "finish_s", "apply_s",
+            "flush_gpu_s", "finish_s", "apply_s",
             "tables_s", "after_s",
         )
         _attributed = sum(_timing[k] for k in _phases)
