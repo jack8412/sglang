@@ -378,6 +378,12 @@ class AnthropicMessagesRequest(BaseModel):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+    # SRT extension, not part of Anthropic's schema: a per-request override
+    # for --kt-routing-margin. litellm's `extra_body` arrives here as a
+    # top-level field, which is how one alias pins a routing point while
+    # another uses the server default -- against ONE set of GPUs, since the
+    # weights fill the devices and a second instance is not an option.
+    kt_routing_margin: Optional[float] = None
 
     @field_validator("model")
     @classmethod

@@ -565,6 +565,12 @@ class AnthropicServing:
             request_data["top_k"] = anthropic_request.top_k
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
+        # Carried explicitly: the converter builds ChatCompletionRequest from a
+        # whitelist, so anything not copied here is silently dropped on
+        # /v1/messages -- which is the endpoint litellm's `anthropic/` prefix
+        # uses, i.e. exactly the path this override has to survive.
+        if anthropic_request.kt_routing_margin is not None:
+            request_data["kt_routing_margin"] = anthropic_request.kt_routing_margin
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
