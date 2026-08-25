@@ -1,7 +1,7 @@
 """Arena geometry and the CUDA copy shims the kt cold path is built from.
 
 WHAT THIS IS NOT. It used to be ``kt_direct_dma.py`` and to carry a whole
-cold transport -- ``--kt-cold-transport direct-dma``, an interval registrar
+cold transport -- a ``direct-dma`` mode, an interval registrar
 that pinned each rank's read-set per (layer, expert), and a per-expert copy
 plan. That transport never armed on any node: it is gated
 under full CPU residency, because its address plan is built at load

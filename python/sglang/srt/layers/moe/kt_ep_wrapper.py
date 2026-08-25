@@ -173,7 +173,6 @@ class KTConfig:
     transport: str = "hostnode"
     transport_pollers: int = 2
     conditional_cpu_branch: bool = False
-    cold_transport: str = "cpu"
     expert_swap_transitions: int = 0
     expert_swap_max: int = 4
     expert_swap_hysteresis: float = 2.0
@@ -795,7 +794,6 @@ def create_kt_config_from_server_args(
         transport=server_args.kt_transport,
         transport_pollers=server_args.kt_transport_pollers,
         conditional_cpu_branch=server_args.kt_conditional_cpu_branch,
-        cold_transport=server_args.kt_cold_transport,
         expert_swap_transitions=server_args.kt_expert_swap_transitions,
         expert_swap_max=server_args.kt_expert_swap_max,
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
@@ -2781,12 +2779,6 @@ def _kt_swap_tables(method) -> "object":
 # order. This is why the original gate counted eager forwards rather than
 # seconds, and the reason survives the move to the scheduler.
 
-# How long a demotion will wait on the background disk prefetch before giving
-# up and reading the expert itself. Generous on purpose: the read is already in
-# flight, so waiting costs at most what is LEFT of it, while giving up costs
-# the whole read again. Bounded only so a stuck reader cannot wedge a window.
-_KT_PREFETCH_WAIT_S = 60.0
-
 _KT_BOUNDARY_STATE = {
     "last_was_extend": False,
     "transitions": 0,
@@ -2959,28 +2951,15 @@ def maybe_run_expert_swap_window(
             }
         )
     if not entries or not act:
-        # Sampling-only pass: counters folded into the EMAs, nothing moved --
-        # but it is also the last boundary before an acting one, so it is where
-        # the demotion reads get started off the critical path.
-        # NOT under rank-write. The prefetch feeds _read_demoted_expert, and
-        # rank-write never calls it: each rank captures its own slice off its
-        # own GPU rows, so no demoted expert's bytes come off the checkpoint at
-        # all. MEASURED on V7: 28 prefetch passes moved 25,617 experts --
-        # ~448 GB off disk -- while every one of 112 windows reported
-        # "prefetch 0 hit / 0 miss". Not one byte was consumed. It is not free
-        # either: it is the boundary right after an acting window that has the
-        # newly-changed plan, so it all misses cache and is read for real.
+        # Sampling-only pass: counters folded into the EMAs, nothing moved.
         #
-        # Gate on whether rank-write is CONFIGURED, not on whether a previous
-        # window armed it. Arming is only known after a window has run, so
-        # keying on it left every boundary before the first window prefetching
-        # ~12.9 GB that rank-write would never read -- V14 logged 17 such
-        # passes, every one of them "prefetch 0 hit / 0 miss". The writer is
-        # built at boot (finalize_split_prefill), so its presence is already
-        # decided by the time any boundary is reached, and there is no longer a
-        # checkpoint path to fall back to: a rank-write failure terminates.
-        if entries and not _rank_write_owns_demotions():
-            _start_demotion_prefetch(anchor, entries)
+        # This used to also kick off a background checkpoint prefetch of what
+        # the NEXT window would demote. It fed a read path that no longer
+        # exists -- rank-write captures each rank's own slice off its own GPU
+        # rows, so no demoted expert's bytes come off disk at all -- and it was
+        # never free: MEASURED on V7, 28 prefetch passes moved 25,617 experts,
+        # ~448 GB read for real, while every one of 112 windows reported
+        # "prefetch 0 hit / 0 miss". Not one byte was consumed.
         return
 
     mover = _get_or_create_expert_mover(anchor)
@@ -2991,8 +2970,6 @@ def maybe_run_expert_swap_window(
     _timing = {
         "read_s": 0.0,
         "install_s": 0.0,
-        "prefetch_hits": 0,
-        "prefetch_misses": 0,
         # Phase breakdown of what the window's timing line calls "elsewhere".
         # Added because two rounds of reasoning about where it goes were both
         # wrong (the per-layer all_reduces, then the pinned allocations); the
@@ -3037,14 +3014,22 @@ def maybe_run_expert_swap_window(
     # result instead: the barrier, the per-layer capture, and the install.
     _rank_writer = _get_or_create_rank_writer(entries[0])
     _t_arm = time.perf_counter()
+    # Still a MIN all_reduce, because the writer is per-rank fallible --
+    # kt_arena_share degrades a rank that could not map the arena, by design --
+    # and a split rank set is silent corruption rather than a crash. What
+    # changed is the verdict: there is nowhere left to degrade TO, so a rank
+    # that cannot write is a dead server, not a slower one. Every rank reaches
+    # this call (entries and act are plan data), so the terminate is unanimous.
     _KT_SWAP_STATE["rank_write_armed"] = _all_tp_ranks_succeeded(
         _rank_writer is not None
     )
     _timing["arm_s"] += time.perf_counter() - _t_arm
-    if _rank_writer is not None and not _KT_SWAP_STATE["rank_write_armed"]:
-        logger.error(
-            "[kt-rankwrite] disarmed for this window: another rank has no "
-            "arena mapping; every rank takes the checkpoint path"
+    if not _KT_SWAP_STATE["rank_write_armed"]:
+        _fatal_swap_failure(
+            "rank-write could not arm on every rank (this rank: "
+            f"writer={'yes' if _rank_writer is not None else 'no'}). A demoted "
+            "expert owns no CPU buffers under cold-only residency, so without "
+            "the arena writer it would become routable with no weights"
         )
 
     # Arena promotion (full-kt + KT_BUFFER_B_MEMFD): promoted bytes come from
@@ -3359,75 +3344,54 @@ def maybe_run_expert_swap_window(
         # is quiesced, so nothing reads either expert in between. The one
         # ordering that matters (all writes land before serving resumes) is
         # the window-end barrier.
-        writer = _KT_SWAP_STATE.get("rank_writer")
-        if writer is not None and _pending.get("rank_write"):
-            t0 = time.perf_counter()
-            # MOVE, COMMIT, THEN WRITE -- and never raise from here.
-            #
-            # Order: writing before the move would blit the demoted expert's
-            # bytes over the PROMOTED expert's LIVE buffer, and an aborted
-            # layer leaves that expert CPU-routable with corrupted weights.
-            # The move must therefore come first; everything that could
-            # refuse was hoisted into validate() at _begin_layer, before
-            # anything moved, so the irreversible step is only taken once the
-            # write is known to be possible.
-            #
-            # THERE IS NO ABORT PATH HERE, DELIBERATELY. Round 2 tried to make
-            # a failure recoverable and made it worse: move_slot_only nulls
-            # gate/up/down_bb_[promote] irreversibly, so a layer that aborts
-            # after it leaves the promoted expert advertised as CPU-served
-            # (the tables never flipped) with a null BufferB -- the next token
-            # routed there null-derefs inside the AMX GEMM. The mirror image,
-            # writing before the move, corrupts that expert's live weights
-            # instead. Neither ordering has a safe unwind.
-            #
-            # And unwinding is not even available: kt's move runs on a
-            # CPUInfer worker thread whose loop has no try/catch, so a C++
-            # precondition throw terminates the PROCESS -- Python never sees
-            # it. Safety therefore has to come from never entering the region
-            # unless it will succeed, which is what validate() establishes at
-            # _begin_layer (it mirrors kt's own checks on every partition) and
-            # what the arming capability probe establishes once per process.
-            # Anything that still raises here is a bug, and it propagates.
-            if method.wrapper is not None:
-                method.wrapper.move_expert_slot(promote_id, demote_id)
-            # Every rank mirrors the move kt just made, wrapper or not: the
-            # arena is shared, so a rank that misses one is silently a swap
-            # behind for the rest of the process's life.
-            writer.commit_move(entry["layer_idx"], promote_id, demote_id)
-            if not writer.write(entry["layer_idx"], promote_id, demote_id):
-                # kt's slot has already moved; there is no state to return to.
-                _fatal_swap_failure(
-                    f"rank-write refused AFTER validation for demote="
-                    f"{demote_id} on layer {entry.get('layer_idx')} -- a bug "
-                    "in validate(), and kt's ownership has already moved"
-                )
-            _timing["install_s"] += time.perf_counter() - t0
-            return
-
-        # CHECKPOINT PATH. It also moves kt's slot (swap_expert_slot routes
-        # through the same move_slot_only), so a writer that exists but is
-        # not driving this layer STILL has to mirror the move.
-        if method.wrapper is None:
-            if writer is not None:
-                writer.commit_move(entry["layer_idx"], promote_id, demote_id)
-            return
+        # Unconditional: arming is a window-scoped MIN consensus that
+        # terminates the server if any rank lacks a writer, and _begin_layer
+        # sets rank_write for every layer it returns from. There is no second
+        # source for a demoted expert's bytes any more.
+        writer = _KT_SWAP_STATE["rank_writer"]
         t0 = time.perf_counter()
-        tensors = _read_demoted_expert(entry, demote_id)
-        t1 = time.perf_counter()
-        method.wrapper.swap_expert_slot(
-            promote_id, demote_id, *[t.data_ptr() for t in tensors]
-        )
-        if writer is not None:
-            writer.commit_move(entry["layer_idx"], promote_id, demote_id)
-        # Timed separately on purpose. The split between "fetching the bytes"
-        # and "handing them to kt" was previously inferred by subtracting an
-        # ESTIMATED disk rate from the measured window, which is guesswork
-        # dressed as a number -- and the loader shows the install is a memcpy
-        # plus a strided restride of down_proj, with no format conversion, so
-        # the estimate was probably wrong. Measure both.
-        _timing["read_s"] += t1 - t0
-        _timing["install_s"] += time.perf_counter() - t1
+        # MOVE, COMMIT, THEN WRITE -- and never raise from here.
+        #
+        # Order: writing before the move would blit the demoted expert's
+        # bytes over the PROMOTED expert's LIVE buffer, and an aborted
+        # layer leaves that expert CPU-routable with corrupted weights.
+        # The move must therefore come first; everything that could
+        # refuse was hoisted into validate() at _begin_layer, before
+        # anything moved, so the irreversible step is only taken once the
+        # write is known to be possible.
+        #
+        # THERE IS NO ABORT PATH HERE, DELIBERATELY. Round 2 tried to make
+        # a failure recoverable and made it worse: move_slot_only nulls
+        # gate/up/down_bb_[promote] irreversibly, so a layer that aborts
+        # after it leaves the promoted expert advertised as CPU-served
+        # (the tables never flipped) with a null BufferB -- the next token
+        # routed there null-derefs inside the AMX GEMM. The mirror image,
+        # writing before the move, corrupts that expert's live weights
+        # instead. Neither ordering has a safe unwind.
+        #
+        # And unwinding is not even available: kt's move runs on a
+        # CPUInfer worker thread whose loop has no try/catch, so a C++
+        # precondition throw terminates the PROCESS -- Python never sees
+        # it. Safety therefore has to come from never entering the region
+        # unless it will succeed, which is what validate() establishes at
+        # _begin_layer (it mirrors kt's own checks on every partition) and
+        # what the arming capability probe establishes once per process.
+        # Anything that still raises here is a bug, and it propagates.
+        if method.wrapper is not None:
+            method.wrapper.move_expert_slot(promote_id, demote_id)
+        # Every rank mirrors the move kt just made, wrapper or not: the
+        # arena is shared, so a rank that misses one is silently a swap
+        # behind for the rest of the process's life.
+        writer.commit_move(entry["layer_idx"], promote_id, demote_id)
+        if not writer.write(entry["layer_idx"], promote_id, demote_id):
+            # kt's slot has already moved; there is no state to return to.
+            _fatal_swap_failure(
+                f"rank-write refused AFTER validation for demote="
+                f"{demote_id} on layer {entry.get('layer_idx')} -- a bug "
+                "in validate(), and kt's ownership has already moved"
+            )
+        _timing["install_s"] += time.perf_counter() - t0
+        return
 
     def _begin_layer(entry, swaps, rows):
         """Read this layer's demoted experts off the GPU, before any move.
@@ -3435,16 +3399,7 @@ def maybe_run_expert_swap_window(
         Runs once per layer with the whole plan, so the collectives inside are
         keyed to the plan -- identical on every rank -- rather than to per-swap
         conditions. It also guarantees read-before-write unconditionally: no
-        move has run yet, so every row still holds its demoted occupant even on
-        the checkpoint-fallback path that writes its row immediately.
-
-        Under the direct-DMA transport it additionally RETURNS a filtered
-        (swaps, rows) plan: a demoted expert must have its arena pages
-        registered on EVERY rank before the tables make it routable
-        (register-before-routable, SPEC-DIRECT-DMA invariant 1), so pairs
-        any rank could not register are dropped everywhere. The filter is
-        derived from ONE fixed-shape collective over the plan, so it is
-        identical on all ranks by construction.
+        move has run yet, so every row still holds its demoted occupant.
         """
         filtered = None
         method = entry.get("method")
@@ -3457,11 +3412,7 @@ def maybe_run_expert_swap_window(
         # leave a hole in the expert, which is wrong bytes rather than a
         # crash.
         _pending["rank_write"] = False
-        # The WINDOW-scoped consensus, not this rank's writer: every rank
-        # takes the same branch here, so the collective counts below match
-        # even when one rank could not map the arena.
-        armed = bool(_KT_SWAP_STATE.get("rank_write_armed"))
-        writer = _KT_SWAP_STATE.get("rank_writer") if armed else None
+        writer = _KT_SWAP_STATE.get("rank_writer")
         captured = False
         if writer is not None and swaps:
             t0 = time.perf_counter()
@@ -3493,39 +3444,13 @@ def maybe_run_expert_swap_window(
                 )
             _timing["read_s"] += time.perf_counter() - t0
 
-        if armed:
-            # NO per-layer consensus here, and none is needed: under the
-            # fail-fast policy a rank that could not capture or validate has
-            # already terminated every rank, so there is no surviving
-            # disagreement to reconcile. `armed` is the window-scoped
-            # consensus, so all eight ranks take this branch or none do.
-            _pending["rank_write"] = True
+        # NO per-layer consensus here, and none is needed: under the fail-fast
+        # policy a rank that could not capture or validate has already
+        # terminated every rank, so there is no surviving disagreement to
+        # reconcile -- and arming itself is a window-scoped MIN that every rank
+        # reached, so all eight take this branch or the server is already down.
+        _pending["rank_write"] = True
         return filtered
-
-    def _read_demoted_expert(entry, demote_id):
-        """The demoted expert's full bytes, off the checkpoint.
-
-        Only reached when rank-write does NOT own demotions: with the arena
-        transport armed each rank captures its own slice off its own GPU rows
-        and _begin_layer returns before this is ever called.
-        """
-        # The background disk prefetch started at the previous boundary.
-        # Waiting on it is the point: the read is already in flight, so
-        # waiting costs at most what remains of it, while re-reading
-        # synchronously costs the whole thing again.
-        pf = _KT_SWAP_STATE.get("prefetch")
-        if pf is not None:
-            pf["done"].wait(timeout=_KT_PREFETCH_WAIT_S)
-            got = pf["data"].get((entry.get("layer_idx"), demote_id))
-            if got is not None:
-                _timing["prefetch_hits"] += 1
-                return got
-            _timing["prefetch_misses"] += 1
-
-        return mover.read_full_expert(
-            entry["layer"],
-            _checkpoint_id(entry["method"]._kt_physical_to_logical, demote_id),
-        )
 
     # after_flip / on_layer_abort existed ONLY to release the direct-dma
     # transport's provisional page pins. Both hooks are optional, so with that
@@ -3580,14 +3505,13 @@ def maybe_run_expert_swap_window(
         # barrier some ranks skip is a hang, and the writer is the one
         # precondition that is per-rank fallible.
         _rw = _KT_SWAP_STATE.get("rank_writer")
-        if _KT_SWAP_STATE.get("rank_write_armed"):
-            _t_sync = time.perf_counter()
-            torch.cuda.current_stream().synchronize()
-            _timing["d2h_sync_s"] += time.perf_counter() - _t_sync
-            if dist.is_initialized() and get_parallel().tp_size > 1:
-                _t_bar = time.perf_counter()
-                dist.barrier(group=get_tp_group().cpu_group)
-                _timing["barrier_s"] += time.perf_counter() - _t_bar
+        _t_sync = time.perf_counter()
+        torch.cuda.current_stream().synchronize()
+        _timing["d2h_sync_s"] += time.perf_counter() - _t_sync
+        if dist.is_initialized() and get_parallel().tp_size > 1:
+            _t_bar = time.perf_counter()
+            dist.barrier(group=get_tp_group().cpu_group)
+            _timing["barrier_s"] += time.perf_counter() - _t_bar
         if _rw is not None:
             logger.info("%s", _rw.end_window())
     _KT_SWAP_STATE["windows"] += 1
@@ -3615,7 +3539,7 @@ def maybe_run_expert_swap_window(
         # strided restride of down_proj, with no format conversion in it.
         logger.info(
             "[kt-swap] window %d timing: total %.2fs = fetch %.2fs + install "
-            "%.2fs (+%.2fs elsewhere); prefetch %d hit / %d miss",
+            "%.2fs (+%.2fs elsewhere)",
             _KT_SWAP_STATE["windows"],
             time.perf_counter() - _window_t0,
             _timing["read_s"],
@@ -3623,8 +3547,6 @@ def maybe_run_expert_swap_window(
             (time.perf_counter() - _window_t0)
             - _timing["read_s"]
             - _timing["install_s"],
-            _timing["prefetch_hits"],
-            _timing["prefetch_misses"],
         )
         # The "elsewhere" term, attributed. Without this the only way to say
         # where a window's time goes is to guess, and two careful guesses
@@ -3796,16 +3718,6 @@ class _PerLayerMover:
         # expert straight from disk and does not need it.
         self._for(layer)(layer, dst_row, logical_id)
 
-    def read_full_expert(self, layer, logical_id):
-        """Full unsliced expert bytes, for the cold-only CPU install.
-
-        Delegates to the same per-layer mover move() uses. Defining it only on
-        CheckpointExpertMover left this wrapper without it, and the swap
-        window swallowed the AttributeError as a failed layer -- so every
-        install silently did nothing while the run looked healthy.
-        """
-        return self._for(layer).read_full_expert(layer, logical_id)
-
     def _for(self, layer):
         from sglang.srt.layers.moe.kt_expert_mover import CheckpointExpertMover
 
@@ -3951,14 +3863,12 @@ def finalize_split_prefill(server_args) -> bool:
         num_gpu = anchor.num_gpu_experts
         num_cold = anchor.global_num_experts - num_gpu
 
-        _dma_writer = None
-        if anchor.kt_config.cold_transport == "arena-dma":
-            _dma_writer = _get_or_create_rank_writer({"method": anchor})
+        _dma_writer = _get_or_create_rank_writer({"method": anchor})
         if _dma_writer is None or getattr(_dma_writer, "_dma", None) is None:
             raise RuntimeError(
-                "split prefill has no cold source: --kt-cold-transport "
-                "arena-dma did not arm. Read the [kt-rankwrite] and "
-                "[kt] KT_BUFFER_B_MEMFD lines above to see why."
+                "split prefill has no cold source: the arena-DMA writer did "
+                "not arm. Read the [kt-rankwrite] and [kt] KT_BUFFER_B_MEMFD "
+                "lines above to see why."
             )
 
         raw_shapes, swizzle_plan = _build_dynamic_swizzle_plan(anchor, device)
@@ -4063,11 +3973,11 @@ def finalize_split_prefill(server_args) -> bool:
     # needs exists by this point: the arenas are mapped (kt_arena_share ran
     # per layer during load) and the layer list is complete.
     #
-    # Failure policy is unchanged and lives in the callee: rank-write that
-    # cannot arm falls back to the checkpoint path, and direct DMA that cannot
-    # arm terminates. Doing it here only moves WHEN that is decided, which is
-    # itself worth something -- a boot that cannot honour the requested
-    # transport now fails at boot instead of minutes into serving.
+    # Failure policy lives in the callee and in the window's arming consensus:
+    # a writer that cannot be built terminates at the first window, because
+    # there is no second source for a demoted expert's weights. Doing it here
+    # only moves WHEN that is decided, which is itself worth something -- a
+    # boot that cannot arm now fails at boot instead of minutes into serving.
     try:
         _get_or_create_rank_writer({"method": anchor})
     except Exception:
@@ -4076,120 +3986,6 @@ def finalize_split_prefill(server_args) -> bool:
             "window will retry"
         )
     return True
-
-
-def _rank_write_owns_demotions() -> bool:
-    """True when a demoted expert's bytes come off the GPU, not the checkpoint.
-
-    Two signals, because they become available at different times: the writer
-    is constructed at boot, while arming is the per-window consensus. Either
-    one means _read_demoted_expert is never called, so prefetching for it is
-    pure disk traffic.
-    """
-    if _KT_SWAP_STATE.get("rank_write_armed"):
-        return True
-    return _KT_SWAP_STATE.get("rank_writer") is not None
-
-
-def _start_demotion_prefetch(anchor, entries):
-    """Read what the NEXT window will demote, on a background thread.
-
-    Under cold-only residency a demoted expert owns no CPU buffers, so the
-    window must give it some before it becomes routable, and those bytes come
-    off the checkpoint: ~17.5 MB per demotion, 8 swaps x 92 layers, against a
-    measured window of ~31 s over a 7.1 s baseline. The plan is knowable one
-    boundary early -- `select` is pure, it reads the EMAs and mutates nothing --
-    so the reading need not sit on the critical path at all.
-
-    Best-effort, and deliberately so. A plan that changes between here and the
-    acting window simply misses the cache and is read synchronously. Nothing
-    blocks on this thread, and crucially NO COLLECTIVE is involved: a rank that
-    skips the prefetch, or finishes late, cannot desynchronise the group. That
-    is the whole reason this is a safer shape than gathering the same bytes off
-    the GPU, which deadlocked three times for exactly that reason.
-    """
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-
-    state = _KT_SWAP_STATE.get("prefetch")
-    if state is not None and not state["done"].is_set():
-        return  # one in flight already
-    if not entries:
-        return
-    method0 = entries[0].get("method")
-    if method0 is None:
-        return
-    # Only the rank that installs needs the bytes. Safe to vary by rank here
-    # precisely because there is no collective below.
-    if method0.wrapper is None:
-        return
-    mover = _get_or_create_expert_mover(anchor)
-    if mover is None:
-        return
-
-    plan = []
-    for entry in entries:
-        try:
-            swaps = entry["policy"].select(entry["tables"].gpu_experts_mask)
-        except Exception:
-            continue
-        for s in swaps:
-            plan.append(
-                (
-                    entry["layer"],
-                    entry["layer_idx"],
-                    entry["method"]._kt_physical_to_logical,
-                    s.demote,
-                )
-            )
-    if not plan:
-        return
-
-    done = threading.Event()
-    data: dict = {}
-    _KT_SWAP_STATE["prefetch"] = {"done": done, "data": data, "planned": len(plan)}
-
-    def _read_one(item):
-        layer, layer_idx, p2l, demote_id = item
-        try:
-            # Cache key stays the PLAN id (that is what the window looks
-            # up); only the checkpoint read arg translates.
-            data[(layer_idx, demote_id)] = mover.read_full_expert(
-                layer, _checkpoint_id(p2l, demote_id)
-            )
-        except Exception:
-            pass  # a miss just costs a synchronous read later
-
-    def _work():
-        t0 = time.perf_counter()
-        try:
-            # PARALLEL, and the parallelism is the point. A window demotes
-            # 8 experts x 92 layers = 736 FULL experts (kt needs every NUMA
-            # partition, not this rank's slice) = ~12.9 GB, and it arrives
-            # as ~4.4k scattered 2-3 MB tensor ranges out of mmap'd
-            # safetensors. Read serially that is page-fault-bound at ~0.6
-            # GB/s -- the ~22 s of fetch measured in a ~31 s window -- on an
-            # NVMe that streams several GB/s. The reads release the GIL and
-            # are independent, so overlapping them is what actually lets the
-            # device be the limit. (The GPU read-back route avoids the disk
-            # entirely and is faster still; this is the floor when it is
-            # off or misses.)
-            with ThreadPoolExecutor(
-                max_workers=8, thread_name_prefix="kt-swap-prefetch"
-            ) as pool:
-                list(pool.map(_read_one, plan))
-        finally:
-            _KT_SWAP_STATE["prefetch"]["seconds"] = time.perf_counter() - t0
-            done.set()
-
-    threading.Thread(
-        target=_work, name="kt-swap-prefetch", daemon=True
-    ).start()
-    logger.info(
-        "[kt-swap] prefetching %d demoted experts off the critical path "
-        "(8 reader threads)",
-        len(plan),
-    )
 
 
 def _checkpoint_id(p2l, plan_id):
@@ -4453,7 +4249,11 @@ def _fatal_swap_failure(context: str) -> None:
 
 
 def _get_or_create_rank_writer(entry):
-    """Process-wide rank-write demotion writer, or None (checkpoint path).
+    """Process-wide rank-write demotion writer, or None.
+
+    None is fatal at the next swap window: it is the ONLY source of a demoted
+    expert's weights, since cold-only residency leaves that expert owning no
+    CPU buffers. The window's arming consensus turns it into a terminate.
 
     Built once, at boot (finalize_split_prefill) so the arena registration
     that direct DMA needs is not paid inside the first serving window. The
@@ -4471,10 +4271,7 @@ def _get_or_create_rank_writer(entry):
     writer = None
     try:
         method = entry.get("method")
-        if (
-            method is not None
-            and method.kt_config.cold_transport == "arena-dma"
-        ):
+        if method is not None and method.kt_config.split_prefill:
             from sglang.srt.layers.moe.kt_arena_share import (
                 arena_write_source_for,
             )
@@ -4514,7 +4311,7 @@ def _get_or_create_rank_writer(entry):
             geom = ArenaExpertRanges(next(iter(sources.values())))
             arenas = {li: s._arenas[geom.part] for li, s in sources.items()}
             dma = None
-            if method.kt_config.cold_transport == "arena-dma":
+            if method.kt_config.split_prefill:
                 # One registration per (layer, partition) MAPPING -- 92 of
                 # ~2275 MiB, not the 150,144 per-expert ranges that made the
                 # direct-DMA transport fail with rc=2. Cost is per page, so
@@ -4554,8 +4351,8 @@ def _get_or_create_rank_writer(entry):
                     )
                 except Exception:
                     logger.exception(
-                        "[kt-rankwrite] direct DMA was requested "
-                        "(--kt-cold-transport arena-dma) and could not arm; "
+                        "[kt-rankwrite] direct DMA (--kt-expert-split-prefill) "
+                        "could not arm; "
                         "check `ulimit -l` -- cudaHostRegister is charged "
                         "against RLIMIT_MEMLOCK"
                     )
@@ -4593,7 +4390,9 @@ def _get_or_create_rank_writer(entry):
             )
     except Exception:
         logger.exception(
-            "[kt-rankwrite] could not arm; demotions keep the checkpoint path"
+            "[kt-rankwrite] could not arm; the next swap window terminates -- "
+            "a demoted expert owns no CPU buffers under cold-only residency "
+            "and this writer is the only thing that gives it any"
         )
         writer = None
 

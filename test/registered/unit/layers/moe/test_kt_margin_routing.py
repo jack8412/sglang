@@ -940,5 +940,62 @@ class TestSplitPrefillMinTokens(CustomTestCase):
         )
 
 
+class TestSwapRequiresSplitPrefill(CustomTestCase):
+    """Critical-path bookkeeping for the swap -> split-prefill dependency.
+
+    Cold-only residency leaves a demoted expert owning no CPU buffers, so a
+    swap window must give it some before it becomes routable. The only writer
+    is the arena-DMA rank-write path, and that is built by split prefill's boot
+    hook -- so without split prefill a window would reach its arming consensus,
+    find no writer on any rank, and terminate the server. The checkpoint read
+    that used to cover this (~17.5 MB per demotion, ~12.9 GB per window) has
+    been removed, so this rail is what turns a mid-serving terminate into a
+    boot-time error.
+    """
+
+    def _args(self, **kw):
+        from sglang.srt.server_args import ServerArgs
+
+        base = dict(
+            model_path="/dummy",
+            kt_weight_path="/dummy",
+            kt_method="MXFP4",
+        )
+        base.update(kw)
+        return ServerArgs(**base)
+
+    def test_swapping_without_split_prefill_raises(self):
+        with self.assertRaises(ValueError) as cm:
+            self._args(kt_expert_swap_transitions=4)
+        self.assertIn("--kt-expert-split-prefill", str(cm.exception))
+
+    def test_swapping_with_split_prefill_is_allowed(self):
+        self._args(kt_expert_swap_transitions=4, kt_expert_split_prefill=True)
+
+    def test_split_prefill_without_swapping_is_allowed(self):
+        # Split prefill stands alone: it computes every routed expert on GPU
+        # and needs no demotion writer of its own.
+        self._args(kt_expert_split_prefill=True)
+
+    def test_neither_is_allowed(self):
+        # Plain margin-routed serving, no swapping, no split prefill. Nothing
+        # ever demotes, so nothing needs the writer.
+        self._args()
+
+    def test_split_prefill_sets_the_kt_memfd_gate(self):
+        # arena-DMA is no longer a flag: selecting split prefill is what makes
+        # kt export its buffers as memfds. Red if the two are decoupled again.
+        import os
+
+        prev = os.environ.pop("KT_BUFFER_B_MEMFD", None)
+        try:
+            self._args(kt_expert_split_prefill=True)
+            self.assertEqual(os.environ.get("KT_BUFFER_B_MEMFD"), "1")
+        finally:
+            os.environ.pop("KT_BUFFER_B_MEMFD", None)
+            if prev is not None:
+                os.environ["KT_BUFFER_B_MEMFD"] = prev
+
+
 if __name__ == "__main__":
     unittest.main()

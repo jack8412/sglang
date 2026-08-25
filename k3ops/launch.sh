@@ -97,8 +97,9 @@ NUMAN=$(numactl --hardware 2>/dev/null | awk '/^available:/{print $2}')
 # [hidden, per_numa]), so a GPU rank's w2 slice is one contiguous block only
 # when per_numa == per_gpu. Below that -- e.g. the NUMA node count, which is
 # what this used to pass -- every expert's w2 becomes H strided
-# (per_gpu/2)-byte reads, the DMA-efficiency trap that makes --kt-cold-transport
-# direct-dma unusable. The NUMA node count is unrelated to the partition count:
+# (per_gpu/2)-byte reads, the DMA-efficiency trap that made the old per-expert
+# direct-dma transport unusable. The NUMA node count is unrelated to the
+# partition count:
 # place the pools explicitly with --kt-numa-nodes (ai.v8.pro, GPUs on nodes
 # 0,0,2,2,3,3,5,5: `--kt-numa-nodes 0 0 2 2 3 3 5 5`).
 KTPOOLS=8

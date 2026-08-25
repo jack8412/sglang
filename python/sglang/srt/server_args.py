@@ -3028,11 +3028,6 @@ class ServerArgs:
         "During prefill, compute EVERY expert on GPU by evaluating the resident and CPU-resident sets as two disjoint expert slices and merging the deferred-finalize partials. Quality-identical to a full-expert model (no routing substitution), unlike --kt-routing-margin / --kt-routing-full-override. Cold-expert weights are held in a pinned host cache and streamed one layer ahead. Decode is unaffected.",
         NS("exec.moe"),
     ] = False
-    kt_cold_transport: A[
-        Literal["cpu", "arena-dma"],
-        "How --kt-expert-split-prefill gets each layer's CPU-resident ('cold') expert weights onto the GPUs. 'cpu' (default): no streaming -- prefill falls back to the margin-routed CPU path. 'arena-dma': every rank's copy engine reads the weights IN PLACE out of kt's memfd arenas, six pitched copies per layer, one DRAM transit, no staging buffer and no pinned host copy. arena-dma sets KT_BUFFER_B_MEMFD=1 for kt; it relies on kt holding only the cold set, which this build always does. It replaces the SGLANG_KT_DEMOTION_DIRECT_DMA and SGLANG_KT_DEMOTION_RANK_WRITE environment variables, which selected the same transport by a different name.",
-        NS("exec.moe"),
-    ] = "cpu"
     kt_expert_split_prefill_token_tile: A[
         int,
         "Run the --kt-expert-split-prefill MoE in token tiles of this many tokens (0 = the whole chunk in one call). A token's MoE output depends only on its own row, so tiling changes no value, but the two large transients -- the gemm2 buffer the kernel sizes for ALL T*top_k slots, and the fp32 finalize accumulator -- then scale with the tile instead of the chunk. Measured at a 49152 chunk: 7.01 GiB peak untiled vs 2.94 GiB at a 16384 tile, for ~7% more MoE time (~1.3% of the forward). This is what lets a large prefill chunk coexist with a long-context KV pool. Ignored unless --kt-expert-split-prefill is set.",
@@ -6959,27 +6954,38 @@ class ServerArgs:
                 self.chunked_prefill_size,
             )
 
-        if self.kt_cold_transport == "arena-dma":
-            if not self.kt_expert_split_prefill:
-                raise ValueError(
-                    "--kt-cold-transport arena-dma has no effect without "
-                    "--kt-expert-split-prefill: it exists to stream the cold "
-                    "expert set that split prefill computes."
-                )
+        if self.kt_expert_split_prefill:
             # KT_BUFFER_B_MEMFD is kt's OWN gate, read by its C++ (moe_base.hpp)
             # and by kt_arena_share, so it stays an env var per the env-var
             # conventions -- but the operator should not have to know that.
-            # Setting it here is what makes the flag sufficient on its own.
+            # Setting it here is what makes --kt-expert-split-prefill
+            # sufficient on its own: the cold set is streamed straight out of
+            # kt's memfd arenas, which is the only transport there is.
             # Assumption: post-init runs in the parent before the scheduler
             # subprocesses are spawned and they inherit os.environ. True for
-            # the current spawn path; if that ever changes this becomes a
-            # silent fallback to the CPU path, which the arming log would show.
+            # the current spawn path; if that ever changes the arena mapping
+            # fails at boot and split prefill refuses to arm, loudly.
             if os.environ.get("KT_BUFFER_B_MEMFD") in (None, "", "0"):
                 os.environ["KT_BUFFER_B_MEMFD"] = "1"
                 logger.info(
-                    "[kt] --kt-cold-transport arena-dma: set "
-                    "KT_BUFFER_B_MEMFD=1 for kt"
+                    "[kt] --kt-expert-split-prefill: set KT_BUFFER_B_MEMFD=1 "
+                    "for kt (arena-DMA cold source)"
                 )
+        elif self.kt_expert_swap_transitions > 0:
+            # A demoted expert owns no CPU buffers under cold-only residency,
+            # so a swap window has to give it some before it becomes routable.
+            # The only writer is the arena-DMA rank-write path, and that is
+            # built by split prefill's boot hook -- so without split prefill
+            # there is nothing to demote INTO. This used to fall back to
+            # ~17.5 MB of checkpoint read per demotion, ~12.9 GB per window;
+            # that path is gone, and refusing here is what keeps its absence
+            # from surfacing as a swap window that terminates the server.
+            raise ValueError(
+                "--kt-expert-swap-transitions requires "
+                "--kt-expert-split-prefill: the swap window writes a demoted "
+                "expert's weights into kt's memfd arena, and the writer that "
+                "does it is armed by split prefill's boot hook."
+            )
 
         if self.kt_transport == "hostnode" and self.kt_max_deferred_experts_per_token:
             raise ValueError(
