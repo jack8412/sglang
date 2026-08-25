@@ -670,6 +670,21 @@ class TboForwardBatchPreparer:
             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
             output_dict[key] = old_value[start_token_index:end_token_index]
 
+        # Optional, so it cannot join the loop above (which asserts non-None),
+        # but it IS a [num_tokens] tensor and splits exactly like input_ids.
+        # Without this the completeness guard at the end of this method raises
+        # on it -- a startup crash for any TBO server, because the decode
+        # cuda-graph slot is registered unconditionally and capture therefore
+        # hands filter_batch a non-None value before any request exists.
+        if batch.kt_routing_margin is not None:
+            assert batch.kt_routing_margin.shape[0] == num_tokens, (
+                f"kt_routing_margin={batch.kt_routing_margin.shape} "
+                f"{num_tokens=} {batch=}"
+            )
+            output_dict["kt_routing_margin"] = batch.kt_routing_margin[
+                start_token_index:end_token_index
+            ]
+
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1

@@ -221,14 +221,11 @@ class DeepSeekMxfp4MoEMethod:
             if torch.cuda.is_available()
             else None
         )
-        _prefill_threshold = get_exec().moe.kt_gpu_prefill_token_threshold or 0
         _resident_experts = layer.w13_weight.shape[0]
         _global_experts = getattr(layer, "num_experts", _resident_experts)
         # The resident partial-expert image is shared by hybrid prefill and
-        # decode.  Keep that image in the existing TK representation for both
-        # threshold=0 reference runs and layerwise-prefill runs; Marlin is
-        # reserved for an ordinary full-expert layer or the manager's full
-        # prefill shadow.
+        # decode, and stays in the TK representation; Marlin is reserved for an
+        # ordinary full-expert layer.
         _resident_partial = _resident_experts < _global_experts
         _take_marlin_path = (
             not _force_tk
@@ -257,14 +254,12 @@ class DeepSeekMxfp4MoEMethod:
                 w2_raw,
                 layer.w2_weight_scale_inv.data,
             )
-            # The full-expert prefill shadow still consumes raw checkpoint
-            # tensors.  Ordinary/non-layerwise layers release them after the
-            # prepared copy has been enqueued.
-            if _prefill_threshold <= 0:
-                del layer.w13_weight
-                del layer.w2_weight
-                del layer.w13_weight_scale_inv
-                del layer.w2_weight_scale_inv
+            # Release the raw checkpoint tensors once the prepared copy has
+            # been enqueued; nothing reads them afterwards.
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale_inv
+            del layer.w2_weight_scale_inv
             layer._v4_marlin_path = True
             return
 
@@ -296,17 +291,11 @@ class DeepSeekMxfp4MoEMethod:
                 w2_scale_raw,
             )
             # Free raw tensors; the triton_kernels Tensor objects keep their
-            # own swizzled storage. The kt_ep_wrapper's full-GPU prefill
-            # fallback (kt_gpu_prefill_token_threshold > 0) needs the raw
-            # attributes around to materialize all 256 experts on GPU when
-            # the gate fires, so opt-in keep them in that mode. Origin: sglang
-            # 本身 (V4-Flash full-GPU prefill fallback compat).
-            _keep_raw_for_full_gpu_fallback = _prefill_threshold > 0
-            if not _keep_raw_for_full_gpu_fallback:
-                del layer.w13_weight
-                del layer.w2_weight
-                del layer.w13_weight_scale_inv
-                del layer.w2_weight_scale_inv
+            # own swizzled storage.
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale_inv
+            del layer.w2_weight_scale_inv
             layer._v4_tk_w13 = w13_swiz
             layer._v4_tk_w13_pcg = w13_pcg
             layer._v4_tk_w2 = w2_swiz

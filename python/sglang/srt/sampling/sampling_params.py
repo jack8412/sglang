@@ -63,7 +63,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     top_p: float = 1.0
     top_k: int = TOP_K_ALL
     min_p: float = 0.0
-    # Per-request override for --kt-routing-margin (KT hybrid CPU/GPU MoE).
+    # Per-request override for --kt-routing-margin (KT hybrid CPU/GPU MoE):
+    # the share of this request's tokens' mixture weight that may be
+    # substituted away from CPU-resident experts, in [0, 1].
     # None = use the server default. Unlike the fields around it this is NOT a
     # sampling knob: it is read inside the MoE forward, not by the sampler. It
     # lives here because it is the per-request surface callers already reach
@@ -162,13 +164,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             )
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
-        if self.kt_routing_margin is not None and self.kt_routing_margin < 0.0:
-            # Upper bound is deliberately open: the margin is a router-logit
-            # gap, and a large value (the margin10 instrument) is a legitimate
-            # setting, not an error. 0.0 is count-only by the flag's contract.
+        if self.kt_routing_margin is not None and not (
+            0.0 <= self.kt_routing_margin <= 1.0
+        ):
+            # The margin is a per-token budget: the share of the token's own
+            # mixture weight that substitution may move. Shares sum to 1, so
+            # [0, 1] is the whole range -- 0.0 is count-only by the flag's
+            # contract and 1.0 places no bound. NaN fails this test too, and
+            # must: it would compare False everywhere, i.e. 100% insists.
             raise ValueError(
-                f"kt_routing_margin must be non-negative, got "
-                f"{self.kt_routing_margin}."
+                f"kt_routing_margin is a share of the token's mixture weight "
+                f"and must lie in [0.0, 1.0], got {self.kt_routing_margin}."
             )
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")

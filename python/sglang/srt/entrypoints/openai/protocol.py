@@ -802,8 +802,9 @@ class ChatCompletionRequest(BaseModel):
     )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    # Per-request override for --kt-routing-margin. The server-wide flag sets
-    # the default; this lets one deployment expose several routing points
+    # Per-request override for --kt-routing-margin -- the share of a token's
+    # mixture weight that substitution may move, in [0, 1]. The server-wide
+    # flag sets the default; this lets one deployment expose several routing points
     # (e.g. a strict alias and a fast alias) against ONE set of GPUs, which is
     # the only way to have both when the weights fill the devices.
     kt_routing_margin: Optional[float] = None

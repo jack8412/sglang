@@ -586,18 +586,6 @@ class TestServerArgsKTRails(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "frequency"):
             server_args._handle_kt()
 
-    def test_dynamic_expert_update_accepts_mxfp4(self):
-        """Rail-removal pin (F2): dynamic+MXFP4 passes config validation;
-        the E8M0-resident wheel requirement is enforced at wrapper init
-        (feature-check — see test_kt_dynamic_update_mxfp4), not here. Red if
-        someone reintroduces a config-time rejection."""
-        server_args = _dummy_server_args(
-            kt_weight_path="/nonexistent-dummy",
-            kt_enable_dynamic_expert_update=True,
-            kt_method="MXFP4",
-        )
-        server_args._handle_kt()  # must not raise
-
     def test_valid_combo_flips_shared_experts_fusion(self):
         server_args = _dummy_server_args(
             kt_weight_path="/nonexistent-dummy",

@@ -379,7 +379,8 @@ class AnthropicMessagesRequest(BaseModel):
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
     # SRT extension, not part of Anthropic's schema: a per-request override
-    # for --kt-routing-margin. litellm's `extra_body` arrives here as a
+    # for --kt-routing-margin -- the share of a token's mixture weight that
+    # substitution may move, in [0, 1]. litellm's `extra_body` arrives here as a
     # top-level field, which is how one alias pins a routing point while
     # another uses the server default -- against ONE set of GPUs, since the
     # weights fill the devices and a second instance is not an option.

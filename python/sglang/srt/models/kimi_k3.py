@@ -351,6 +351,84 @@ def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Ten
     )
 
 
+def _assert_kt_routing_contract(config: KimiLinearConfig) -> None:
+    """Refuse a checkpoint whose router would break the KT weight recompute.
+
+    Margin routing replaces CPU-resident picks with GPU-resident stand-ins and
+    then recomputes the mixture weights for the set that results
+    (``kt_ep_wrapper._reweight_for_new_expert_set``).  That recompute reproduces
+    ``scores.gather(new_ids)`` renormalised -- exactly what this router would
+    emit for that set -- but only under two properties of THIS router, and the
+    wrapper cannot check either: the TopK config does not travel with the
+    dispatch output, so by the time the rewrite runs only ids, weights and
+    logits are in hand.  Checked here instead, where the config is in scope.
+
+    * ``moe_renormalize``.  The recompute renormalises to the row's own total.
+      With raw-sigmoid weights the correct move is to swap the two gates and
+      leave every other slot untouched, so renormalising would instead scale
+      the whole layer output by S/S' -- a few percent, always the same sign,
+      at every one of the MoE layers.
+    * ungrouped selection.  The router masks everything outside its top
+      ``topk_group`` groups before the top-k (topk.py:1301-1320), while the
+      stand-in search ranks all GPU-resident experts globally.  With more than
+      one group the stand-in could come from a group the router excluded, which
+      is no longer "the router re-run over the resident set".
+
+    Both hold for the shipping K3 config (renormalize on, a single group), so
+    this is a rail rather than a limitation.  It raises rather than warns
+    because every way it can be wrong produces right-shaped wrong numbers:
+    plausible weights, silently not the router's.
+
+    ``num_fused_shared_experts`` needs no check -- K3's shared expert is a
+    separate KimiK3MLP merged outside the routed path, and the TopK below is
+    constructed without that argument, so no topk slot is ever a shared expert.
+    """
+    if not config.moe_renormalize:
+        raise ValueError(
+            "--kt-weight-path (margin routing) requires a router with "
+            "moe_renormalize=True. This checkpoint sets it False, so "
+            "topk_weights are raw sigmoids and the substitution reweight "
+            "would rescale every slot instead of only the replaced ones, "
+            "amplifying each MoE layer's output by the gate deficit."
+        )
+    if (config.num_expert_group or 1) > 1 or (config.topk_group or 1) > 1:
+        raise ValueError(
+            f"--kt-weight-path (margin routing) requires ungrouped expert "
+            f"selection, but this checkpoint has num_expert_group="
+            f"{config.num_expert_group} / topk_group={config.topk_group}. "
+            f"The router restricts its top-k to the chosen groups; the "
+            f"stand-in search ranks GPU-resident experts globally, so it "
+            f"could substitute an expert the router had excluded."
+        )
+
+
+def _bind_kt_correction_bias(experts: nn.Module, correction_bias: torch.Tensor) -> None:
+    """Hand the KT wrapper the router's selection bias.
+
+    Margin routing replaces a CPU-resident pick with the expert the router would
+    choose next out of the GPU-resident pool, which means ranking candidates in
+    the router's SELECTION space -- ``sigmoid(logit) + e_score_correction_bias``
+    -- not by affinity alone.  The bias lives on the gate module and does not
+    travel with the dispatch output, so the wrapper cannot reach it; this hands
+    it over once, at construction.
+
+    The Parameter is passed by reference, not copied: weights load AFTER
+    construction, so a snapshot taken here would be uninitialised memory.
+
+    A layer whose experts are ALL GPU-resident is deliberately left unwrapped
+    (kt_ep_wrapper.create_kt_config_from_server_args returns None for it), so a
+    non-wrapper quant method here is a legitimate configuration rather than an
+    error -- layer_concentrated placement and --kt-gpu-experts-ratio 1.0 both
+    produce them. Such a layer holds no CPU-resident pick to substitute, so it
+    never consults the bias and skipping is a no-op, not a degradation.
+    """
+    from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+
+    method = experts.quant_method
+    if isinstance(method, KTEPWrapperMethod):
+        method.correction_bias = correction_bias
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -430,6 +508,9 @@ class KimiK3MoE(nn.Module):
         # finalize disabled, topk forced to STANDARD; route-quant fusion
         # self-disables via its isinstance check on the wrapped method).
         self._kt_enabled = get_exec().moe.kt_weight_path is not None
+        if self._kt_enabled:
+            _assert_kt_routing_contract(config)
+            _bind_kt_correction_bias(self.experts, self.gate.e_score_correction_bias)
         # With the KT wrapper, no layer applies routed_scaling_factor: the
         # topk fuse is off (isinstance checks fail on the wrapper), the GPU
         # runner config is stripped by the wrapper, and kt-kernel never

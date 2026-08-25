@@ -1817,6 +1817,17 @@ def _build_kt_routing_margin(
 
     if fb.forward_mode.is_decode():
         counts = None
+    elif fb.forward_mode.is_target_verify() and fb.spec_info is not None:
+        # init_new routes TARGET_VERIFY down the positions-only branch, so
+        # extend_seq_lens_cpu is never assigned and the elif below would bail --
+        # dropping per-request budgets for every GENERATED token under
+        # speculative decoding while the initial prefill still honoured them.
+        # A verify batch lays out draft tokens contiguously per request
+        # (eagle_info.py steps by draft_token_num), and num_tokens_per_req
+        # auto-fills from it, so the expansion is uniform. A ragged verify batch
+        # is not uniform; it fails the length check below and falls back exactly
+        # as it does today rather than mis-assigning.
+        counts = [fb.spec_info.num_tokens_per_req] * len(per_req)
     elif fb.extend_seq_lens_cpu is not None:
         counts = fb.extend_seq_lens_cpu
     else:

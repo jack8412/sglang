@@ -201,7 +201,6 @@ class TestKTEPMergeEquivalence(CustomTestCase):
             method.gpu_experts_mask_cuda = gpu_mask.clone()
             method.logical_to_gpu_index_cuda = method.logical_to_gpu_index.clone()
             method.global_num_experts = NUM_EXPERTS
-            method.gpu_prefill_token_threshold = 0
             method._cpu_stream = None
             method._sync_done_event = None
 

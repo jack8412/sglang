@@ -40,7 +40,7 @@
 # Otherwise the image satisfies every path k3ops/launch.sh reaches for -- the
 # venv at /workspace/venv-k3, the checkout at /workspace/sglang, the cubin pool
 # under /opt, the runs/ tree -- so the launcher runs unmodified, and
-# K3_PROFILE / K3_PORT behave exactly as they do on a bare node.
+# K3_PORT behaves exactly as it does on a bare node.
 #
 # --ipc=host (or a large --shm-size) is not decoration: tp 8 moves tensors
 # through /dev/shm and the 64 MB default silently deadlocks NCCL init.
@@ -202,13 +202,24 @@ ARG BUILD_JOBS=
 # venv and warns on every install. Copying is what it falls back to anyway.
 # UV_HTTP_TIMEOUT=600: the sglang wheel index (docs.sglang.ai -> .io) has
 # stalled mid-build twice; the default timeout gives up too eagerly.
+# CARGO_*: sglang's setup.py shells out to `cargo metadata` on
+# rust/sglang-grpc/Cargo.toml, which downloads the whole crate graph -- including
+# windows-only crates, since metadata resolves every target. static.crates.io
+# stalls from this host, and cargo's DEFAULT low-speed abort (10 bytes in 30 s)
+# turns a slow transfer into a hard `code 101` failure that kills the install.
+# LOW_SPEED_LIMIT=0 disables that abort, MULTIPLEXING=false avoids the HTTP/2
+# stalls crates.io is prone to, and NET_RETRY raises cargo's own retry count.
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     WS=/workspace \
     VENV=/workspace/venv-k3 \
     PATH="/usr/local/cuda/bin:${PATH}" \
     UV_LINK_MODE=copy \
-    UV_HTTP_TIMEOUT=600
+    UV_HTTP_TIMEOUT=600 \
+    CARGO_NET_RETRY=10 \
+    CARGO_HTTP_TIMEOUT=300 \
+    CARGO_HTTP_LOW_SPEED_LIMIT=0 \
+    CARGO_HTTP_MULTIPLEXING=false
 
 # --- 0. system packages -----------------------------------------------------
 # No-op on the default base, which already has all of these. numactl and
@@ -274,6 +285,7 @@ COPY . ${WS}/sglang
 # each other is the exact class of mixed-install failure k3.sh exists to
 # prevent. The base contributes its toolchain, not its Python packages.
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     uv venv ${VENV} --python 3.12 --seed \
     && . ${VENV}/bin/activate \
     && [ "$(command -v pip)" = "${VENV}/bin/pip" ] || { echo "FATAL: pip outside venv"; exit 9; } \
@@ -323,22 +335,44 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 # --- 4. ktransformers checkout (trap 2: submodules) ------------------------
 # --depth is deliberately absent on the submodule update: kt pins submodule
 # shas, and a shallow fetch of a non-tip sha fails on many git servers.
-RUN git clone ${KT_REPO} ${WS}/ktransformers \
-    && cd ${WS}/ktransformers \
-    && if [ -n "${KT_COMMIT}" ]; then git checkout -q ${KT_COMMIT}; \
-       else git checkout -q -B ${KT_REF} origin/${KT_REF}; fi \
-    && git submodule update --init --recursive third_party/pybind11 third_party/llama.cpp \
+# COPIED from the build context, not cloned. This host's egress broke the build
+# three different ways in one evening -- the sglang wheel index stalled, cargo
+# aborted on static.crates.io ("transfer too slow"), and the kt clone died with
+# "RPC failed; curl 56 GnuTLS recv error" mid-transfer. Copying removes the
+# network from this step entirely and makes the kt source exactly reproducible.
+#
+# THE CONTEXT MUST CONTAIN ktsrc/ -- this build FAILS without it. Produce it with:
+#   git -C <ktransformers> fetch origin feat/mxfp4-kimi-k3
+#   git -C <ktransformers> checkout -B feat/mxfp4-kimi-k3 FETCH_HEAD
+#   git -C <ktransformers> submodule update --init --recursive \
+#       third_party/pybind11 third_party/llama.cpp
+#   rsync -a --delete <ktransformers>/ <context>/ktsrc/
+# The two submodules are NOT optional: kt-kernel's CMake add_subdirectory's them
+# and an empty checkout dies at configure with
+# "Unknown CMake command pybind11_add_module".
+COPY ktsrc ${WS}/ktransformers
+
+RUN cd ${WS}/ktransformers \
+    # A stale ktsrc/ is the failure this guards. KT_COMMIT says what the caller
+    # believes it copied; .git says what it actually copied. Disagreement means
+    # the context was not refreshed, which is exactly how a wheel built from a
+    # sha that predates packed staging shipped once already.
+    && resolved=$(git rev-parse HEAD 2>/dev/null || echo unknown) \
+    && if [ -n "${KT_COMMIT}" ] && [ "$resolved" != "${KT_COMMIT}" ]; then \
+         echo "FATAL: ktsrc is at $resolved but KT_COMMIT=${KT_COMMIT} -- stale build context" >&2; \
+         exit 9; \
+       fi \
     && test -f third_party/pybind11/CMakeLists.txt \
     && test -f third_party/llama.cpp/CMakeLists.txt \
-    && echo "kt $(git log --oneline -1)" \
-    # Record the RESOLVED sha in the image. With KT_COMMIT empty (branch-tip
-    # tracking) the build ARG does not say what was actually built, and the
-    # LABEL cannot be computed from a RUN -- so write it to a file. This is the
-    # only way to answer "which kt is in this image?" after the fact.
-    && printf 'kt_repo=%s\nkt_ref=%s\nkt_commit_requested=%s\nkt_commit_resolved=%s\nkt_subject=%s\n' \
-         "${KT_REPO}" "${KT_REF}" "${KT_COMMIT:-<branch tip>}" \
-         "$(git rev-parse HEAD)" "$(git log -1 --format=%s)" \
+    && echo "kt $(git log --oneline -1 2>/dev/null || echo "$resolved (no .git)")" \
+    && printf 'kt_repo=%s\nkt_ref=%s\nkt_commit_requested=%s\nkt_commit_resolved=%s\nkt_subject=%s\nkt_source=%s\n' \
+         "${KT_REPO}" "${KT_REF}" "${KT_COMMIT:-<context copy>}" \
+         "$resolved" "$(git log -1 --format=%s 2>/dev/null || echo unknown)" \
+         "COPY ktsrc (build context)" \
          > /opt/k3-build-info.txt \
+    # Drop history: ~94 MB that the runtime never reads. The sha is preserved
+    # in /opt/k3-build-info.txt above, so provenance survives.
+    && rm -rf .git \
     && cat /opt/k3-build-info.txt
 
 # --- 5. kt-kernel (traps 1 and 3) ------------------------------------------

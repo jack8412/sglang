@@ -332,7 +332,6 @@ class TestTransportConfigRails(CustomTestCase):
         kt_gpu_experts_ratio=None,
         kt_num_gpu_experts=0,
         kt_routing_margin=None,
-        kt_gpu_prefill_token_threshold=None,
         kt_max_deferred_experts_per_token=None,
         kt_cold_only_cpu_experts=False,
         kt_expert_swap_transitions=0,

@@ -2971,11 +2971,6 @@ class ServerArgs:
         "[ktransformers parameter] Ratio of total experts (across all MoE layers) to place on GPU, in (0.0, 1.0]. If set, overrides --kt-num-gpu-experts.",
         NS("exec.moe"),
     ] = None
-    kt_gpu_prefill_token_threshold: A[
-        Optional[int],
-        "[ktransformers parameter] Token threshold for the full-GPU prefill fallback: when a batch's token count reaches it, the complete layer's experts are temporarily streamed to GPU instead of using CPU experts. DEPRECATED for margin-routed serving — it is slower, costs 7.54 GiB/GPU, and bypasses margin routing. Leave unset.",
-        NS("exec.moe"),
-    ] = None
     kt_expert_placement_strategy: A[
         Literal[
             "frequency", "front-loading", "uniform", "random", "layer_concentrated"
@@ -2988,14 +2983,9 @@ class ServerArgs:
         "[ktransformers parameter] Number of MoE layers placed fully on CPU under the layer_concentrated placement strategy (evenly spaced across the MoE stack; the dense prefix is excluded by construction). Required when the strategy is layer_concentrated.",
         NS("exec.moe"),
     ] = None
-    kt_enable_dynamic_expert_update: A[
-        bool,
-        "[ktransformers parameter] Enable dynamic GPU expert updates from runtime statistics: after a full-GPU prefill fallback, the resident GPU expert set is updated to the batch's most-activated experts. Not supported for MXFP4 expert layouts.",
-        NS("exec.moe"),
-    ] = False
     kt_routing_margin: A[
         Optional[float],
-        "Margin routing over KT-wrapped MoE layers: a routed expert that is CPU-resident is replaced by the token's best not-yet-selected GPU-resident expert when its router-logit lead over that alternative is below this margin (an 'override'); larger leads keep the CPU expert (an 'insist'). Unit: router-logit gap. 0.0 counts insists/overrides without substituting; unset disables the feature entirely (bit-exact routing).",
+        "Per-token substitution BUDGET for KT-wrapped MoE layers, as a share of the token's own mixture weight in [0, 1]. Routed picks that are CPU-resident are replaced by not-yet-selected GPU-resident experts (an 'override'), smallest weight first, until the token's substituted share would exceed this budget; the rest stay on the CPU path (an 'insist'). A stand-in does NOT inherit the weight of the pick it replaces: the mixture weights are recomputed over the resulting set of experts, each member at its own router gate and renormalised across the set -- REAP's rule (drop the expert, recompute the top-k weights without it) applied per token and per layer. Inheriting would run a below-cut expert at an above-cut weight, and an expert's output is fitted to the gate it trains under, since the loss only sees the product g_k*f_k. The budget is therefore a BOUND on how far substitution can move any token's layer output, at each of the 92 layers: a layer computes y = sum_j w_j f_j(x), so replacing slot j costs w_j * ||f_sub - f_orig|| -- linear in that slot's weight and independent of the router logit that put it there. 0.0 counts insists/overrides without substituting; >= 1.0 places no bound (equivalent to --kt-routing-full-override); unset disables the feature entirely (bit-exact routing). NOTE: this used to be a router-logit gap against the best unselected resident. That rule bounded nothing -- its comparison point sits at the top-k selection boundary by construction, so it collapsed towards zero on flat-routing tokens and substituted the whole CPU tail exactly where the model blends most experts -- and it has been removed. A value tuned for it does not carry over and must be re-swept.",
         NS("exec.moe"),
     ] = None
     kt_transport: A[
@@ -3010,7 +3000,7 @@ class ServerArgs:
     ] = 2
     kt_cold_only_cpu_experts: A[
         bool,
-        "Hold CPU expert weights only for experts this rank does NOT keep on the GPU. kt-kernel otherwise allocates an AMX weight buffer for every expert of every wrapped layer and masks GPU-resident ones out at forward time -- 896 experts x 92 layers x ~17.55 MB = ~1.45 TB on Kimi-K3, against ~447 GB actually served at 620/896 resident. Frees ~1 TB for HiCache and cuts the weight load, which is 75% of startup. Requires --kt-routing-margin: the buffers a GPU-resident expert never computes are still READ by the full-GPU prefill fallback and the layerwise prefill manager, both of which margin routing refuses.",
+        "Hold CPU expert weights only for experts this rank does NOT keep on the GPU. kt-kernel otherwise allocates an AMX weight buffer for every expert of every wrapped layer and masks GPU-resident ones out at forward time -- 896 experts x 92 layers x ~17.55 MB = ~1.45 TB on Kimi-K3, against ~447 GB actually served at 620/896 resident. Frees ~1 TB for HiCache and cuts the weight load, which is 75% of startup. Nothing reads the buffers a GPU-resident expert never computes: the full-GPU prefill fallback and the layerwise prefill manager, the two paths that exported resident experts from their CPU buffers, have both been removed.",
         NS("exec.moe"),
     ] = False
     kt_conditional_cpu_branch: A[
@@ -6907,16 +6897,36 @@ class ServerArgs:
                 )
             return
 
-        if self.kt_routing_margin is not None and not (
-            self.kt_routing_margin >= 0.0
-        ):
-            # NaN fails the >= test too: `NaN < 0.0` is False, so a naive
-            # lower-bound check would admit it, and a NaN margin compares
-            # False everywhere — i.e. 100% insists, the exact inverse of the
-            # intended bias and fatal under the full-override skip.
-            raise ValueError(
-                f"--kt-routing-margin must be a number >= 0.0 (0.0 = "
-                f"count-only), got {self.kt_routing_margin}."
+        if self.kt_routing_margin is not None:
+            # The margin is a SHARE of each token's mixture weight, which sums
+            # to 1 by construction, so its whole range is [0, 1].
+            #
+            # NaN fails this comparison, and must: `NaN < 0.0` is False, so a
+            # naive lower-bound check would admit it, and a NaN threshold
+            # compares False everywhere -- i.e. 100% insists, the exact inverse
+            # of the intended bias and fatal under the full-override skip.
+            #
+            # Above 1.0 is REFUSED rather than clamped to the no-bound
+            # endpoint: such a value is almost certainly a leftover router-logit
+            # margin from the rule this replaced (production ran 0.5 and the
+            # sweep went to 5.0), and clamping would serve a silently different
+            # quality point under a familiar-looking number.
+            if not 0.0 <= self.kt_routing_margin <= 1.0:
+                raise ValueError(
+                    f"--kt-routing-margin is a per-token BUDGET -- the share "
+                    f"of a token's own mixture weight that substitution may "
+                    f"move -- so it must lie in [0.0, 1.0] (0.0 = count-only, "
+                    f"1.0 = no bound), got {self.kt_routing_margin}. It used "
+                    f"to be a router-logit gap against the best unselected "
+                    f"resident; that rule has been removed and its values do "
+                    f"not carry over. Re-sweep."
+                )
+            logger.info(
+                "[kt] --kt-routing-margin %.4g: up to %.1f%% of each token's "
+                "mixture weight may be substituted away from CPU-resident "
+                "experts, per layer (smallest-weight slots first)",
+                self.kt_routing_margin,
+                100.0 * self.kt_routing_margin,
             )
 
         if self.kt_cold_transport == "arena-dma":
@@ -6948,24 +6958,6 @@ class ServerArgs:
                     "[kt] --kt-cold-transport arena-dma: set "
                     "KT_BUFFER_B_MEMFD=1 for kt"
                 )
-
-        if self.kt_gpu_prefill_token_threshold and self.kt_routing_margin is not None:
-            # The full-GPU sweep predates margin routing and is strictly worse
-            # with it. Measured on Kimi-K3 (8xB200), margin 0.5, placement held
-            # constant: 30k-token prefill 448.9 tok/s with the sweep vs 2,335
-            # without (5.2x); 1k-token prompts paid 35 s for a full sweep. It
-            # also allocates 7.54 GiB/GPU of slots, and -- because it returns
-            # before the override block -- it bypasses margin routing entirely,
-            # so those tokens are computed under different routing than decode
-            # AND contribute nothing to the counters that drive expert swaps.
-            raise ValueError(
-                "--kt-gpu-prefill-token-threshold is incompatible with "
-                "--kt-routing-margin: the full-GPU prefill sweep is 5.2x "
-                "SLOWER than margin-routed prefill (448.9 vs 2,335 tok/s at "
-                "30k tokens), costs 7.54 GiB/GPU, bypasses margin routing so "
-                "prefill and decode disagree, and starves expert swapping of "
-                "its statistics. Unset it."
-            )
 
         if self.kt_transport == "hostnode" and self.kt_max_deferred_experts_per_token:
             raise ValueError(
@@ -7028,22 +7020,6 @@ class ServerArgs:
                     f"paths still fill every expert's buffer unconditionally and "
                     f"would dereference the ones that are no longer allocated."
                 )
-            if self.kt_routing_margin is None:
-                raise ValueError(
-                    "--kt-cold-only-cpu-experts requires --kt-routing-margin. "
-                    "Without margin routing the full-GPU prefill fallback and "
-                    "the layerwise prefill manager are reachable, and both READ "
-                    "the CPU-side weights of GPU-resident experts to export them "
-                    "to the device -- exactly the buffers this flag stops "
-                    "allocating. Margin routing refuses both."
-                )
-            if self.kt_gpu_prefill_token_threshold:
-                raise ValueError(
-                    "--kt-cold-only-cpu-experts is incompatible with "
-                    "--kt-gpu-prefill-token-threshold: the sweep exports "
-                    "GPU-resident experts from their CPU buffers, which this "
-                    "flag no longer allocates."
-                )
 
         if self.kt_conditional_cpu_branch:
             raise ValueError(
@@ -7090,18 +7066,7 @@ class ServerArgs:
             # Full override no longer builds the KT wrapper or loads any CPU
             # expert weight (kt_ep_wrapper: _skip_cpu_path gates construction),
             # which is what makes it start in minutes instead of loading ~1.45 TB
-            # it never reads. The two flags below are the ways something would
-            # still go looking for those weights.
-            if self.kt_gpu_prefill_token_threshold:
-                raise ValueError(
-                    "--kt-routing-full-override is incompatible with "
-                    "--kt-gpu-prefill-token-threshold: full override does not "
-                    "load CPU expert weights at all, and the full-GPU prefill "
-                    "path exports them to the device from host staging buffers "
-                    "that were never written. On the MXFP4 layerwise path that "
-                    "raises mid-request; on the other layouts it silently "
-                    "prefills from uninitialised memory. Drop one of them."
-                )
+            # it never reads.
             if self.kt_expert_swap_transitions > 0:
                 raise ValueError(
                     "--kt-routing-full-override is incompatible with "
@@ -7167,12 +7132,6 @@ class ServerArgs:
                 "--init-expert-location pointing at logical_count activation "
                 "data (.pt/.json)."
             )
-
-        # MXFP4 + dynamic expert update is supported (F2,
-        # copy_experts_weights_mxfp4). The E8M0-resident wheel requirement is
-        # feature-checked at KTEPWrapperMethod init via the wheel's own
-        # mxfp4_buffer_bytes footprint — a config-time rail here could only
-        # version-guess, so none is kept.
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""

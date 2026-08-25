@@ -1,6 +1,5 @@
 #!/bin/bash
 # usage: launch.sh <name> [extra server args...]
-#        K3_PROFILE=prod|prod01|margin10|ceiling|bare   (default: prod)
 #        K3_PORT=<n>      server port (default 30000, sglang's well-known one)
 #
 # The K3 server launcher. Lives in the repo so a bootstrapped node has it
@@ -8,42 +7,26 @@
 # lived only on the node and evaporated with the rental.
 #
 # ---------------------------------------------------------------------------
-# PROFILES
+# ROUTING FLAGS -- none. Pass them yourself.
 # ---------------------------------------------------------------------------
-# Margin routing is the product, not a variant: the point of the campaign is to
-# make it faster, and everything else here exists to measure it. So `prod` is
-# the default and carries the full shipping recipe. The instrument profiles are
-# separate rather than "prod minus a flag" for a concrete reason -- see the
-# store_true warning below.
+# This launcher emits NO routing flags. --kt-routing-margin,
+# --kt-routing-full-override, --kt-cold-only-cpu-experts and the expert-swap
+# knobs are all yours to pass as trailing args, and with none passed the server
+# routes bit-exactly (margin routing off).
 #
-#   prod      margin 0.5 + cold-only + swapping. Verified end to end by phase
-#             CS: -0.0215 nats vs exact routing, greedy output byte-identical,
-#             swapped-in experts bitwise-match the bulk loader on every NUMA
-#             partition. This is what the numbers in HANDOFF describe.
-#   prod01    the same stack at margin 0.1 -- the quality-first end of the
-#             tradeoff. A smaller margin substitutes LESS, so more tokens reach
-#             their CPU-resident first choice: closer to exact routing and
-#             slower. The sweep that established the shape (phase C, uniform
-#             placement, pre-optimisation build) read 31.8 / 42.0 / 47.7 tok/s
-#             at margin 0.1 / 1.0 / 10. Its nats are UNMEASURED -- margin 0.0
-#             is bit-exact (phase B) and 0.5 is -0.0215, so 0.1 sits between,
-#             but gate it with logprobs before quoting it as a serving option.
-#   margin10  margin 10. NOT a serving mode -- its nats are identical to full
-#             override to four decimals (-0.5942), i.e. the same 31% of experts
-#             made unreachable, 8 tok/s slower. It exists to measure the
-#             sglang-side machinery with almost no CPU compute underneath.
-#   ceiling   full override, no margin at all. The GPU-only floor. Builds no KT
-#             wrapper and loads NO CPU expert weights (they are never computed),
-#             so it starts in minutes rather than loading ~1.45 TB it never reads
-#             -- which also stops it evicting the page cache for later rows.
-#   bare      nothing routing-related. For A/B rows that set every knob
-#             themselves, and the only safe base for a row that must NOT have
-#             cold-only or swapping on.
+# The named profiles that used to live here are gone. They bundled a margin
+# value with cold-only and swapping under a one-word name, and the bundling is
+# what made them dangerous: --kt-routing-margin changed meaning (a router-logit
+# gap became a per-token share of the mixture weight) and every profile kept
+# serving its old number under its old name. A flag list you can read at the
+# call site cannot rot that way.
 #
-# WARNING -- trailing args can override a VALUED flag (argparse keeps the last
-# occurrence) but CANNOT unset a store_true one. `--kt-cold-only-cpu-experts`
-# and `--kt-routing-full-override` cannot be turned off by anything you append.
-# A row that needs them off must choose a profile that never sets them.
+# The removal also lifts a real limitation. Trailing args override a VALUED
+# flag -- argparse keeps the last occurrence -- but CANNOT unset a store_true
+# one, so while a profile set --kt-cold-only-cpu-experts or
+# --kt-routing-full-override there was no way to turn it back off from the
+# command line. Nothing here sets them now, so every routing knob is reachable
+# in both directions.
 #
 # ---------------------------------------------------------------------------
 # Evidence for the non-obvious defaults
@@ -53,16 +36,15 @@
 #   hostnode, so the launcher sets doorbell explicitly. Full-override ceiling
 #   rows ran hostnode (transport absent from their graph) -- pass
 #   --kt-transport hostnode to reproduce those exactly.
-# - cold-only requires --kt-routing-margin, which is why it lives in `prod`
-#   and not in the shared defaults (CO1: outputs byte-identical, -0.0215 nats
-#   unchanged, ~1 TB host RAM freed, weight load 110 s).
+# - --kt-cold-only-cpu-experts requires --kt-routing-margin (server_args
+#   refuses it otherwise), so the two travel together or not at all. Measured
+#   on the OLD router-logit rule (CO1: outputs byte-identical, -0.0215 nats
+#   unchanged, ~1 TB host RAM freed, weight load 110 s); the margin's unit has
+#   since changed, so re-sweep before quoting those numbers again.
 # - attention backends: leave UNSET -- the KimiK3 override resolves all three
 #   to trtllm_mla on SM100/SM103 (verified in every old log). The fa2
 #   UserWarning from the flashinfer prefill wrapper appeared in every old
 #   campaign log too; it is noise, not a config error.
-# - --kt-gpu-prefill-token-threshold deliberately absent: the full-GPU sweep is
-#   5.2x slower than margin-routed prefill, costs 7.54 GiB/GPU, and is refused
-#   at config time when a margin is set.
 set -u
 
 NAME=${1:?usage: launch.sh <name> [extra server args...]}; shift
@@ -180,24 +162,12 @@ CPUINF=$(( PER_POOL * KTPOOLS ))
 # this launcher discovering a *.pt and applying it behind your back. With no
 # flag emitted, sglang uses its default (uniform) placement.
 
-# The routing skeleton. Everything the campaign varies lives here and nowhere
-# else, so a row's identity is one word rather than a flag list to diff.
-PROFILE=${K3_PROFILE:-prod}
-case "$PROFILE" in
-  prod)     ROUTING=(--kt-routing-margin 0.5 --kt-cold-only-cpu-experts
-                     --kt-expert-swap-transitions 5 --kt-expert-swap-max 8) ;;
-  prod01)   ROUTING=(--kt-routing-margin 0.1 --kt-cold-only-cpu-experts
-                     --kt-expert-swap-transitions 5 --kt-expert-swap-max 8) ;;
-  margin10) ROUTING=(--kt-routing-margin 10) ;;
-  ceiling)  ROUTING=(--kt-routing-full-override) ;;
-  bare)     ROUTING=() ;;
-  *) echo "FATAL: unknown K3_PROFILE '$PROFILE' (prod|prod01|margin10|ceiling|bare)" | tee -a $LOG >&2; exit 2 ;;
-esac
-
-echo "[launch] $NAME profile=$PROFILE placement=sglang-default(uniform)" >> $LOG
+# Routing is not set here -- see the header. The flags the caller appended are
+# echoed so a log identifies its own row without needing the shell history.
+echo "[launch] $NAME placement=sglang-default(uniform) args: $*" >> $LOG
 
 # Every flag below can be overridden by passing it again in the extra args:
-# argparse keeps the last value (store_true flags excepted -- see the warning
+# argparse keeps the last value (store_true flags excepted -- see ROUTING FLAGS
 # at the top of this file).
 exec python -m sglang.launch_server \
   --model-path $WS/k3 --trust-remote-code --tp 8 --port ${K3_PORT:-30000} --host 127.0.0.1 \
@@ -205,6 +175,5 @@ exec python -m sglang.launch_server \
   --kt-num-gpu-experts 620 \
   --kt-threadpool-count $KTPOOLS --kt-cpuinfer $CPUINF \
   --kt-transport doorbell \
-  "${ROUTING[@]}" \
   --moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4 \
   "$@" >> $LOG 2>&1
