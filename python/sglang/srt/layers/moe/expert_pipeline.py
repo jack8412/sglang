@@ -24,113 +24,13 @@ incorrectly.
 from __future__ import annotations
 
 import logging
-import os
-import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.kt_mxfp4_export import WEIGHT_NAMES
 
 logger = logging.getLogger(__name__)
-
-
-class _OverlapProbe:
-    """Per-layer copy/compute timing for the prefetch, read after the pass.
-
-    The number that decides whether prefetch is working is not the copy
-    duration on its own -- it is how long the COMPUTE stream sat blocked
-    waiting for it.  ``wait_prefetch`` issues a stream wait, so bracketing
-    that wait with two events on the compute stream measures the stall
-    directly: if the copy landed early the two events are adjacent, and if it
-    did not, the gap is exactly the time prefetch failed to hide.
-
-    Events are recorded during the pass and only read once it has finished,
-    so nothing here synchronises the hot path.
-    """
-
-    def __init__(self, num_layers: int):
-        def events():
-            return [
-                torch.cuda.Event(enable_timing=True) for _ in range(num_layers)
-            ]
-
-        self._copy_begin, self._copy_end = events(), events()
-        self._stall_begin, self._stall_end = events(), events()
-        self._compute_end = events()
-        self._copied: set = set()
-        self._computed: set = set()
-        # Host-side, per layer: how long prefetch_layer waited for the arena
-        # gather BEFORE enqueuing the H2D. Without it that wait hides inside
-        # the copy interval (the copy stream sits idle between copy_begin and
-        # the late-enqueued copies) and a gather-headroom deficit reads as an
-        # H2D-bandwidth regression.
-        self._gather_wait_ms: Dict[int, float] = {}
-
-    def copy_begin(self, pos, stream):
-        self._copy_begin[pos].record(stream)
-
-    def copy_end(self, pos, stream):
-        self._copy_end[pos].record(stream)
-        self._copied.add(pos)
-
-    def stall_begin(self, pos, stream):
-        self._stall_begin[pos].record(stream)
-
-    def stall_end(self, pos, stream):
-        self._stall_end[pos].record(stream)
-
-    def compute_end(self, pos, stream):
-        self._compute_end[pos].record(stream)
-        self._computed.add(pos)
-
-    def gather_wait(self, pos, ms):
-        self._gather_wait_ms[pos] = ms
-
-    def summarize(self) -> Optional[str]:
-        """One line per pass. Caller must have synchronised both streams."""
-        rows = []
-        for pos in sorted(self._computed & self._copied):
-            try:
-                copy = self._copy_begin[pos].elapsed_time(self._copy_end[pos])
-                stall = self._stall_begin[pos].elapsed_time(self._stall_end[pos])
-                compute = self._stall_end[pos].elapsed_time(self._compute_end[pos])
-            except RuntimeError:
-                continue                # event never recorded this pass
-            rows.append((pos, copy, stall, compute))
-        self._copied.clear()
-        self._computed.clear()
-        if not rows:
-            return None
-
-        n = len(rows)
-        copy = [r[1] for r in rows]
-        stall = [r[2] for r in rows]
-        compute = [r[3] for r in rows]
-        tot_stall = sum(stall)
-        tot_compute = sum(compute)
-        # Margin: the compute window a copy had to hide under, minus the copy.
-        margins = [comp - cp for cp, comp in zip(copy, compute)]
-        worst = min(range(n), key=lambda i: margins[i])
-        # The stall share is quoted against stall + MoE compute -- the window
-        # this probe can see. It is NOT a share of the forward, which also
-        # contains attention, the dense path and communication; dividing by
-        # the forward needs a number the pipeline does not have.
-        gw = [self._gather_wait_ms.get(r[0], 0.0) for r in rows]
-        self._gather_wait_ms.clear()
-        return (
-            f"[cold-pipeline] {n} layers | "
-            f"copy {sum(copy)/n:.1f} ms avg (max {max(copy):.1f}), "
-            f"{sum(copy)/1000:.2f} s total | "
-            f"gather-wait {sum(gw)/n:.1f} ms avg (max {max(gw):.1f}) | "
-            f"moe {tot_compute/n:.1f} ms avg | "
-            f"STALL {tot_stall/n:.2f} ms avg, {max(stall):.1f} max, "
-            f"{tot_stall:.0f} ms total = "
-            f"{100*tot_stall/max(tot_stall+tot_compute, 1e-9):.0f}% of stall+moe "
-            f"| worst margin {margins[worst]:+.1f} ms at layer pos {rows[worst][0]}"
-        )
 
 
 class ColdExpertPipeline:
@@ -217,17 +117,6 @@ class ColdExpertPipeline:
         for ev in self._consume_events:
             ev.record(cur)
 
-        # Toggleable per PASS, not fixed at boot: reset() re-reads the env, so
-        # `SGLANG_DEBUG_KT_PIPELINE_OVERLAP=1` exported into a running
-        # server's environment... cannot work cross-process -- but the env CAN
-        # be flipped via the /set_envs debug route or a config reload without
-        # a 17-minute reboot. Costing a boot per decomposition was the bug.
-        self._probe = (
-            _OverlapProbe(len(self._layers))
-            if envs.SGLANG_DEBUG_KT_PIPELINE_OVERLAP.get()
-            else None
-        )
-
         def _gib(bufs) -> float:
             return sum(
                 t.numel() * t.element_size() for buf in bufs for t in buf.values()
@@ -259,24 +148,9 @@ class ColdExpertPipeline:
     def prefetch_layer(self, layer_idx: int) -> None:
         """Copy one layer's cold experts into its slot on the copy stream."""
         slot = self._slot(layer_idx)
-        if self._probe is not None:
-            # Resolve the (arena) gather BEFORE copy_begin and time it
-            # host-side: one name waits the layer's whole gather, so the
-            # in-loop layer_rows calls return instantly and copy_begin ->
-            # copy_end goes back to measuring the transfer alone. A plain
-            # store pays a dict lookup.
-            t0 = time.perf_counter()
-            self._source.layer_rows(layer_idx, WEIGHT_NAMES[0])
-            self._probe.gather_wait(
-                self._pos[layer_idx], (time.perf_counter() - t0) * 1e3
-            )
         with torch.cuda.stream(self._copy_stream):
             # WAR: the slot's previous occupant must be done being read.
             self._copy_stream.wait_event(self._consume_events[slot])
-            # After the WAR wait, so this times the transfer and not the
-            # queueing behind the previous occupant.
-            if self._probe is not None:
-                self._probe.copy_begin(self._pos[layer_idx], self._copy_stream)
             if self._raw_buffers is None:
                 dst = self._buffers[slot]
                 for name in WEIGHT_NAMES:
@@ -290,8 +164,6 @@ class ColdExpertPipeline:
                 # idles most of every layer. The prefetch event therefore now
                 # means "the raw block has landed", not "resident is ready".
                 self._issue_raw(slot, layer_idx)
-            if self._probe is not None:
-                self._probe.copy_end(self._pos[layer_idx], self._copy_stream)
             self._prefetch_events[slot].record(self._copy_stream)
         # After the copies are enqueued: an arena source uses this to recycle
         # its staging slot once the DMA completes; the store's is a no-op.
@@ -349,11 +221,7 @@ class ColdExpertPipeline:
                 f"holds layer {self._slot_layer[slot]} -- prefetch order broke"
             )
         cur = torch.cuda.current_stream(self._device)
-        if self._probe is not None:
-            self._probe.stall_begin(self._pos[layer_idx], cur)
         cur.wait_event(self._prefetch_events[slot])
-        if self._probe is not None:
-            self._probe.stall_end(self._pos[layer_idx], cur)
         if self._raw_buffers is None:
             return self._buffers[slot]
         # One resident buffer is enough because this stream both writes and
@@ -370,8 +238,6 @@ class ColdExpertPipeline:
         """Release this layer's slot and start the layer two ahead."""
         slot = self._slot(layer_idx)
         cur = torch.cuda.current_stream(self._device)
-        if self._probe is not None:
-            self._probe.compute_end(self._pos[layer_idx], cur)
         if self._raw_buffers is None:
             # Plain store: the copy stream writes the resident buffer itself,
             # so the slot is free only once the MoE has read it. When
@@ -395,18 +261,7 @@ class ColdExpertPipeline:
         # Both streams are idle here, so the PREVIOUS pass's events are all
         # complete and readable -- this is the one place the summary costs
         # nothing extra.
-        if self._probe is not None:
-            line = self._probe.summarize()
-            if line is not None:
-                logger.info("%s", line)
         self._slot_layer = [None] * self.NUM_SLOTS
-        # Re-evaluate the probe toggle at every pass boundary so enabling the
-        # decomposition never costs a reboot.
-        want_probe = envs.SGLANG_DEBUG_KT_PIPELINE_OVERLAP.get()
-        if want_probe and self._probe is None:
-            self._probe = _OverlapProbe(len(self._layers))
-        elif not want_probe and self._probe is not None:
-            self._probe = None
         # Both streams are idle (synchronized above), so the source can drain
         # its gather threads without racing any in-flight DMA.
         self._source.reset()

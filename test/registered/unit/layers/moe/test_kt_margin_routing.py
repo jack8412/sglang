@@ -868,5 +868,77 @@ class TestKtRoutingContractGuard(CustomTestCase):
         self._guard(KimiLinearConfig())
 
 
+class TestSplitPrefillMinTokens(CustomTestCase):
+    """Critical-path bookkeeping for --kt-expert-split-prefill-min-tokens.
+
+    It used to be _SPLIT_PREFILL_MIN_TOKENS, a module constant, so the only way
+    to move it was an edit. The value is a BREAK-EVEN against the CPU-expert
+    path (1.99 s fixed cold stream x ~1,400 tok/s = ~2,800 tokens, 4096 rounded
+    up), and the trap it exists to avoid is setting it to the chunk size --
+    which leaves only exactly-full chunks qualifying and drops every remainder
+    onto the CPU path (65,498 tokens = 32768 split + 32730 CPU, 6.4x slower).
+    """
+
+    def _args(self, **kw):
+        from sglang.srt.server_args import ServerArgs
+
+        base = dict(
+            model_path="/dummy",
+            kt_weight_path="/dummy",
+            kt_method="MXFP4",
+        )
+        base.update(kw)
+        return ServerArgs(**base)
+
+    def test_default_is_the_measured_break_even(self):
+        self.assertEqual(self._args().kt_expert_split_prefill_min_tokens, 4096)
+
+    def test_zero_is_refused(self):
+        # 0 arms split prefill on every forward, decode included, where a fixed
+        # ~2 s cold stream buys nothing at all.
+        with self.assertRaises(ValueError) as cm:
+            self._args(kt_expert_split_prefill_min_tokens=0)
+        self.assertIn("must be >= 1", str(cm.exception))
+
+    def test_negative_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._args(kt_expert_split_prefill_min_tokens=-1)
+
+    def test_at_or_above_chunk_size_warns(self):
+        """The chunk-size trap, as a warning rather than a refusal.
+
+        A deliberately huge threshold is a legitimate way to disable split
+        prefill for one run, so this must not raise -- but silently taking the
+        CPU path on every remainder chunk is the 6.4x regression, so it must
+        not be silent either.
+        """
+        with self.assertLogs("sglang.srt.server_args", level="WARNING") as log:
+            self._args(
+                kt_expert_split_prefill=True,
+                chunked_prefill_size=4096,
+                kt_expert_split_prefill_min_tokens=4096,
+            )
+        self.assertIn("every remainder falls back", "".join(log.output))
+
+    def test_below_chunk_size_is_quiet(self):
+        # The positive branch, so the warning above cannot be "fixed" by
+        # firing on every configuration.
+        args = self._args(
+            kt_expert_split_prefill=True,
+            chunked_prefill_size=32768,
+            kt_expert_split_prefill_min_tokens=4096,
+        )
+        self.assertEqual(args.kt_expert_split_prefill_min_tokens, 4096)
+
+    def test_the_threshold_reaches_the_wrapper(self):
+        # The whole point of the change: the value must travel from the flag to
+        # the gate. Red if KTConfig or the wrapper stops carrying it.
+        from sglang.srt.layers.moe.kt_ep_wrapper import KTConfig
+
+        self.assertEqual(
+            KTConfig.__dataclass_fields__["split_prefill_min_tokens"].default, 4096
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

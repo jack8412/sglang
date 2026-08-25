@@ -3038,6 +3038,11 @@ class ServerArgs:
         "Run the --kt-expert-split-prefill MoE in token tiles of this many tokens (0 = the whole chunk in one call). A token's MoE output depends only on its own row, so tiling changes no value, but the two large transients -- the gemm2 buffer the kernel sizes for ALL T*top_k slots, and the fp32 finalize accumulator -- then scale with the tile instead of the chunk. Measured at a 49152 chunk: 7.01 GiB peak untiled vs 2.94 GiB at a 16384 tile, for ~7% more MoE time (~1.3% of the forward). This is what lets a large prefill chunk coexist with a long-context KV pool. Ignored unless --kt-expert-split-prefill is set.",
         NS("exec.moe"),
     ] = 0
+    kt_expert_split_prefill_min_tokens: A[
+        int,
+        "Smallest forward --kt-expert-split-prefill will take, in tokens; below it the layer keeps the margin-routed CPU-expert path. This is a BREAK-EVEN against that path, not a chunk size. The split path's cost is dominated by a FIXED per-forward stream -- every cold expert lands once however many tokens the forward carries -- so it wins above roughly (stream seconds x CPU tokens/s): 1.99 s and ~1,400 tok/s measured on Kimi-K3/8xB200 give ~2,800 tokens, and the 4096 default is that rounded up. Do NOT set it to --chunked-prefill-size: only an exactly-full chunk would then qualify and the scheduler's remainder would always fall back -- a 65,498-token prompt became 32768 (split, 2.0 s) + 32730 (CPU, 23 s), 38 tokens short of the threshold and 6.4x slower overall. Re-derive it if the cold transport or the CPU-expert rate changes. Ignored unless --kt-expert-split-prefill is set.",
+        NS("exec.moe"),
+    ] = 4096
     record_kt_gpu_expert_distribution: A[
         bool,
         "[ktransformers parameter] Record the per-layer GPU-resident expert mask each forward pass; dumped with the expert distribution stats.",
@@ -6922,6 +6927,36 @@ class ServerArgs:
                 "experts, per layer (smallest-weight slots first)",
                 self.kt_routing_margin,
                 100.0 * self.kt_routing_margin,
+            )
+
+        if self.kt_expert_split_prefill_min_tokens < 1:
+            # 0 would arm split prefill on every forward including decode, where
+            # a fixed ~2 s cold stream buys nothing; negative is meaningless.
+            # The gate is `num_tokens >= threshold` and decode carries 1 token
+            # per sequence, so 1 is the smallest value that still means
+            # "prefill only" on a single-token step.
+            raise ValueError(
+                f"--kt-expert-split-prefill-min-tokens must be >= 1, got "
+                f"{self.kt_expert_split_prefill_min_tokens}."
+            )
+        if (
+            self.kt_expert_split_prefill
+            and self.chunked_prefill_size
+            and self.kt_expert_split_prefill_min_tokens >= self.chunked_prefill_size
+        ):
+            # At or above the chunk size only an exactly-full chunk qualifies,
+            # so every remainder chunk silently takes the CPU path -- the 6.4x
+            # regression the flag help describes. A warning rather than a
+            # refusal: a deliberately huge threshold is a legitimate way to
+            # disable split prefill for one run.
+            logger.warning(
+                "[kt] --kt-expert-split-prefill-min-tokens %d >= "
+                "--chunked-prefill-size %d: only an exactly-full chunk will "
+                "take the split path and every remainder falls back to the "
+                "CPU-expert path. The threshold is a break-even (~2,800 "
+                "tokens), not a chunk size.",
+                self.kt_expert_split_prefill_min_tokens,
+                self.chunked_prefill_size,
             )
 
         if self.kt_cold_transport == "arena-dma":

@@ -339,7 +339,6 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 # Snapshot at import (= launch): flipping the env later must not open the
 # runtime-probing door on a server that started with it closed.
-KT_RUNTIME_PROBING_ALLOWED = envs.SGLANG_DEBUG_KT_RUNTIME_PROBING.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
@@ -4272,7 +4271,6 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
-                "kt_pipeline_overlap_probe",
             ]
         )
 
@@ -4280,13 +4278,6 @@ class Scheduler(
         for k, v in server_args_dict.items():
             if k not in args_allow_update:
                 logging.warning(f"Updating {k} is not supported.")
-                if_success = False
-                break
-            elif k == "kt_pipeline_overlap_probe" and not KT_RUNTIME_PROBING_ALLOWED:
-                logging.warning(
-                    "kt_pipeline_overlap_probe rejected: this server was "
-                    "launched without SGLANG_DEBUG_KT_RUNTIME_PROBING=1"
-                )
                 if_success = False
                 break
             elif k == "pp_max_micro_batch_size" and (
@@ -4338,15 +4329,6 @@ class Scheduler(
             # DSpark control keys are worker commands, not server args; route
             # them to the draft worker and keep them out of the override.
             remaining = dict(server_args_dict)
-            # Probe toggle, not a server arg: flips the env this rank's cold
-            # pipeline re-reads at every pass boundary, so the per-layer
-            # copy/export/stall decomposition turns on and off on a RUNNING
-            # server -- it used to cost a full reboot per measurement.
-            #   curl -X POST .../set_internal_state \
-            #        -d '{"server_args": {"kt_pipeline_overlap_probe": 1}}'
-            probe = remaining.pop("kt_pipeline_overlap_probe", None)
-            if probe is not None:
-                envs.SGLANG_DEBUG_KT_PIPELINE_OVERLAP.set(bool(probe))
             frac = remaining.pop("dspark_force_budget_frac", None)
             if "dspark_force_budget_frac" in server_args_dict:
                 self.draft_worker.set_dspark_forced_budget_frac(

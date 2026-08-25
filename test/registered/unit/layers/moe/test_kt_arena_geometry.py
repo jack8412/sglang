@@ -56,13 +56,7 @@ def _load_kt_arena_geometry():
     ):
         stub(name)
 
-    class _Env:
-        def get(self):
-            return False
-
-    sys.modules["sglang.srt.environ"].envs = types.SimpleNamespace(
-        SGLANG_DEBUG_KT_PIPELINE_OVERLAP=_Env()
-    )
+    sys.modules["sglang.srt.environ"].envs = types.SimpleNamespace()
 
     def load(mod_name, filename):
         spec = importlib.util.spec_from_file_location(

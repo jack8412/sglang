@@ -672,7 +672,7 @@ class TestColdSourceSatisfiesThePipelineProtocol(unittest.TestCase):
     This exists because of a real failure. ``ArenaDmaColdSource`` shipped
     without ``layer_rows``, and nothing noticed: the pipeline only calls it
     from inside ``if self._probe is not None``, so the gap was invisible until
-    a server booted with SGLANG_DEBUG_KT_PIPELINE_OVERLAP=1 and every one of
+    a server booted with the overlap probe enabled and every one of
     the eight ranks died with AttributeError partway through a benchmark --
     after a 17-minute boot.
 

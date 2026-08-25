@@ -41,28 +41,6 @@ from typing import Optional
 import torch
 
 
-def assert_slices_partition(idx_a: torch.Tensor, idx_b: torch.Tensor) -> None:
-    """Every (token, k) slot must be owned by exactly one of the two slices.
-
-    Both index vectors mark slots they do not own as -1, so a slot claimed by
-    both means the slices overlap (an expert would be counted twice) and a slot
-    claimed by neither means an expert is unreachable (silently dropped from
-    the token's sum).  Syncs, so this is a test/boot gate, not a hot path.
-    """
-    both = (idx_a >= 0) & (idx_b >= 0)
-    if bool(both.any()):
-        raise RuntimeError(
-            f"split-moe: {int(both.sum())} slots claimed by BOTH expert "
-            "slices -- the slices are not disjoint"
-        )
-    neither = (idx_a < 0) & (idx_b < 0)
-    if bool(neither.any()):
-        raise RuntimeError(
-            f"split-moe: {int(neither.sum())} slots claimed by NEITHER "
-            "slice -- some experts are unreachable"
-        )
-
-
 def _tiled_split_slice_moe(
     *,
     situ_moe,
@@ -76,7 +54,6 @@ def _tiled_split_slice_moe(
     top_k: int,
     intermediate_size: int,
     shared_output: Optional[torch.Tensor],
-    validate: bool,
     token_tile: int,
 ) -> torch.Tensor:
     """Run ``split_slice_moe`` over token tiles, writing into one output.
@@ -112,7 +89,6 @@ def _tiled_split_slice_moe(
             shared_output=(
                 None if shared_output is None else shared_output[lo:hi]
             ),
-            validate=validate,
             token_tile=None,          # already tiled
         )
     return out
@@ -131,7 +107,6 @@ def split_slice_moe(
     top_k: int,
     intermediate_size: int,
     shared_output: Optional[torch.Tensor] = None,
-    validate: bool = False,
     token_tile: Optional[int] = None,
 ) -> torch.Tensor:
     """Run the MoE over resident + cold expert slices and finalize once.
@@ -162,7 +137,7 @@ def split_slice_moe(
             resident=resident, cold=cold, num_experts=num_experts,
             num_resident=num_resident, top_k=top_k,
             intermediate_size=intermediate_size,
-            shared_output=shared_output, validate=validate,
+            shared_output=shared_output,
             token_tile=token_tile,
         )
 
@@ -221,8 +196,6 @@ def split_slice_moe(
     del gemm2_r
 
     gemm2_c, _, idx_c = _call(cold, num_resident, num_experts - num_resident)
-    if validate:
-        assert_slices_partition(idx_r, idx_c)
     return moe_finalize_fuse_shared(
         gemm2_c, idx_c, weights, shared_output, top_k, acc_in=acc
     )

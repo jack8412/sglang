@@ -1347,33 +1347,6 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
-    # ===================================================================
-    # KTransformers CPU-GPU hybrid MoE (kt_ep_wrapper) debug knobs
-    # ===================================================================
-    # Per-call wall-time breakdown of the hybrid submit/mask/gpu/sync/merge
-    # stages, logged for layers (0, 5, 20, 35) on TP0.
-    SGLANG_DEBUG_KT_HYBRID_TIMING = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_KT_HYBRID_TIMING"
-    )
-    # Adds torch.cuda.synchronize() at each timing stage (slow; triage only).
-    SGLANG_DEBUG_KT_HYBRID_TIMING_DEEP = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_KT_HYBRID_TIMING_DEEP"
-    )
-    # Collapse the CPU-experts CUDA stream onto the main stream (regression
-    # isolation for the multi-stream submit path).
-    SGLANG_DISABLE_KT_CPU_STREAM = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_KT_HYBRID_NO_CPU_STREAM"
-    )
-    # Force GPU-experts apply() to a zero return; routed output comes purely
-    # from CPU experts ("Plan-C" fallback for GPU-vs-merge triage).
-    SGLANG_DEBUG_KT_BYPASS_GPU_MOE = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_KT_BYPASS_GPU_MOE"
-    )
-    # One-shot bitwise self-check of the expert-swap weight mover: rebuild an
-    # already-resident expert from the checkpoint and compare against the row
-    # the loader produced. Read-only; the gate the mover must pass before it
-    # is trusted to rewrite resident weights.
-    SGLANG_KT_VERIFY_EXPERT_MOVER = EnvBool(False)
     # Install a demoted expert's CPU weights from its GPU row (unswizzle + a TP
     # all-gather) instead of re-reading the checkpoint, which costs ~12.9 GB per
     # swap window. The layout inverse is proved bitwise
@@ -1387,53 +1360,6 @@ class Envs:
     # which is identical on every rank. Still opt-in until measured against the
     # checkpoint path on a live server.
     SGLANG_KT_SWAP_GPU_READBACK = EnvBool(False)
-    # Rank-write demotions: instead of one process materializing each demoted
-    # expert (12.9 GB off the checkpoint at 0.45 GB/s, measured 28.8 s per
-    # window; or an all-gather that deadlocked three builds), every rank maps
-    # kt's memfd BufferB arena and writes its OWN disjoint slice -- gate/up
-    # contiguous at its row offset, down strided at its column offset. No
-    # collective, no disk, ~1.6 GB per rank in parallel. Requires
-    # KT_BUFFER_B_MEMFD=1 and cold-only residency (with full kt residency a
-    # demotion is already a nop). Falls back per layer to the checkpoint path.
-    # Hold the split-prefill cold store in CHECKPOINT layout and swizzle each
-    # layer on device as it is prefetched, instead of storing pre-swizzled
-    # bytes. Costs ~1.0 ms per layer (~+4.4% of the ~2.07 s/forward copy floor)
-    # and is the step toward dropping the pinned store altogether in favour of
-    # streaming out of kt's own buffers, which hold checkpoint layout too.
-    # Off until the batched swizzle is proved bitwise on a live server.
-    SGLANG_KT_SPLIT_PREFILL_DYNAMIC_SWIZZLE = EnvBool(False)
-    # One-shot bitwise self-check of the kt-RAM expert source: rebuild a few
-    # experts from kt's resident buffers and compare against the checkpoint.
-    # The gate before that source may replace the pinned cold store, because
-    # every way it can be wrong -- partition concat axis, physical vs logical
-    # expert ids, the TP slice -- yields right-shaped wrong bytes rather than
-    # an error. Read-only.
-    SGLANG_KT_VERIFY_RAM_SOURCE = EnvBool(False)
-    # Per-forward slot-accounting check for split-slice full-expert prefill:
-    # assert the resident and cold expert slices claim every routed slot
-    # exactly once. Costs a device sync per layer, so it is a debug gate, not
-    # a production default.
-    SGLANG_KT_VERIFY_SPLIT_PREFILL = EnvBool(False)
-    # Per-layer copy/compute overlap for the cold-expert prefetch: how long the
-    # compute stream sat blocked on each layer's weights, and how the copy
-    # duration compares with the compute window it has to hide under. Events
-    # are recorded during the pass and read at the next reset, so no sync is
-    # added to the hot path -- but the summary log is per forward, so this is
-    # a triage knob rather than a production default.
-    SGLANG_DEBUG_KT_PIPELINE_OVERLAP = EnvBool(False)
-    # Gate for flipping the probe above (and future probes) AT RUNTIME via
-    # /set_internal_state. Snapshotted at scheduler startup: a server launched
-    # without it can NEVER have probing enabled remotely -- production stays
-    # unprobeable by construction, test servers launch with it and toggle
-    # freely without reboots.
-    SGLANG_DEBUG_KT_RUNTIME_PROBING = EnvBool(False)
-    # P0 ablation for the doorbell-transport design: skip ONLY the two
-    # cudaLaunchHostFunc submissions (submit/sync) while keeping the staging
-    # D2H, the result H2D and the merge-add. Differencing this against the
-    # normal path isolates host-node dispatch cost from the copies. Produces
-    # wrong numbers by construction (CPU contributions are dropped) — a timing
-    # instrument only, never a serving mode.
-    SGLANG_KT_ABLATE_HOSTNODES = EnvBool(False)
 
     # ===================================================================
     # DeepSeek-V4-Flash MXFP4 GPU MoE

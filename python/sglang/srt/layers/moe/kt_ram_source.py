@@ -42,8 +42,8 @@ expert per call, which matters at ~370 promotions per swap window.
 
 EXPERT IDS ARE BUFFER SLOTS. The ``bb_`` arrays are indexed by the same ids the
 swap window and ``swap_expert_slot`` use; no physical/logical translation
-happens here. ``verify_against_checkpoint`` is where the physical-to-logical
-map matters, because the CHECKPOINT is indexed by logical id.
+happens here. Anything that reaches the CHECKPOINT must translate first, since
+that side is indexed by logical id.
 """
 
 from __future__ import annotations
@@ -323,111 +323,6 @@ class KtArenaExpertSource(KtRamExpertSource):
         nbytes = self._w_bytes if which in _WEIGHT_KINDS else self._s_bytes
         off = self._rows[part * self.experts + expert][which]
         return self._arenas[part][off : off + nbytes]
-
-
-def verify_against_checkpoint(
-    source: "KtRamExpertSource",
-    *,
-    weight_path: str,
-    layer_idx: int,
-    expert_ids: Sequence[int],
-    tp_rank: int,
-    tp_size: int,
-    physical_to_logical: Optional[Sequence[int]] = None,
-) -> bool:
-    """Bitwise: do kt's buffers reproduce the checkpoint, shard for shard?
-
-    The gate on replacing the pinned store with this source. Every way the
-    mapping can be wrong -- partition concat axis, physical vs logical ids, the
-    TP slice -- yields right-shaped wrong bytes, so equality is demonstrated
-    against ``build_expert_bytes`` rather than argued.
-
-    ``expert_ids`` are buffer SLOTS (physical): they feed ``raw_shard``
-    directly, and the map translates them for the CHECKPOINT side only --
-    kt fills slot ``s`` with checkpoint expert ``map[s]``, so that pairing is
-    the identity being verified.
-    """
-    from sglang.srt.layers.moe.kt_expert_mover import (
-        CheckpointExpertReader,
-        build_expert_bytes,
-    )
-
-    prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe.experts"
-    pairs = (
-        ("w13", "w13"),
-        ("w13_scale", "w13_scale_e8m0"),
-        ("w2", "w2"),
-        ("w2_scale", "w2_scale_e8m0"),
-    )
-    reader = CheckpointExpertReader(weight_path)
-    ok = True
-    try:
-        for eid in expert_ids:
-            slot = int(eid)
-            logical = (
-                slot if physical_to_logical is None else int(physical_to_logical[slot])
-            )
-            want = build_expert_bytes(
-                reader, prefix, logical, tp_rank=tp_rank, tp_size=tp_size
-            )
-            try:
-                got = source.raw_shard(slot)
-            except Exception:
-                logger.exception("[kt-ram] raw_shard(%d) failed", slot)
-                ok = False
-                continue
-            for mine, theirs in pairs:
-                a = got[mine].reshape(-1)
-                b = getattr(want, theirs).reshape(-1).to(torch.uint8)
-                if a.shape != b.shape or not torch.equal(a, b):
-                    logger.error(
-                        "[kt-ram] layer %d slot %d (logical %d) %s DIFFERS "
-                        "from the checkpoint (%s vs %s, %s bytes differ)",
-                        layer_idx,
-                        slot,
-                        logical,
-                        mine,
-                        tuple(got[mine].shape),
-                        tuple(getattr(want, theirs).shape),
-                        "shape" if a.shape != b.shape else int((a != b).sum()),
-                    )
-                    ok = False
-    finally:
-        reader.close()
-    if ok:
-        logger.info(
-            "[kt-ram] layer %d: %d expert(s) reproduce the checkpoint bitwise "
-            "from kt's resident buffers",
-            layer_idx,
-            len(expert_ids),
-        )
-    return ok
-
-
-def build_kt_ram_source(method, *, tp_rank: int, tp_size: int):
-    """Build a source for one layer's kt MoE object, or None if unavailable."""
-    wrapper = getattr(method, "wrapper", None)
-    moe = getattr(wrapper, "moe", None) if wrapper is not None else None
-    target = moe if moe is not None else wrapper
-    getter = getattr(target, "expert_buffer_pointers", None)
-    if getter is None:
-        logger.info(
-            "[kt-ram] this kt build exposes no expert_buffer_pointers(); "
-            "keeping the pinned cold store"
-        )
-        return None
-    try:
-        pointers, geometry = getter()
-    except Exception:
-        logger.exception("[kt-ram] expert_buffer_pointers() failed")
-        return None
-    return KtRamExpertSource(
-        pointers=pointers,
-        geometry=geometry,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
-        physical_to_logical=method._kt_physical_to_logical,
-    )
 
 
 def export_kt_arenas(method):

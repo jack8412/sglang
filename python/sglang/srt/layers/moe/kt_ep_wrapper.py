@@ -5,44 +5,15 @@ KT Expert Parallelism Wrapper for MoE layers.
 This module provides a generic wrapper that enables CPU-GPU expert parallelism
 for any MoE quantization method. It coordinates parallel execution of GPU experts
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
-
-Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
-
-    SGLANG_DEBUG_KT_HYBRID_TIMING=1 (legacy alias: SGLANG_KT_HYBRID_TIMING)
-        Per-call wall-time breakdown of submit / mask / gpu / sync / merge
-        / cpu_wait stages. Logged at DEBUG for layers (0, 5, 20, 35) on TP0.
-
-    SGLANG_DEBUG_KT_HYBRID_TIMING_DEEP=1 (legacy alias: SGLANG_KT_HYBRID_TIMING_DEEP)
-        Insert torch.cuda.synchronize() at each timing stage so DEEP numbers
-        reflect real GPU work rather than async-launch return time. Slows
-        decode meaningfully; only enable for one-shot triage.
-
-    SGLANG_DISABLE_KT_CPU_STREAM=1 (legacy alias: SGLANG_KT_HYBRID_NO_CPU_STREAM)
-        Collapse the CPU-experts CUDA stream onto the main stream. Useful
-        when isolating regressions caused by the multi-stream submit path.
-
-    SGLANG_DEBUG_KT_BYPASS_GPU_MOE=1 (legacy alias: SGLANG_KT_BYPASS_GPU_MOE)
-        Force GPU-experts apply() to a zero return; routed expert output
-        comes purely from the CPU side. "Plan-C" fallback for diagnosing
-        whether a regression sits in the GPU MoE path or the merge math.
 """
 
-import bisect
-import copy
-import ctypes
-import gc
-import json
 import logging
 import os
 import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from multiprocessing import shared_memory
-from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional
 
-import msgspec
 import torch
 import torch.distributed as dist
 
@@ -50,11 +21,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_buffer, get_parallel, get_stream
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
-from sglang.srt.utils import get_compiler_backend, is_cuda
-
-if is_cuda():
-    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -182,6 +149,8 @@ class KTConfig:
         chunked_prefill_size: Chunk size for prefill computation
         method: CPU computation method (e.g., "int4")
         num_layers: Total number of layers in the model (optional)
+        split_prefill_min_tokens: Smallest forward worth paying the
+            cold-expert stream for (--kt-expert-split-prefill-min-tokens)
         routing_margin: Per-token budget for GPU-preferred routing overrides,
             as a share of the token's own mixture weight in [0, 1]
             (0.0 = substitute nothing, bit-exact routing, demand/hit counters
@@ -211,6 +180,7 @@ class KTConfig:
     expert_swap_hysteresis: float = 2.0
     split_prefill: bool = False
     split_prefill_token_tile: int = 0
+    split_prefill_min_tokens: int = 4096
 
 
 # Every wrapped MoE layer, in construction order, so the swap driver can walk
@@ -228,12 +198,6 @@ _KT_SPLIT_PREFILL_LAYERS = []
 _KT_SPLIT_PREFILL_STATE = {
     "pipeline": None,
 }
-
-# Smallest chunk worth paying the cold-expert stream for. The stream is a
-# fixed per-forward cost (~2.0 s measured: every cold expert lands once
-# regardless of token count), so the split path beats the ~1,400 tok/s
-# CPU-expert path above ~2,800 tokens. Rounded up for margin.
-_SPLIT_PREFILL_MIN_TOKENS = 4096
 
 # Resident trtllm-gen parameter names.  K3's native Mxfp4MoEMethod consumes
 # the trtllm-gen shuffled layout, and its
@@ -838,6 +802,7 @@ def create_kt_config_from_server_args(
         expert_swap_hysteresis=server_args.kt_expert_swap_hysteresis,
         split_prefill=server_args.kt_expert_split_prefill,
         split_prefill_token_tile=server_args.kt_expert_split_prefill_token_tile,
+        split_prefill_min_tokens=server_args.kt_expert_split_prefill_min_tokens,
     )
 
 
@@ -1246,11 +1211,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_parallel().tp_rank
         # Debug/kill-switch env knobs, snapshotted once (read on the hot path).
-        self._kt_debug_timing = envs.SGLANG_DEBUG_KT_HYBRID_TIMING.get()
-        self._kt_debug_timing_deep = envs.SGLANG_DEBUG_KT_HYBRID_TIMING_DEEP.get()
-        self._kt_no_cpu_stream = envs.SGLANG_DISABLE_KT_CPU_STREAM.get()
-        self._kt_bypass_gpu_moe = envs.SGLANG_DEBUG_KT_BYPASS_GPU_MOE.get()
-        self._kt_ablate_hostnodes = envs.SGLANG_KT_ABLATE_HOSTNODES.get()
         # Doorbell transport: one slot per (layer, BATCH SIZE), assigned on
         # this layer's first forward at each size. Not one per layer:
         # KExpertsCPUBuffer keys its rings by batch size, so a single
@@ -1282,7 +1242,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._cond_enabled = kt_config.conditional_cpu_branch
         self._cond_flag: Optional[torch.Tensor] = None
         self._cond_body_stream: Optional[torch.cuda.Stream] = None
-        self._kt_ablate_zero: Optional[torch.Tensor] = None
         # Margin routing (SPEC-MARGIN-ROUTING P1). None = off, bit-exact.
         # A per-token budget: the share of a token's own mixture weight that
         # substitution may move, at each layer.
@@ -1316,8 +1275,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # chunk qualified, so the scheduler's remainder always fell back: a
         # 65,498-token prompt became 32768 (split, 2.0 s) + 32730 (CPU, 23 s),
         # 38 tokens short of the threshold and 6.4x slower overall.
-        self._split_prefill_threshold = _SPLIT_PREFILL_MIN_TOKENS
-        self._split_prefill_validate = envs.SGLANG_KT_VERIFY_SPLIT_PREFILL.get()
+        self._split_prefill_threshold = kt_config.split_prefill_min_tokens
         # Cap the MoE's per-call transients by running it in token tiles. Both
         # scale with tokens -- the gemm2 buffer the kernel sizes for all
         # T*top_k slots, and the fp32 accumulator -- while a token's output
@@ -1732,7 +1690,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0 and self.wrapper is not None:
             torch.cuda.synchronize()
             self.wrapper.load_weights(physical_to_logical_map_cpu)
-            self._maybe_verify_kt_ram_source()
 
         # 4. KT_BUFFER_B_MEMFD: hand every rank a read-only mapping of this
         # layer's kt expert buffers (rank 0 exports memfds, peers map them),
@@ -1743,58 +1700,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         share_layer_arenas(method=self)
 
-    def _maybe_verify_kt_ram_source(self):
-        """SGLANG_KT_VERIFY_RAM_SOURCE=1: prove kt's buffers match the checkpoint.
-
-        Runs here -- immediately after this layer's kt weights load, on the
-        rank that owns the wrapper -- because the buffers this checks exist
-        nowhere else and at no earlier time. Read-only, a few experts, once per
-        process (the mapping is layer-independent, so one layer's evidence
-        covers the rest).
-        """
-        if not envs.SGLANG_KT_VERIFY_RAM_SOURCE.get():
-            return
-        if _KT_SWAP_STATE.get("ram_source_verified"):
-            return
-        _KT_SWAP_STATE["ram_source_verified"] = True
-        from sglang.srt.layers.moe.kt_ram_source import (
-            build_kt_ram_source,
-            verify_against_checkpoint,
-        )
-
-        source = build_kt_ram_source(
-            self, tp_rank=self.tp_rank, tp_size=get_parallel().tp_size
-        )
-        if source is None:
-            logger.error(
-                "[kt-ram] verification requested but no source could be built "
-                "(no expert_buffer_pointers on this wrapper?)"
-            )
-            return
-        # SLOT ids: raw_shard is slot-indexed and verify translates only the
-        # checkpoint side. Pre-mapping the ids here compared raw_shard(p2l[s])
-        # against checkpoint p2l[s] -- wrong on both sides of a non-identity
-        # map, and invisible under the identity maps it was written against.
-        #
-        # Sample only slots that hold buffers. Spreading the picks across the
-        # whole id space instead made this probe raise on every hot expert under
-        # cold-only residency -- V14 logged 27 tracebacks at boot for a check
-        # that is supposed to be read-only and quiet.
-        live = source.resident_slots()
-        if not live:
-            logger.error("[kt-ram] no CPU-resident expert to verify on this rank")
-            return
-        n = len(live)
-        ids = sorted({live[0], live[n // 3], live[(2 * n) // 3], live[n - 1]})
-        verify_against_checkpoint(
-            source,
-            weight_path=self.kt_config.weight_path,
-            layer_idx=self.kt_config.layer_idx,
-            expert_ids=ids,
-            physical_to_logical=self._kt_physical_to_logical,
-            tp_rank=self.tp_rank,
-            tp_size=get_parallel().tp_size,
-        )
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
@@ -2022,7 +1927,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             num_resident=self.num_gpu_experts,
             top_k=packed.shape[1],
             intermediate_size=self.gpu_method.intermediate_size_per_partition,
-            validate=self._split_prefill_validate,
             token_tile=self._split_prefill_token_tile,
         )
 
@@ -2087,24 +1991,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if self._counters_enabled:
                 self._update_demand_counters(dispatch_output.topk_output.topk_ids)
             return self._split_prefill_apply(layer, dispatch_output, num_tokens)
-
-        # No layer filter: placement strategies (layer_concentrated) put
-        # wrappers on arbitrary layer indices; the per-layer step rate-limit
-        # at the emission site keeps volume bounded.  Never instrument under
-        # stream capture — DEEP mode's device synchronize invalidates the
-        # graph being captured.
-        _kt_timing = (
-            self._kt_debug_timing
-            and self.tp_rank == 0
-            and not torch.cuda.is_current_stream_capturing()
-        )
-        _kt_t_apply_start = time.perf_counter() if _kt_timing else None
-        _kt_t_after_submit = None
-        _kt_t_after_mask = None
-        _kt_t_after_gpu = None
-        _kt_t_after_sync = None
-        _kt_t_after_merge = None
-        _kt_t_cpu_wait_ms = 0.0
 
         # Margin routing (SPEC-MARGIN-ROUTING P1): rewrite below-margin
         # CPU-resident picks to resident alternatives BEFORE the Step-1 CPU
@@ -2215,7 +2101,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         topk_output=topk_output
                     )
                 self._maybe_log_margin_stats()
-                self._maybe_verify_expert_mover(layer)
                 # The first registered layer drives the swap window for the
                 # whole model: later layers have not read their membership
                 # yet this forward, so one window keeps the batch consistent.
@@ -2287,14 +2172,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # the GPU may modify x freely.
                 staging_buffer.copy_(x, non_blocking=True)
 
-            # SGLANG_DISABLE_KT_CPU_STREAM=1 collapses cpu_stream onto main stream.
-            _no_cpu_stream = self._kt_no_cpu_stream
-            if not _no_cpu_stream:
-                # Fork to cpu_stream (waits for the pack/staging copy)
-                self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
-            from contextlib import nullcontext as _ctx_null
-            _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
-            with _stream_ctx:
+            # Fork to cpu_stream (waits for the pack/staging copy)
+            self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
+            with torch.cuda.stream(self._cpu_stream):
                 # Elide the whole branch when no slot routes off-GPU. Only
                 # under capture: a conditional node has to be spliced into a
                 # graph, and eager forwards have none -- they simply run the
@@ -2326,7 +2206,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         # would have it judge the PREVIOUS step's batch.
                         self._kt_flush_inputs(staging_buffer)
                         kt_doorbell_ring(_db_slot, _db_stream)
-                elif _fused and not self._kt_ablate_hostnodes:
+                elif _fused:
                     # One D2H, then the dispatch. The pack already ran on the
                     # main stream, so this is all that stands between the fork
                     # and the poller learning there is work.
@@ -2334,14 +2214,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     self.wrapper.submit_forward_packed(
                         x, torch.cuda.current_stream(x.device).cuda_stream
                     )
-                elif not self._kt_ablate_hostnodes:
+                else:
                     self._submit_with_staged_input(
                         layer, dispatch_output, staging_buffer
                     )
-        if _kt_timing:
-            if self._kt_debug_timing_deep:
-                torch.cuda.synchronize(x.device)
-            _kt_t_after_submit = time.perf_counter()
 
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
@@ -2355,10 +2231,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         masked_dispatch_output = dispatch_output._replace(
             topk_output=masked_topk_output
         )
-        if _kt_timing:
-            if self._kt_debug_timing_deep:
-                torch.cuda.synchronize(x.device)
-            _kt_t_after_mask = time.perf_counter()
 
         # Step 3: Execute GPU expert computation on main stream
         # No wait needed - staging buffer decouples CPU and GPU data access
@@ -2385,13 +2257,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 tuple(self.gpu_experts_mask.shape),
                 type(self.gpu_method).__name__,
             )
-        # SGLANG_DEBUG_KT_BYPASS_GPU_MOE=1 also short-circuits to zeros, because
-        # the kt mask generator returns an all-True (num_gpu_experts ==
-        # num_total_experts) per-layer mask in some configurations (e.g. V4
-        # Flash + --kt-num-gpu-experts=0), which defeats the
-        # num_gpu_experts==0 short-circuit. The env var lets the operator
-        # force the bypass without untangling the mask generator.
-        if self.num_gpu_experts == 0 or self._kt_bypass_gpu_moe:
+        if self.num_gpu_experts == 0:
             gpu_combine_input = None
             output = torch.zeros_like(x)
         else:
@@ -2400,16 +2266,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     layer, masked_dispatch_output
                 )
             output = gpu_combine_input.hidden_states
-        if _kt_timing:
-            if self._kt_debug_timing_deep:
-                torch.cuda.synchronize(x.device)
-            _kt_t_after_gpu = time.perf_counter()
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         if self.tp_rank == 0 and self._cpu_stream is not None and not self._skip_cpu_path:
-            _no_cpu_stream = self._kt_no_cpu_stream
-            from contextlib import nullcontext as _ctx_null
-            if _db_elide and not _no_cpu_stream:
+            if _db_elide:
                 # The merge moves INSIDE the IF body (a skipped body must
                 # leave `output` untouched), so the CPU stream now has to see
                 # the finished GPU result. It did not before, because the
@@ -2418,10 +2278,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # working throughout the GPU compute -- only the WAIT is
                 # ordered after it, which is exactly where it belongs.
                 self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
-            _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
-            with _stream_ctx:
+            with torch.cuda.stream(self._cpu_stream):
                 # Use staging_buffer for sync to get correct buffer reference
-                _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
                 if _db_elide:
                     with self._kt_cond_region(True):
                         kt_doorbell_wait(
@@ -2440,85 +2298,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         _db_slot, torch.cuda.current_stream(x.device).cuda_stream
                     )
                     cpu_output = self._kt_doorbell_output(staging_buffer)
-                elif _fused and not self._kt_ablate_hostnodes:
+                elif _fused:
                     # x, not staging_buffer: the packed path never fills the
                     # shared buffer. Both name the same [bs, hidden] shape and
                     # sync_forward keys its rings by shape alone, so this is
                     # the same buffer either way -- passing x keeps the packed
                     # path's data flow readable end to end.
                     cpu_output = self._sync_cpu_forward(x)
-                elif self._kt_ablate_hostnodes:
-                    # Same shape and same merge-add, without the sync host
-                    # node: isolates dispatch cost from the copies/merge.
-                    # Grow-on-demand: the staging slice is batch-sized, so a
-                    # buffer cached from the first (small) batch cannot serve a
-                    # later larger one. Reallocating only on growth keeps the
-                    # steady-state cost at zero so the measurement stays clean.
-                    if (
-                        self._kt_ablate_zero is None
-                        or self._kt_ablate_zero.shape[0] < staging_buffer.shape[0]
-                    ):
-                        self._kt_ablate_zero = torch.zeros_like(staging_buffer)
-                    cpu_output = self._kt_ablate_zero[: staging_buffer.shape[0]]
                 else:
                     cpu_output = self._sync_with_staged_input(staging_buffer)
-                if _kt_t_sync_pre is not None:
-                    _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
-                if not _no_cpu_stream:
-                    self._sync_done_event.record(self._cpu_stream)
-            if _kt_timing:
-                _kt_t_after_sync = time.perf_counter()
+                self._sync_done_event.record(self._cpu_stream)
 
             # Main stream waits for cpu_stream to complete before merging results
-            if not _no_cpu_stream:
-                torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
+            torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
             # cpu_output is None only when the merge already happened inside
             # the conditional body, where it had to be in-place.
             if cpu_output is not None:
                 output = output + cpu_output
-        if _kt_timing:
-            _kt_t_after_merge = time.perf_counter()
-            # Optional: synchronize GPU at end of apply() to capture true GPU
-            # work latency (otherwise gpu_apply Python time only captures
-            # kernel-launch CPU overhead, not actual GPU compute). DEEP mode
-            # serialises streams so per-stage numbers reflect GPU work, not
-            # async launch return.
-            if self._kt_debug_timing_deep:
-                torch.cuda.synchronize(x.device)
-                _kt_t_after_merge = time.perf_counter()
-
-        if _kt_t_apply_start is not None:
-            _kt_total_ms = (_kt_t_after_merge - _kt_t_apply_start) * 1000.0
-            _stage_submit_ms = (_kt_t_after_submit - _kt_t_apply_start) * 1000.0
-            _stage_mask_ms = (_kt_t_after_mask - _kt_t_after_submit) * 1000.0
-            _stage_gpu_ms = (_kt_t_after_gpu - _kt_t_after_mask) * 1000.0
-            _stage_sync_ms = (
-                (_kt_t_after_sync - _kt_t_after_gpu) * 1000.0
-                if _kt_t_after_sync is not None else 0.0
-            )
-            _stage_merge_ms = (
-                (_kt_t_after_merge - _kt_t_after_sync) * 1000.0
-                if _kt_t_after_sync is not None
-                else (_kt_t_after_merge - _kt_t_after_gpu) * 1000.0
-            )
-            _cls = type(self)
-            if not hasattr(_cls, '_kt_layer_step'):
-                _cls._kt_layer_step = {}
-            _li = getattr(self.kt_config, 'layer_idx', -1)
-            _cls._kt_layer_step[_li] = _cls._kt_layer_step.get(_li, 0) + 1
-            _step = _cls._kt_layer_step[_li]
-            if _step <= 16 or _step % 16 == 0:
-                # INFO on purpose: the env flag is the opt-in; requiring
-                # --log-level debug on top buried the numbers under the
-                # whole server's debug firehose.
-                logger.info(
-                    "[kt-time] layer=%s step=%d total=%.2fms submit=%.2f "
-                    "mask=%.2f gpu=%.2f sync=%.2f merge=%.2f "
-                    "cpu_wait=%.2fms num_tokens=%d",
-                    _li, _step, _kt_total_ms, _stage_submit_ms,
-                    _stage_mask_ms, _stage_gpu_ms, _stage_sync_ms,
-                    _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
-                )
         return StandardCombineInput(hidden_states=output)
 
     def _kt_doorbell_slot(self, staging_buffer, dispatch_output) -> Optional[int]:
@@ -2846,56 +2642,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """Result tensor for the merge; the wait node already ordered it."""
         return self.wrapper.doorbell_output(staging_buffer)
 
-    def _maybe_verify_expert_mover(self, layer) -> None:
-        """SGLANG_KT_VERIFY_EXPERT_MOVER=1: prove the swap mover, once.
-
-        Rebuilds an expert that is ALREADY resident straight from the
-        checkpoint and compares byte-for-byte with the row the production
-        loader filled. This is the gate the weight mover has to pass before it
-        is allowed to rewrite anything: a wrong TP slice or gate/up assembly
-        produces a correctly-shaped tensor full of the wrong numbers, which
-        degrades output without ever raising.
-
-        Read-only and one-shot; never runs under capture.
-        """
-        if getattr(type(self), "_kt_mover_verified", False):
-            return
-        if self.tp_rank != 0 or torch.cuda.is_current_stream_capturing():
-            return
-        if not envs.SGLANG_KT_VERIFY_EXPERT_MOVER.get():
-            return
-        type(self)._kt_mover_verified = True
-        try:
-            from sglang.srt.layers.moe.kt_expert_mover import CheckpointExpertMover
-
-            resident_rows = torch.nonzero(self.gpu_experts_mask).flatten()
-            if resident_rows.numel() == 0:
-                return
-            logical_id = int(resident_rows[0].item())
-            row = int(self.logical_to_gpu_index[logical_id].item())
-            layer_idx = self.kt_config.layer_idx
-            mover = CheckpointExpertMover(
-                self.kt_config.weight_path,
-                expert_prefix_for_layer=lambda _l: (
-                    f"language_model.model.layers.{layer_idx}"
-                    f".block_sparse_moe.experts"
-                ),
-                tp_rank=get_parallel().tp_rank,
-                tp_size=get_parallel().tp_size,
-                param_names=_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES,
-            )
-            ok = mover.verify_row(layer, row, logical_id)
-            logger.info(
-                "[kt-swap-verify] layer=%d expert=%d row=%d -> %s",
-                layer_idx,
-                logical_id,
-                row,
-                "PASS" if ok else "FAIL",
-            )
-            mover.reader.close()
-        except Exception:
-            logger.exception("[kt-swap-verify] mover verification errored")
-
     def _maybe_log_margin_stats(self) -> None:
         """Rate-limited INFO line with cumulative insist/override counts.
 
@@ -3069,9 +2815,10 @@ def maybe_run_expert_swap_at_decode_boundary(
 
     RATE LIMIT IS NOT OPTIONAL. With continuous batching at 8 concurrent
     requests a prefill->decode transition lands every ~2.5 s; an unthrottled
-    window there costs far more than it returns. The interval is expressed in
-    seconds of wall clock rather than forwards because the cost being bounded
-    (a quiesce plus weight copies) is wall-clock cost.
+    window there costs far more than it returns. The limit counts TRANSITIONS
+    (--kt-expert-swap-transitions), not wall clock: a window costs a quiesce
+    plus weight copies, and what earns that back is the demand observed since
+    the last one, which arrives per transition rather than per second.
     """
     if not _KT_EP_METHODS:
         return
@@ -3163,7 +2910,6 @@ def maybe_run_expert_swap_window(
     from sglang.srt.layers.moe.kt_arena_share import arena_source_for
     from sglang.srt.layers.moe.kt_expert_swap import (
         ExpertSwapPolicy,
-        SwapInstallError,
         run_swap_window,
     )
 

@@ -54,12 +54,11 @@ import struct
 import tempfile
 import time
 import warnings
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
 
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -159,41 +158,6 @@ def _build_source_from_export(
         arenas=arenas,
         offsets=offsets,
         geometry=geometry,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
-    )
-
-
-def _maybe_verify_source(
-    source, *, method, layer_idx: int, tp_rank: int, tp_size: int, phys_to_log
-) -> None:
-    """SGLANG_KT_VERIFY_RAM_SOURCE=1: prove THIS rank's mapped shard bitwise.
-
-    Stronger than the wrapper's own verify hook, which can only check rank 0's
-    absolute-pointer view: this runs on every rank, against the offsets and
-    the mapping that rank actually promotes from, so a wrong offset table, a
-    truncated mapping, or a TP-slice bug on any rank turns into a loud log
-    line instead of plausible wrong weights. Once per process, a few experts.
-    """
-    from sglang.srt.environ import envs
-
-    if not envs.SGLANG_KT_VERIFY_RAM_SOURCE.get():
-        return
-    if _STATE.get("verified"):
-        return
-    _STATE["verified"] = True
-    from sglang.srt.layers.moe.kt_ram_source import verify_against_checkpoint
-
-    n = source.experts
-    # SLOT ids straight into raw_shard; the map covers the checkpoint side
-    # inside verify_against_checkpoint.
-    ids = sorted({0, n // 3, (2 * n) // 3, n - 1})
-    verify_against_checkpoint(
-        source,
-        weight_path=method.kt_config.weight_path,
-        layer_idx=layer_idx,
-        expert_ids=ids,
-        physical_to_logical=phys_to_log,
         tp_rank=tp_rank,
         tp_size=tp_size,
     )
@@ -356,14 +320,6 @@ def _serve_layer(*, method, layer_idx: int, tp_rank: int, tp_size: int) -> None:
         tp_size=tp_size,
     )
     _register_source(method, layer_idx, source)
-    _maybe_verify_source(
-        source,
-        method=method,
-        layer_idx=layer_idx,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
-        phys_to_log=method._kt_physical_to_logical,
-    )
 
 
 def _register_source(method, layer_idx: int, source) -> None:
@@ -419,14 +375,6 @@ def _receive_layer(*, method, layer_idx: int, tp_rank: int, tp_size: int) -> Non
             tp_size=tp_size,
         )
         _register_source(method, layer_idx, source)
-        _maybe_verify_source(
-            source,
-            method=method,
-            layer_idx=layer_idx,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            phys_to_log=method._kt_physical_to_logical,
-        )
     finally:
         for fd in fds:
             try:

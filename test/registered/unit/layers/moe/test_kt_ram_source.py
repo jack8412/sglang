@@ -4,7 +4,7 @@ The source's one job is byte fidelity: whatever mode it runs in (absolute
 pointers in the kt-owning process, or offsets into fd-passed read-only
 mappings in every other rank), raw_shard must reproduce exactly the
 cat-then-slice construction its docstring specifies -- the construction
-verify_against_checkpoint proved bitwise against the checkpoint on the node.
+the source was proved bitwise against the checkpoint on the node.
 These tests pin the modes to a NumPy reference of that construction, and pin
 the share protocol (send_fds -> header/meta -> mmap PROT_READ -> source) end
 to end over a real memfd, including the shared-page property the whole design
