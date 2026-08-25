@@ -1347,19 +1347,6 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
-    # Install a demoted expert's CPU weights from its GPU row (unswizzle + a TP
-    # all-gather) instead of re-reading the checkpoint, which costs ~12.9 GB per
-    # swap window. The layout inverse is proved bitwise
-    # (runs/meta/verify_unswizzle.py) and re-checked against the checkpoint on
-    # the first demotion. An earlier version issued its all-gather from inside
-    # the per-swap install, where the decision to read was per-rank data; ranks
-    # disagreed on how many collectives to run and the window deadlocked (NCCL
-    # _ALLGATHER_BASE timing out after 600 s, watchdog killing the group). The
-    # read now happens once per layer from run_swap_window's begin_layer hook,
-    # so the collective count is a pure function of the per-layer swap plan,
-    # which is identical on every rank. Still opt-in until measured against the
-    # checkpoint path on a live server.
-    SGLANG_KT_SWAP_GPU_READBACK = EnvBool(False)
 
     # ===================================================================
     # DeepSeek-V4-Flash MXFP4 GPU MoE

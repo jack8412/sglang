@@ -18,7 +18,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_buffer, get_parallel, get_stream
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import get_compiler_backend
@@ -3064,7 +3063,6 @@ def maybe_run_expert_swap_window(
         "layer": None,
         "layer_idx": None,
         "items": [],
-        "prefetched": {},
         # True when the DMA wrote the promoted rows STRAIGHT INTO the batch
         # buffers, so _flush_moves has nothing to gather. False when they are
         # separate tensors (the ring-export staging path) that still have to be
@@ -3073,7 +3071,6 @@ def maybe_run_expert_swap_window(
         # is checkpoint layout and the swizzle is unconditional.
         "in_batch": False,
     }
-    gpu_reader = _get_or_create_gpu_reader()
 
     def _flush_moves():
         """Apply one layer's staged swaps as a handful of bulk copies.
@@ -3449,7 +3446,6 @@ def maybe_run_expert_swap_window(
         derived from ONE fixed-shape collective over the plan, so it is
         identical on all ranks by construction.
         """
-        _pending["prefetched"] = {}
         filtered = None
         method = entry.get("method")
 
@@ -3497,57 +3493,26 @@ def maybe_run_expert_swap_window(
                 )
             _timing["read_s"] += time.perf_counter() - t0
 
-        want = (
-            gpu_reader is not None
-            and not _KT_SWAP_STATE.get("gpu_readback_off")
-            and method is not None
-        )
         if armed:
-            # NO per-layer consensus here any more, and none is needed: under
-            # the fail-fast policy a rank that could not capture or validate
-            # has already terminated every rank, so there is no surviving
-            # disagreement to reconcile. Removing it also removes a
-            # collective, which is the resource these rounds kept
-            # desynchronising. `armed` is the window-scoped consensus, so all
-            # eight ranks take this branch or none do.
+            # NO per-layer consensus here, and none is needed: under the
+            # fail-fast policy a rank that could not capture or validate has
+            # already terminated every rank, so there is no surviving
+            # disagreement to reconcile. `armed` is the window-scoped
+            # consensus, so all eight ranks take this branch or none do.
             _pending["rank_write"] = True
-            return filtered
-        # NOT part of `want`: whether THIS rank has a kt wrapper to install
-        # into. Only some ranks do, and gating the gather on it is what
-        # deadlocked M9 and M11 -- rank 0 entered the collective alone and the
-        # other seven, having nothing to install, never called it and sailed on
-        # through all 92 layers. A rank that will not consume the result still
-        # has to contribute its shard.
-        #
-        # Agreed across ranks rather than assumed: this all_reduce runs on every
-        # layer whether or not the gather does, so it is symmetric by
-        # construction, and any residual disagreement degrades to "no rank uses
-        # the GPU route here" instead of hanging.
-        if not _all_tp_ranks_succeeded(want):
-            return filtered
-        # Not wrapped: absorbing here on one rank would drop it out of the
-        # collectives the others are running, which is the failure this hook
-        # exists to prevent.
-        got = gpu_reader.read_full_experts(entry["layer"], rows)
-        _pending["prefetched"] = {
-            s.demote: [t.to("cpu") for t in tensors]
-            for s, tensors in zip(swaps, got)
-        }
         return filtered
 
     def _read_demoted_expert(entry, demote_id):
-        """The demoted expert's full bytes, from the GPU if that is proven.
+        """The demoted expert's full bytes, off the checkpoint.
 
-        Device memory already holds them; the checkpoint read they replace is
-        ~17.5 MB per demotion and dominated the swap window. The GPU route is
-        used only after it has been shown bitwise-equal to the checkpoint route
-        on this process's first demotion, and any failure falls back rather
-        than installing bytes nobody has checked.
+        Only reached when rank-write does NOT own demotions: with the arena
+        transport armed each rank captures its own slice off its own GPU rows
+        and _begin_layer returns before this is ever called.
         """
-        # 1. The background disk prefetch started at the previous boundary.
-        #    Waiting on it is the point: the read is already in flight, so
-        #    waiting costs at most what remains of it, while re-reading
-        #    synchronously costs the whole thing again.
+        # The background disk prefetch started at the previous boundary.
+        # Waiting on it is the point: the read is already in flight, so
+        # waiting costs at most what remains of it, while re-reading
+        # synchronously costs the whole thing again.
         pf = _KT_SWAP_STATE.get("prefetch")
         if pf is not None:
             pf["done"].wait(timeout=_KT_PREFETCH_WAIT_S)
@@ -3557,63 +3522,10 @@ def maybe_run_expert_swap_window(
                 return got
             _timing["prefetch_misses"] += 1
 
-        # 2. Prefetched by _begin_layer off the GPU, before any of this layer's
-        #    moves ran, in one collective per tensor. Nothing here is per-rank
-        #    data: either the whole layer was prefetched on every rank or none.
-        got = _pending["prefetched"].get(demote_id)
-        if got is None:
-            return mover.read_full_expert(
-                entry["layer"],
-                _checkpoint_id(entry["method"]._kt_physical_to_logical, demote_id),
-            )
-
-        if not _KT_SWAP_STATE.get("gpu_readback_verified"):
-            # NO COLLECTIVE HERE. The comment that used to sit at this line
-            # claimed every rank reaches it; that is false, and it was M11
-            # rebuilt: _read_demoted_expert's only caller sits AFTER
-            # `if method.wrapper is None: return`, and the wrapper exists on
-            # rank 0 alone, so an all_reduce here is issued by one rank while
-            # seven march into the next layer -- a permanent one-collective
-            # skew on the gloo group that ends in the watchdog.
-            #
-            # The verdict does not need a collective anyway: turning the
-            # route off is rank-local, and the per-layer
-            # `_all_tp_ranks_succeeded(want)` in _begin_layer is a MIN, so
-            # rank 0's False propagates to every rank on the very next layer
-            # through a consensus that IS symmetric.
-            _KT_SWAP_STATE["gpu_readback_verified"] = True
-            want = mover.read_full_expert(
-                entry["layer"],
-                _checkpoint_id(entry["method"]._kt_physical_to_logical, demote_id),
-            )
-            bad = [
-                i
-                for i, (a, b) in enumerate(zip(got, want))
-                if a.shape != b.shape or not torch.equal(a, b)
-            ]
-            if bad:
-                logger.error(
-                    "[kt-swap] GPU read-back DIFFERS from the checkpoint on "
-                    "tensor(s) %s (expert %d, layer %s)",
-                    bad,
-                    demote_id,
-                    entry.get("layer_idx"),
-                )
-            if bad:
-                # Local flag only; _begin_layer's MIN consensus carries it to
-                # every rank at the next layer.
-                _KT_SWAP_STATE["gpu_readback_off"] = True
-                logger.error(
-                    "[kt-swap] GPU read-back disabled; the next layer's "
-                    "consensus drops it on every rank and demotions read the "
-                    "checkpoint instead"
-                )
-                return want
-            logger.info(
-                "[kt-swap] GPU read-back verified bitwise against the "
-                "checkpoint; demotions no longer touch disk"
-            )
-        return got
+        return mover.read_full_expert(
+            entry["layer"],
+            _checkpoint_id(entry["method"]._kt_physical_to_logical, demote_id),
+        )
 
     # after_flip / on_layer_abort existed ONLY to release the direct-dma
     # transport's provisional page pins. Both hooks are optional, so with that
@@ -3748,17 +3660,19 @@ class _GpuResidentExpertReader:
     essentially the entire 12.5 s a batched swap window still cost. The bytes
     are already in device memory; only the layout differs.
 
-    Two things stand between the resident row and the exported bytes:
+    One thing stands between the resident row and the exported bytes: the
+    trtllm-gen shuffle, inverted exactly by ``unswizzle_trtllm_expert``
+    (bitwise on every tensor -- runs/meta/verify_unswizzle.py).
 
-      1. the trtllm-gen shuffle, inverted exactly by ``unswizzle_trtllm_expert``
-         (bitwise on every tensor -- runs/meta/verify_unswizzle.py); and
-      2. TP. A rank holds one eighth of the expert, while kt slices across its
-         own NUMA partitions internally and therefore wants the whole thing.
-         So the shards are all-gathered -- ~17.5 MB per expert over NVLink,
-         which is microseconds against the seconds of disk it replaces.
+    NO COLLECTIVE, AND NO WHOLE EXPERT. Each rank returns its OWN shard and
+    writes it into its own slice of kt's arena, which is what
+    ``RankShardWriter`` consumes -- so TP never has to be undone. The
+    all-gathering variants this class used to carry served the readback route
+    that fed ``_read_demoted_expert``; that route was never enabled, and
+    rank-write reaches the same bytes without a collective at all.
 
     Everything here is shape-derived and cached per layer shape, so the cost
-    per demotion is the unswizzle plus one collective.
+    per demotion is the unswizzle alone.
     """
 
     def __init__(self, param_names):
@@ -3821,26 +3735,6 @@ class _GpuResidentExpertReader:
         self._by_shape[key] = prepared
         return prepared
 
-    def read_full_experts(self, layer, dst_rows):
-        """Every expert in ``dst_rows``, in one collective per tensor.
-
-        This is the shape the swap window must use. Reading rows one at a time
-        issues six all-gathers per expert and, worse, does so from inside the
-        per-swap install where the decision to read at all is per-rank data --
-        ranks then disagree on how many collectives to run and the window
-        deadlocks in NCCL instead of falling back. Called once per layer with
-        the layer's whole plan, the collective count is a pure function of that
-        plan, which is identical on every rank by construction.
-
-        Returns one ``(gate, up, down, gate_s, up_s, down_s)`` tuple per row, in
-        the same order and layout ``CheckpointExpertMover.read_full_expert``
-        returns, so the two are interchangeable.
-
-        Every row must still hold its DEMOTED occupant: call before any move.
-        """
-        shards = self.read_own_shards(layer, dst_rows)
-        return self._gather_shards(shards, len(dst_rows))
-
     def read_own_shards(self, layer, dst_rows):
         """THIS RANK's unswizzled shards for ``dst_rows`` -- no collective.
 
@@ -3887,94 +3781,6 @@ class _GpuResidentExpertReader:
             )
             for i in range(len(dst_rows))
         ]
-
-    def _gather_shards(self, shards, n_rows: int):
-        per = shards[0].w13.shape[0] // 2
-        per_s = shards[0].w13_scale_e8m0.shape[0] // 2
-        # (name, per-expert concat dim). Stacking prepends an expert axis, so
-        # the concat dim shifts by one inside _all_gather_batched.
-        plan = [
-            ([s.w13[:per] for s in shards], 0),
-            ([s.w13[per:] for s in shards], 0),
-            ([s.w2 for s in shards], 1),
-            ([s.w13_scale_e8m0[:per_s] for s in shards], 0),
-            ([s.w13_scale_e8m0[per_s:] for s in shards], 0),
-            ([s.w2_scale_e8m0 for s in shards], 1),
-        ]
-        gathered = [
-            self._all_gather_batched(torch.stack(parts), dim) for parts, dim in plan
-        ]
-        return [tuple(g[i].contiguous() for g in gathered) for i in range(n_rows)]
-
-    def _all_gather_batched(self, stacked: torch.Tensor, dim: int) -> torch.Tensor:
-        """Gather ``[experts, ...]`` shards from every rank; concat along ``dim``.
-
-        One collective for the whole layer instead of one per expert.
-        """
-        tp_size = get_parallel().tp_size
-        if tp_size == 1:
-            return stacked.contiguous()
-        stacked = stacked.contiguous()
-        out = torch.empty(
-            (tp_size,) + tuple(stacked.shape), dtype=stacked.dtype, device=stacked.device
-        )
-        dist.all_gather_into_tensor(out, stacked, group=get_tp_group().device_group)
-        # out is [rank, expert, ...]; the per-expert concat axis is dim + 1.
-        return torch.cat(list(out.unbind(0)), dim=dim + 1)
-
-    def read_full_expert(self, layer, dst_row: int):
-        """Single-row convenience wrapper. Prefer :meth:`read_full_experts`.
-
-        Kept for the offline verifier and for tp_size == 1, where there is no
-        collective and therefore no symmetry requirement.
-        """
-        from sglang.srt.layers.moe.kt_mxfp4_export import unswizzle_trtllm_expert
-
-        inverse, w13_scale_shape, w2_scale_shape = self._prepare(layer)
-        w13_n, w13_s_n, w2_n, w2_s_n = self.param_names
-
-        shard = unswizzle_trtllm_expert(
-            w13=getattr(layer, w13_n).data[dst_row],
-            w13_scale=getattr(layer, w13_s_n).data[dst_row],
-            w2=getattr(layer, w2_n).data[dst_row],
-            w2_scale=getattr(layer, w2_s_n).data[dst_row],
-            inverse=inverse,
-            w13_scale_shape=w13_scale_shape,
-            w2_scale_shape=w2_scale_shape,
-        )
-
-        # build_expert_bytes packs w13 as [gate | up] ROW halves of this rank's
-        # slice, and shards down by COLUMN; undo both, in rank order.
-        per = shard.w13.shape[0] // 2
-        per_s = shard.w13_scale_e8m0.shape[0] // 2
-        parts = [
-            (shard.w13[:per], 0),
-            (shard.w13[per:], 0),
-            (shard.w2, 1),
-            (shard.w13_scale_e8m0[:per_s], 0),
-            (shard.w13_scale_e8m0[per_s:], 0),
-            (shard.w2_scale_e8m0, 1),
-        ]
-        return tuple(self._all_gather(t, dim) for t, dim in parts)
-
-    def _all_gather(self, shard: torch.Tensor, dim: int) -> torch.Tensor:
-        """Concatenate this tensor's TP shards, in rank order, along ``dim``.
-
-        Every rank swaps the same experts (the policy is deterministic for
-        exactly this reason), so all ranks reach this collective the same
-        number of times and in the same order.
-        """
-        tp_size = get_parallel().tp_size
-        if tp_size == 1:
-            return shard.contiguous()
-        shard = shard.contiguous()
-        out = torch.empty(
-            (tp_size,) + tuple(shard.shape), dtype=shard.dtype, device=shard.device
-        )
-        dist.all_gather_into_tensor(
-            out, shard, group=get_tp_group().device_group
-        )
-        return torch.cat(list(out.unbind(0)), dim=dim).contiguous()
 
 
 class _PerLayerMover:
@@ -4565,45 +4371,6 @@ def _build_dynamic_swizzle_plan(anchor, device):
             "the pre-swizzled cold store"
         )
         return None, None
-
-
-def _get_or_create_gpu_reader():
-    """Process-wide reader for demoted experts; None if disabled or unbuildable.
-
-    WHY IT IS WORTH USING. A window demotes 8 experts x 92 layers = 736 FULL
-    experts, ~12.9 GB, and the disk route reads that as ~4.4k scattered
-    2-3 MB ranges out of mmap'd safetensors (measured ~22 s of fetch in a
-    ~31 s window). The bytes are already in VRAM -- they are the resident
-    rows about to be overwritten -- so this route unswizzles them and
-    all-gathers the full expert over NVLink instead, which is microseconds
-    of transfer against seconds of disk.
-
-    WHY IT WAS OFF, AND WHY IT IS ON NOW. The read-back is proved bitwise,
-    but it reaches the full expert through a TP all-gather, and the install
-    path it lived in had data-dependent early-outs (no cold-store slot, a
-    row already written, a disabled route). Ranks that disagreed on how many
-    collectives to run deadlocked the window rather than falling back --
-    observed as an _ALLGATHER_BASE timing out after 600 s with the NCCL
-    watchdog killing the process group. The condition for re-enabling was
-    that the collective count become a pure function of the per-layer swap
-    plan, and it now is: `_begin_layer` runs ONCE per layer with the whole
-    plan, and its decision goes through `_all_tp_ranks_succeeded(want)`,
-    which every rank executes whether or not it consumes the gather. A
-    residual disagreement therefore degrades to "no rank uses the GPU route
-    on this layer" instead of hanging. SGLANG_KT_SWAP_GPU_READBACK=0 still
-    forces the disk route if a window ever misbehaves.
-    """
-    if not envs.SGLANG_KT_SWAP_GPU_READBACK.get():
-        return None
-    reader = _KT_SWAP_STATE.get("gpu_reader")
-    if reader is None:
-        try:
-            reader = _GpuResidentExpertReader(_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES)
-            _KT_SWAP_STATE["gpu_reader"] = reader
-        except Exception:
-            logger.exception("[kt-swap] could not build the GPU expert reader")
-            return None
-    return reader
 
 
 def _fatal_swap_failure(context: str) -> None:
