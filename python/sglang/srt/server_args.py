@@ -2984,10 +2984,10 @@ class ServerArgs:
         NS("exec.moe"),
     ] = None
     kt_routing_margin: A[
-        Optional[float],
-        "Per-token substitution BUDGET for KT-wrapped MoE layers, as a share of the token's own mixture weight in [0, 1]. Routed picks that are CPU-resident are replaced by not-yet-selected GPU-resident experts (an 'override'), smallest weight first, until the token's substituted share would exceed this budget; the rest stay on the CPU path (an 'insist'). A stand-in does NOT inherit the weight of the pick it replaces: the mixture weights are recomputed over the resulting set of experts, each member at its own router gate and renormalised across the set -- REAP's rule (drop the expert, recompute the top-k weights without it) applied per token and per layer. Inheriting would run a below-cut expert at an above-cut weight, and an expert's output is fitted to the gate it trains under, since the loss only sees the product g_k*f_k. The budget is therefore a BOUND on how far substitution can move any token's layer output, at each of the 92 layers: a layer computes y = sum_j w_j f_j(x), so replacing slot j costs w_j * ||f_sub - f_orig|| -- linear in that slot's weight and independent of the router logit that put it there. 0.0 counts insists/overrides without substituting; >= 1.0 places no bound (equivalent to --kt-routing-full-override); unset disables the feature entirely (bit-exact routing). NOTE: this used to be a router-logit gap against the best unselected resident. That rule bounded nothing -- its comparison point sits at the top-k selection boundary by construction, so it collapsed towards zero on flat-routing tokens and substituted the whole CPU tail exactly where the model blends most experts -- and it has been removed. A value tuned for it does not carry over and must be re-swept.",
+        float,
+        "Per-token substitution BUDGET for KT-wrapped MoE layers, as a share of the token's own mixture weight in [0, 1]. Routed picks that are CPU-resident are replaced by not-yet-selected GPU-resident experts (an 'override'), smallest weight first, until the token's substituted share would exceed this budget; the rest stay on the CPU path (an 'insist'). A stand-in does NOT inherit the weight of the pick it replaces: the mixture weights are recomputed over the resulting set of experts, each member at its own router gate and renormalised across the set -- REAP's rule (drop the expert, recompute the top-k weights without it) applied per token and per layer. Inheriting would run a below-cut expert at an above-cut weight, and an expert's output is fitted to the gate it trains under, since the loss only sees the product g_k*f_k. The budget is therefore a BOUND on how far substitution can move any token's layer output, at each of the 92 layers: a layer computes y = sum_j w_j f_j(x), so replacing slot j costs w_j * ||f_sub - f_orig|| -- linear in that slot's weight and independent of the router logit that put it there. 0.0 (the default) substitutes nothing -- routing is bit-exact, and the demand/hit counters that drive expert swapping still accumulate; >= 1.0 places no bound (equivalent to --kt-routing-full-override). NOTE: this used to be a router-logit gap against the best unselected resident. That rule bounded nothing -- its comparison point sits at the top-k selection boundary by construction, so it collapsed towards zero on flat-routing tokens and substituted the whole CPU tail exactly where the model blends most experts -- and it has been removed. A value tuned for it does not carry over and must be re-swept.",
         NS("exec.moe"),
-    ] = None
+    ] = 0.0
     kt_transport: A[
         Literal["hostnode", "hostnode-unfused", "doorbell"],
         "Transport for CPU expert forwards. hostnode: two cudaLaunchHostFunc nodes per layer, with activations/ids/weights packed on the main stream and staged in ONE D2H after the fork, so the dispatch reaches the CPU while the GPU expert GEMM is still running (default). hostnode-unfused: the original form, three separate D2H copies issued on the CPU stream after the fork -- kept for A/B and for batch sizes kt does not cache. doorbell: a device value-write plus a wait node served by a spinning CPU poller, removing both host-node dispatches.",
@@ -2998,11 +2998,6 @@ class ServerArgs:
         "Poller threads for --kt-transport doorbell (one per socket is the intent).",
         NS("exec.moe"),
     ] = 2
-    kt_cold_only_cpu_experts: A[
-        bool,
-        "Hold CPU expert weights only for experts this rank does NOT keep on the GPU. kt-kernel otherwise allocates an AMX weight buffer for every expert of every wrapped layer and masks GPU-resident ones out at forward time -- 896 experts x 92 layers x ~17.55 MB = ~1.45 TB on Kimi-K3, against ~447 GB actually served at 620/896 resident. Frees ~1 TB for HiCache and cuts the weight load, which is 75% of startup. Nothing reads the buffers a GPU-resident expert never computes: the full-GPU prefill fallback and the layerwise prefill manager, the two paths that exported resident experts from their CPU buffers, have both been removed.",
-        NS("exec.moe"),
-    ] = False
     kt_conditional_cpu_branch: A[
         bool,
         "Skip a layer's CPU-expert branch device-side, via a CUDA conditional node, when no routed slot in the batch names a CPU-resident expert. Under margin routing a large share of layer-steps route entirely to GPU-resident experts; kt's inline-empty check already makes the poller cheap for those, but the GPU still pays the staging D2H, the round trip, the result H2D and the merge. Applies to captured decode graphs only -- an eager forward has no graph to splice a conditional into and runs the branch as before. Requires --kt-transport doorbell.",
@@ -3035,7 +3030,7 @@ class ServerArgs:
     ] = False
     kt_cold_transport: A[
         Literal["cpu", "arena-dma"],
-        "How --kt-expert-split-prefill gets each layer's CPU-resident ('cold') expert weights onto the GPUs. 'cpu' (default): no streaming -- prefill falls back to the margin-routed CPU path. 'arena-dma': every rank's copy engine reads the weights IN PLACE out of kt's memfd arenas, six pitched copies per layer, one DRAM transit, no staging buffer and no pinned host copy. arena-dma REQUIRES --kt-cold-only-cpu-experts (kt must hold only the cold set; at full residency its arenas are ~3.3x larger and there is nothing left to pin) and sets KT_BUFFER_B_MEMFD=1 for kt. It replaces the SGLANG_KT_DEMOTION_DIRECT_DMA and SGLANG_KT_DEMOTION_RANK_WRITE environment variables, which selected the same transport by a different name.",
+        "How --kt-expert-split-prefill gets each layer's CPU-resident ('cold') expert weights onto the GPUs. 'cpu' (default): no streaming -- prefill falls back to the margin-routed CPU path. 'arena-dma': every rank's copy engine reads the weights IN PLACE out of kt's memfd arenas, six pitched copies per layer, one DRAM transit, no staging buffer and no pinned host copy. arena-dma sets KT_BUFFER_B_MEMFD=1 for kt; it relies on kt holding only the cold set, which this build always does. It replaces the SGLANG_KT_DEMOTION_DIRECT_DMA and SGLANG_KT_DEMOTION_RANK_WRITE environment variables, which selected the same transport by a different name.",
         NS("exec.moe"),
     ] = "cpu"
     kt_expert_split_prefill_token_tile: A[
@@ -6891,36 +6886,36 @@ class ServerArgs:
                     "--kt-gpu-experts-ratio/--kt-num-gpu-experts have no effect "
                     "without --kt-weight-path."
                 )
-            if self.kt_routing_margin is not None:
+            if self.kt_routing_margin:
                 logger.warning(
                     "--kt-routing-margin has no effect without --kt-weight-path."
                 )
             return
 
-        if self.kt_routing_margin is not None:
-            # The margin is a SHARE of each token's mixture weight, which sums
-            # to 1 by construction, so its whole range is [0, 1].
-            #
-            # NaN fails this comparison, and must: `NaN < 0.0` is False, so a
-            # naive lower-bound check would admit it, and a NaN threshold
-            # compares False everywhere -- i.e. 100% insists, the exact inverse
-            # of the intended bias and fatal under the full-override skip.
-            #
-            # Above 1.0 is REFUSED rather than clamped to the no-bound
-            # endpoint: such a value is almost certainly a leftover router-logit
-            # margin from the rule this replaced (production ran 0.5 and the
-            # sweep went to 5.0), and clamping would serve a silently different
-            # quality point under a familiar-looking number.
-            if not 0.0 <= self.kt_routing_margin <= 1.0:
-                raise ValueError(
-                    f"--kt-routing-margin is a per-token BUDGET -- the share "
-                    f"of a token's own mixture weight that substitution may "
-                    f"move -- so it must lie in [0.0, 1.0] (0.0 = count-only, "
-                    f"1.0 = no bound), got {self.kt_routing_margin}. It used "
-                    f"to be a router-logit gap against the best unselected "
-                    f"resident; that rule has been removed and its values do "
-                    f"not carry over. Re-sweep."
-                )
+        # The margin is a SHARE of each token's mixture weight, which sums
+        # to 1 by construction, so its whole range is [0, 1].
+        #
+        # NaN fails this comparison, and must: `NaN < 0.0` is False, so a
+        # naive lower-bound check would admit it, and a NaN threshold compares
+        # False everywhere -- i.e. 100% insists, the exact inverse of the
+        # intended bias and fatal under the full-override skip.
+        #
+        # Above 1.0 is REFUSED rather than clamped to the no-bound endpoint:
+        # such a value is almost certainly a leftover router-logit margin from
+        # the rule this replaced (production ran 0.5 and the sweep went to
+        # 5.0), and clamping would serve a silently different quality point
+        # under a familiar-looking number.
+        if not 0.0 <= self.kt_routing_margin <= 1.0:
+            raise ValueError(
+                f"--kt-routing-margin is a per-token BUDGET -- the share of a "
+                f"token's own mixture weight that substitution may move -- so "
+                f"it must lie in [0.0, 1.0] (0.0 = exact routing, 1.0 = no "
+                f"bound), got {self.kt_routing_margin}. It used to be a "
+                f"router-logit gap against the best unselected resident; that "
+                f"rule has been removed and its values do not carry over. "
+                f"Re-sweep."
+            )
+        if self.kt_routing_margin > 0.0:
             logger.info(
                 "[kt] --kt-routing-margin %.4g: up to %.1f%% of each token's "
                 "mixture weight may be substituted away from CPU-resident "
@@ -6930,14 +6925,6 @@ class ServerArgs:
             )
 
         if self.kt_cold_transport == "arena-dma":
-            if not self.kt_cold_only_cpu_experts:
-                raise ValueError(
-                    "--kt-cold-transport arena-dma requires "
-                    "--kt-cold-only-cpu-experts. The transport reads kt's "
-                    "memfd arenas in place, and at full residency kt holds "
-                    "all experts (~3.3x the arena bytes), which is what "
-                    "exhausts pinnable host memory."
-                )
             if not self.kt_expert_split_prefill:
                 raise ValueError(
                     "--kt-cold-transport arena-dma has no effect without "
@@ -7000,26 +6987,32 @@ class ServerArgs:
                     "would be silently dropped."
                 )
 
-        if self.kt_cold_only_cpu_experts:
-            from sglang.srt.layers.moe.kt_ep_wrapper import (
-                KT_WHEEL_SUPPORTS_COLD_ONLY,
-            )
+        # COLD-ONLY RESIDENCY IS THE ONLY PATH, so both preconditions are
+        # unconditional. kt otherwise allocates an AMX weight buffer for every
+        # expert of every wrapped layer and masks GPU-resident ones out at
+        # forward time -- 896 x 92 x ~17.55 MB = ~1.45 TB on Kimi-K3 against
+        # ~447 GB actually served at 620/896 resident, which does not fit the
+        # node's cgroup and leaves nothing for HiCache.
+        from sglang.srt.layers.moe.kt_ep_wrapper import (
+            KT_WHEEL_SUPPORTS_COLD_ONLY,
+        )
 
-            if not KT_WHEEL_SUPPORTS_COLD_ONLY:
-                raise ValueError(
-                    "--kt-cold-only-cpu-experts needs a kt_kernel wheel whose "
-                    "KTMoEWrapper ctor accepts cold_only_cpu_experts. The "
-                    "installed one does not, so the flag would be dropped and "
-                    "every expert allocated -- which looks exactly like the "
-                    "feature not working. Rebuild kt-kernel."
-                )
-            if (self.kt_method or "").upper() != "MXFP4":
-                raise ValueError(
-                    f"--kt-cold-only-cpu-experts is implemented for MXFP4 only, "
-                    f"got --kt-method {self.kt_method}. The other methods' load "
-                    f"paths still fill every expert's buffer unconditionally and "
-                    f"would dereference the ones that are no longer allocated."
-                )
+        if not KT_WHEEL_SUPPORTS_COLD_ONLY:
+            raise ValueError(
+                "This build needs a kt_kernel wheel whose KTMoEWrapper ctor "
+                "accepts cold_only_cpu_experts; the installed one does not. "
+                "It would silently allocate every expert -- ~1.45 TB on "
+                "Kimi-K3 -- which is not a degraded mode but an OOM. "
+                "Rebuild kt-kernel from feat/mxfp4-kimi-k3."
+            )
+        if (self.kt_method or "").upper() != "MXFP4":
+            raise ValueError(
+                f"--kt-method must be MXFP4, got {self.kt_method}. Cold-only "
+                f"CPU residency is the only expert-allocation path and is "
+                f"implemented for MXFP4 alone; the other methods' load paths "
+                f"still fill every expert's buffer unconditionally and would "
+                f"dereference the ones that are no longer allocated."
+            )
 
         if self.kt_conditional_cpu_branch:
             raise ValueError(

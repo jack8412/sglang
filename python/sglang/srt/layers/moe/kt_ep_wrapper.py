@@ -184,8 +184,8 @@ class KTConfig:
         num_layers: Total number of layers in the model (optional)
         routing_margin: Per-token budget for GPU-preferred routing overrides,
             as a share of the token's own mixture weight in [0, 1]
-            (None = feature off, bit-exact routing; 0.0 = count-only;
-            >= 1.0 = no bound, i.e. full override)
+            (0.0 = substitute nothing, bit-exact routing, demand/hit counters
+            still accumulate; >= 1.0 = no bound, i.e. full override)
         routing_full_override: Override EVERY CPU-resident pick, making the
             layer's CPU path provably dead so it can be skipped statically
     """
@@ -200,12 +200,11 @@ class KTConfig:
     method: str
     numa_nodes: Optional[List[int]] = None
     num_layers: Optional[int] = None
-    routing_margin: Optional[float] = None
+    routing_margin: float = 0.0
     routing_full_override: bool = False
     transport: str = "hostnode"
     transport_pollers: int = 2
     conditional_cpu_branch: bool = False
-    cold_only_cpu_experts: bool = False
     cold_transport: str = "cpu"
     expert_swap_transitions: int = 0
     expert_swap_max: int = 4
@@ -833,7 +832,6 @@ def create_kt_config_from_server_args(
         transport=server_args.kt_transport,
         transport_pollers=server_args.kt_transport_pollers,
         conditional_cpu_branch=server_args.kt_conditional_cpu_branch,
-        cold_only_cpu_experts=server_args.kt_cold_only_cpu_experts,
         cold_transport=server_args.kt_cold_transport,
         expert_swap_transitions=server_args.kt_expert_swap_transitions,
         expert_swap_max=server_args.kt_expert_swap_max,
@@ -1297,10 +1295,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.correction_bias: Optional[torch.Tensor] = None
         self._full_override = kt_config.routing_full_override
         self._resident_hit_count: Optional[torch.Tensor] = None
-        if self._full_override and self._margin is None:
-            # Full override subsumes the margin: counters still record what
-            # the router wanted, so the mode reports its own quality cost.
-            self._margin = 0.0
         # Armed in create_weights once num_gpu_experts and top_k are known.
         self._skip_cpu_path = False
         # Split-slice full-expert prefill.  Armed in create_weights once the
@@ -1507,9 +1501,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # reads (kt_expert_swap.py:283). So swapping does not need margin, and
         # exact routing + adaptive placement is now a legal configuration.
         # See SPEC-SWAP-DEMAND.md.
-        if self._counters_enabled and (
-            self._margin is not None or self.kt_config.expert_swap_transitions > 0
-        ):
+        if self._counters_enabled:
             # Demand the router asked for and we did NOT substitute away. With
             # margin unset nothing is ever substituted, so this holds all of it;
             # under margin routing it is the "insist" half and the counter below
@@ -1619,11 +1611,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # Read at MOEConfig construction, before kt allocates the
                 # per-expert weight buffers -- passing it later would silently
                 # allocate all 896 and look like the feature did nothing.
-                **(
-                    {"cold_only_cpu_experts": True}
-                    if self.kt_config.cold_only_cpu_experts
-                    else {}
-                ),
+                cold_only_cpu_experts=True,
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
@@ -1675,7 +1663,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Swap driver registry: keep the layer with the method, since the
         # weight mover writes into the layer's resident parameter rows.
-        if self.kt_config.expert_swap_transitions > 0 and self._margin is not None:
+        # No margin term: demand and hits are functions of the routed ids and
+        # the residency mask alone, so a server at the default 0.0 budget still
+        # feeds the policy. Requiring a margin here used to leave the driver
+        # with nothing to iterate on exactly the exact-routing configuration
+        # the counter gate above declares legal.
+        if self.kt_config.expert_swap_transitions > 0:
             self._swap_layer = layer
             self._swap_policy = None  # built lazily, needs num_experts
             _KT_EP_METHODS.append(self)
@@ -2131,21 +2124,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # about them requires a margin (SPEC-SWAP-DEMAND). This branch is what
         # makes exact routing WITH adaptive placement a legal configuration --
         # bit-exact output, resident set still following the workload.
-        # Margin routing runs when the SERVER set a default, or when any
-        # request in this batch asked for one. Gating on the server default
+        # Margin routing runs when the SERVER set a nonzero budget, or when
+        # any request in this batch asked for one. Gating on the server value
         # alone silently dropped SamplingParams.kt_routing_margin on a server
-        # started without --kt-routing-margin: the value reached ForwardBatch
-        # and the graph buffer, and then nothing read it.
+        # left at the default: the value reached ForwardBatch and the graph
+        # buffer, and then nothing read it.
         _per_req_margin = self._any_request_margin()
 
-        if self._margin is None and not _per_req_margin and self._counters_enabled:
+        # THE DEFAULT IS 0.0, so this is the path most servers take and it must
+        # not pay for the machinery it does not use. At a scalar 0.0 budget the
+        # rewrite provably returns the router's own ids and weights, and the
+        # decision below already declines to apply them -- but the kernel still
+        # RAN, at every one of the 92 layers of every decode step, for a result
+        # thrown away. The counters it would have produced reduce to demand and
+        # hits, which _update_demand_counters computes directly from the routed
+        # ids and the residency mask (SPEC-SWAP-DEMAND). So exact routing keeps
+        # its full swap signal and skips the argsort/cumsum/scatter.
+        #
+        # Full override sits at the default budget too, and must NOT take this
+        # path: its whole effect is the rewrite.
+        _exact_routing = (
+            not self._margin and not _per_req_margin and not self._full_override
+        )
+
+        if _exact_routing and self._counters_enabled:
             self._update_demand_counters(dispatch_output.topk_output.topk_ids)
             # Swap windows moved to the scheduler (SPEC-SWAP-DEMAND Phase 3):
             # mid-prompt re-cuts stall the throughput-critical path, and this
             # call site never ran under --kt-expert-split-prefill anyway --
             # split prefill returns before it and decode replays a graph.
 
-        if self._margin is not None or _per_req_margin:
+        if not _exact_routing:
             from sglang.srt.layers.moe.topk import StandardTopKOutput
 
             _format_ok = (
@@ -2190,19 +2199,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     self._update_margin_counters(
                         topk_output.topk_ids, _insist_slots, _override_slots
                     )
-                # margin == 0.0 is count-only (documented flag contract):
-                # counters record what WOULD override, routing stays exact.
-                # With per-request margins the decision is per token, made
-                # inside the kernel by the `margin > 0` term, so the rewrite is
-                # applied and tokens at 0.0 come back unchanged. The
-                # `is not None` guard matters: a server with no default but a
-                # request that asked reaches here with self._margin None, and
-                # `None > 0.0` raises.
-                if (
-                    self._full_override
-                    or _per_req_margin
-                    or (self._margin is not None and self._margin > 0.0)
-                ):
+                # Reachable at a server margin of 0.0 only via a per-request
+                # budget (the scalar-0.0 batch took the exact-routing path
+                # above). With per-request margins the decision is per token,
+                # made inside the kernel by the `margin > 0` term, so the
+                # rewrite is applied and tokens at 0.0 come back unchanged.
+                if self._full_override or _per_req_margin or self._margin > 0.0:
                     # Both, always: the weights belong to the new expert set,
                     # so applying the ids alone would run it at the old set's
                     # weights -- exactly the mismatch the recompute removes.
@@ -2585,13 +2587,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # request opting in on a server that did not enable margin routing
         # leaves every other request bit-exact.
         #
-        # NEVER None. The caller enters the routing block on a per-request
-        # budget alone (`self._margin is None and _per_req_margin`), so a None
-        # returned here reaches `budget * total` in the greedy and raises
-        # TypeError -- killing the scheduler, and at decode-graph CAPTURE
-        # rather than on a request, because the capture context always carries
-        # the graph-resident margin slot.
-        default = 0.0 if self._margin is None else float(self._margin)
+        # NEVER None: the caller can enter the routing block on a per-request
+        # budget alone, and a None returned here would reach `budget * total`
+        # in the greedy and raise TypeError -- killing the scheduler, and at
+        # decode-graph CAPTURE rather than on a request, because the capture
+        # context always carries the graph-resident margin slot. The server
+        # margin is a plain float now, so this is a float too.
+        default = float(self._margin)
 
         # get_forward_context() asserts rather than returning None, and this
         # code also runs from paths that publish no context (unit tests, the
@@ -2661,7 +2663,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if reason in type(self)._per_request_budget_warned:
             return
         type(self)._per_request_budget_warned.add(reason)
-        _default = "unset -> count-only" if self._margin is None else self._margin
+        _default = self._margin
         logger.warning(
             "[kt-margin] per-request kt_routing_margin IGNORED: the per-token "
             "budget tensor has %d rows but the MoE sees %d, so every token in "
@@ -2955,10 +2957,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if v > 0
         ]
         logger.info(
-            # %s, not %.4g: self._margin is None on a server started without
-            # --kt-routing-margin but running the swap driver, which allocates
-            # these counters and so reaches this line the moment a request
-            # carries its own budget. %.4g raises TypeError on None.
             "[kt-margin] layer=%s eager_step=%d budget=%s "
             "insists=%d overrides=%d top_insisted=%s",
             _li,
@@ -3602,7 +3600,7 @@ def maybe_run_expert_swap_window(
         expert become routable, until its weights are present.
         """
         method = entry.get("method")
-        if method is None or not method.kt_config.cold_only_cpu_experts:
+        if method is None:
             return
 
         # RANK-WRITE PATH. Every rank writes its own slice of the demoted
@@ -3757,7 +3755,6 @@ def maybe_run_expert_swap_window(
             gpu_reader is not None
             and not _KT_SWAP_STATE.get("gpu_readback_off")
             and method is not None
-            and method.kt_config.cold_only_cpu_experts
         )
         if armed:
             # NO per-layer consensus here any more, and none is needed: under
@@ -4568,8 +4565,8 @@ def _start_demotion_prefetch(anchor, entries):
     if not entries:
         return
     method0 = entries[0].get("method")
-    if method0 is None or not method0.kt_config.cold_only_cpu_experts:
-        return  # nothing to install: the demoted expert keeps its CPU buffers
+    if method0 is None:
+        return
     # Only the rank that installs needs the bytes. Safe to vary by rank here
     # precisely because there is no collective below.
     if method0.wrapper is None:

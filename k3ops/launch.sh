@@ -10,12 +10,13 @@
 # ROUTING FLAGS -- none. Pass them yourself.
 # ---------------------------------------------------------------------------
 # This launcher emits NO routing flags. --kt-routing-margin,
-# --kt-routing-full-override, --kt-cold-only-cpu-experts and the expert-swap
-# knobs are all yours to pass as trailing args, and with none passed the server
-# routes bit-exactly (margin routing off).
+# --kt-routing-full-override and the expert-swap knobs are all yours to pass as
+# trailing args, and with none passed the server routes bit-exactly: the margin
+# default is 0.0, which substitutes nothing while still feeding the swap
+# counters.
 #
 # The named profiles that used to live here are gone. They bundled a margin
-# value with cold-only and swapping under a one-word name, and the bundling is
+# value with swapping under a one-word name, and the bundling is
 # what made them dangerous: --kt-routing-margin changed meaning (a router-logit
 # gap became a per-token share of the mixture weight) and every profile kept
 # serving its old number under its old name. A flag list you can read at the
@@ -23,10 +24,9 @@
 #
 # The removal also lifts a real limitation. Trailing args override a VALUED
 # flag -- argparse keeps the last occurrence -- but CANNOT unset a store_true
-# one, so while a profile set --kt-cold-only-cpu-experts or
-# --kt-routing-full-override there was no way to turn it back off from the
-# command line. Nothing here sets them now, so every routing knob is reachable
-# in both directions.
+# one, so while a profile set --kt-routing-full-override there was no way to
+# turn it back off from the command line. Nothing here sets it now, so every
+# routing knob is reachable in both directions.
 #
 # ---------------------------------------------------------------------------
 # Evidence for the non-obvious defaults
@@ -36,11 +36,11 @@
 #   hostnode, so the launcher sets doorbell explicitly. Full-override ceiling
 #   rows ran hostnode (transport absent from their graph) -- pass
 #   --kt-transport hostnode to reproduce those exactly.
-# - --kt-cold-only-cpu-experts requires --kt-routing-margin (server_args
-#   refuses it otherwise), so the two travel together or not at all. Measured
-#   on the OLD router-logit rule (CO1: outputs byte-identical, -0.0215 nats
-#   unchanged, ~1 TB host RAM freed, weight load 110 s); the margin's unit has
-#   since changed, so re-sweep before quoting those numbers again.
+# - cold-only CPU residency is no longer a flag: kt always holds only the
+#   experts this rank does not keep on the GPU. Measured when it was still
+#   opt-in, on the OLD router-logit rule (CO1: outputs byte-identical, -0.0215
+#   nats unchanged, ~1 TB host RAM freed, weight load 110 s); the margin's unit
+#   has since changed, so re-sweep before quoting those numbers again.
 # - attention backends: leave UNSET -- the KimiK3 override resolves all three
 #   to trtllm_mla on SM100/SM103 (verified in every old log). The fa2
 #   UserWarning from the flashinfer prefill wrapper appeared in every old

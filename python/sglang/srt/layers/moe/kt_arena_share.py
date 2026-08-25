@@ -369,15 +369,12 @@ def _serve_layer(*, method, layer_idx: int, tp_rank: int, tp_size: int) -> None:
 def _register_source(method, layer_idx: int, source) -> None:
     """Publish a source to the READ registry, or the WRITE-only one.
 
-    Under cold-only the read registry must stay empty -- offsets go stale at
-    the first swap and the promotion path would serve the previous
-    occupant's bytes. The rank-write path tracks moves itself and never
-    reads through these, so it gets its own registry instead.
+    The read registry stays empty: kt holds only the cold set, so arena
+    offsets go stale at the first swap and the promotion path would serve the
+    previous occupant's bytes. The rank-write path tracks moves itself and
+    never reads through these, so it gets its own registry instead.
     """
-    if method.kt_config.cold_only_cpu_experts:
-        _STATE["write_sources"][layer_idx] = source
-    else:
-        _STATE["sources"][layer_idx] = source
+    _STATE["write_sources"][layer_idx] = source
 
 
 def _receive_layer(*, method, layer_idx: int, tp_rank: int, tp_size: int) -> None:
@@ -461,10 +458,7 @@ def share_layer_arenas(*, method) -> None:
     # than assumed away. kt_config and the env gate are identical on every
     # rank, so this branch is symmetric and nobody enters the broadcast
     # alone.
-    if (
-        method.kt_config.cold_only_cpu_experts
-        and method.kt_config.cold_transport != "arena-dma"
-    ):
+    if method.kt_config.cold_transport != "arena-dma":
         if not _STATE.get("warned_cold_only"):
             _STATE["warned_cold_only"] = True
             logger.info(

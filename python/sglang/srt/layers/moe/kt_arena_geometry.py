@@ -4,7 +4,7 @@ WHAT THIS IS NOT. It used to be ``kt_direct_dma.py`` and to carry a whole
 cold transport -- ``--kt-cold-transport direct-dma``, an interval registrar
 that pinned each rank's read-set per (layer, expert), and a per-expert copy
 plan. That transport never armed on any node: it is gated
-``and not cold_only_cpu_experts``, because its address plan is built at load
+under full CPU residency, because its address plan is built at load
 time and a swap hands a BufferB block to a different expert, so under
 cold-only it would serve the previous occupant's bytes. Forbidding cold-only
 made kt hold all 896 experts (1.35 TB of memfd arenas), which is what

@@ -6,7 +6,7 @@ kt's memfd arenas.
 
 This file used to test a direct-DMA interval registrar and per-expert plan
 builder as well. That transport is gone -- it was gated
-``and not cold_only_cpu_experts``, never armed on any node, and issued ~1,632
+under full CPU residency, never armed on any node, and issued ~1,632
 copies per layer where ArenaDmaColdSource issues 6 -- so only the geometry
 cases remain, which is what the production cold source and the rank writer
 are actually built from.

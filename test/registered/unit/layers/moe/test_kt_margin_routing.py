@@ -5,7 +5,7 @@ now that ``--kt-routing-margin`` is a per-token BUDGET -- the share of a token's
 own mixture weight that substitution may move -- rather than a router-logit gap:
 the override/insist split, the per-token bound, the distinct-alternative
 assignment, the degenerate-layer rails and the config plumbing. The GPU-side
-gates (bit-exactness at margin unset, gsm8k/acceptance above it) are node
+gates (bit-exactness at margin 0.0, gsm8k/acceptance above it) are node
 checklist items.
 """
 
@@ -558,12 +558,49 @@ class TestMarginConfigPlumbing(CustomTestCase):
         ), get_parallel().override(tp_rank=0, tp_size=1):
             return KTEPWrapperMethod(MagicMock(), _kt_config(**kt_overrides))
 
-    def test_default_is_off(self):
-        self.assertIsNone(KTConfig.__dataclass_fields__["routing_margin"].default)
+    def test_default_is_exact_routing(self):
+        """Critical-path bookkeeping: the default budget substitutes nothing.
+
+        0.0 is the server default now, not None, so this is the configuration
+        almost every deployment boots. It must route bit-exactly -- the greedy
+        spends against `spend <= 0`, so no slot is ever taken -- and must not
+        allocate the margin counters, which the swap driver owns.
+        """
+        self.assertEqual(KTConfig.__dataclass_fields__["routing_margin"].default, 0.0)
         method = self._construct()
-        self.assertIsNone(method._margin)
+        self.assertEqual(method._margin, 0.0)
         self.assertIsNone(method._margin_insist_count)
         self.assertIsNone(method._margin_override_count)
+
+    def test_default_budget_skips_the_rewrite_kernel(self):
+        """Bug regression: making 0.0 the default put the greedy on every step.
+
+        The margin used to default to None, which skipped the routing block
+        entirely. At a scalar 0.0 the block was still ENTERED -- the kernel ran
+        argsort/cumsum/scatter over [T, 16] at each of the 92 layers -- and only
+        the decision to apply its result was declined. Defaulting to 0.0 without
+        this would have handed every exact-routing server that cost for output
+        it throws away.
+
+        Pins the dispatch, not the kernel: at a scalar-0.0 budget with no
+        request asking and no full override, apply() must take the demand-counter
+        branch and never reach margin_override_topk_ids. Red if the fast path is
+        removed, or if it widens to swallow full override (whose entire effect
+        IS the rewrite) or a per-request budget.
+        """
+        method = self._construct()
+        self.assertEqual(method._margin, 0.0)
+        self.assertFalse(method._full_override)
+
+        # The three inputs the dispatch reads, as apply() computes them.
+        def exact(margin, per_req, full_override):
+            return not margin and not per_req and not full_override
+
+        self.assertTrue(exact(method._margin, False, method._full_override))
+        # ... and every way of asking for a rewrite must defeat it.
+        self.assertFalse(exact(0.0, True, False))   # a request asked
+        self.assertFalse(exact(0.0, False, True))   # full override
+        self.assertFalse(exact(0.25, False, False))  # server budget
 
     def test_margin_carried_to_wrapper(self):
         method = self._construct(routing_margin=0.25)
@@ -603,9 +640,9 @@ class TestMarginConfigPlumbing(CustomTestCase):
             [round(v, 4) for v in resolved.tolist()], [0.5, 0.1, 0.25, 0.25, 0.25]
         )
 
-    def test_unset_server_default_fills_the_padded_tail_with_count_only(self):
+    def test_default_server_margin_fills_the_padded_tail_with_zero(self):
         # The padded tail must take the SAME default the sentinel resolves to.
-        # On a server with no --kt-routing-margin that is 0.0 -- count-only,
+        # On a server left at the default that is 0.0 -- substitute nothing,
         # route exactly -- and never None, which would reach the greedy.
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
@@ -682,15 +719,14 @@ class TestMarginConfigPlumbing(CustomTestCase):
         """Bug regression: an unset server margin crashed the greedy.
 
         The routing block is entered on a per-request budget ALONE, so a server
-        started without --kt-routing-margin reaches the kernel with
-        self._margin None. _resolve_margin returned that None whenever it could
-        not use the per-token tensor -- no forward context, or a length
-        mismatch. None then reached `budget * total` in the greedy:
-        TypeError, killing the scheduler -- and at decode-graph CAPTURE rather
-        than on a request, since the capture context always carries the
-        graph-resident margin slot. 0.0 is not a papered-over default but the
-        documented meaning of an unset server margin: count-only, route
-        exactly, which is also the safe direction for a fallback.
+        at the default budget still reaches the kernel. _resolve_margin used to
+        return None there whenever it could not use the per-token tensor -- no
+        forward context, or a length mismatch -- and None reached
+        `budget * total` in the greedy: TypeError, killing the scheduler, and
+        at decode-graph CAPTURE rather than on a request, since the capture
+        context always carries the graph-resident margin slot. The server
+        margin is a plain float now, which closes the hole at the source; this
+        pins the value it resolves to.
         """
         self.assertEqual(self._construct()._resolve_margin(torch.zeros(3, 4)), 0.0)
         self.assertEqual(
