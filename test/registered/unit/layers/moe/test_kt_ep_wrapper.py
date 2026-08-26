@@ -339,17 +339,46 @@ class TestZeroGpuExpertPwalGuard(CustomTestCase):
         wrapper.tp_rank = 1
         wrapper.wrapper = None
         wrapper.gpu_method = mock.Mock(spec=["process_weights_after_loading"])
+        # Everything else process_weights_after_loading reads on the way past
+        # step 1. object.__new__ skips __init__, so each of these is an
+        # AttributeError rather than a default -- which is how this test came
+        # to fail: the method grew a split-prefill step (1b) and an expert-map
+        # step (2) after the guard it exercises, and nothing here followed.
+        #   _split_prefill  gates 1b; False keeps this test on the guard.
+        #   tp_rank/wrapper skip step 3 (already set above).
+        wrapper._split_prefill = False
         return wrapper
+
+    def _layer(self):
+        # num_experts is read by step 2's identity-mapping fallback, which is
+        # the branch taken with no EPLB metadata registered.
+        return SimpleNamespace(num_local_experts=64, num_experts=64)
+
+    @staticmethod
+    def _no_arena_share():
+        """Stub out step 4, which is a cross-rank rendezvous.
+
+        share_layer_arenas asks get_parallel().tp_rank, and outside a launched
+        server there is no tensor-model-parallel group to ask -- it asserts.
+        It is also the wrong thing to drag into a unit test about step 1: it
+        passes memfds between processes. Imported inside the method under test,
+        so the patch target is the defining module.
+        """
+        return mock.patch(
+            "sglang.srt.layers.moe.kt_arena_share.share_layer_arenas"
+        )
 
     def test_zero_gpu_experts_skips_gpu_pwal(self):
         wrapper = self._wrapper(0)
-        wrapper.process_weights_after_loading(SimpleNamespace())
+        with self._no_arena_share():
+            wrapper.process_weights_after_loading(self._layer())
         wrapper.gpu_method.process_weights_after_loading.assert_not_called()
 
     def test_nonzero_gpu_experts_still_delegates(self):
         wrapper = self._wrapper(3)
-        layer = SimpleNamespace(num_local_experts=64, num_experts=64)
-        wrapper.process_weights_after_loading(layer)
+        layer = self._layer()
+        with self._no_arena_share():
+            wrapper.process_weights_after_loading(layer)
         wrapper.gpu_method.process_weights_after_loading.assert_called_once_with(layer)
 
 
