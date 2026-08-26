@@ -3999,14 +3999,20 @@ def _build_dynamic_swizzle_plan(anchor, device):
     THE SAMPLE IS A RULER, NOT DATA. ``trtllm_permute_indices`` builds a row
     permutation, and the builder underneath it caches on ``tuple(x.shape)``
     plus the tile size and device -- it never reads a byte of the tensor. So
-    the sample only has to have the right SHAPE.
+    the sample only has to have the right SHAPE, and this reads NO expert
+    bytes: ``raw_shard_shapes`` states them arithmetically.
 
-    It used to be read off the checkpoint, through a whole expert-mover module,
-    for exactly that. kt's arena already holds every cold expert in the layout
-    the swizzle consumes, and ``raw_shard`` documents itself as producing what
-    the old reader produced -- so the ruler comes out of memory now. The write
-    source is registered per layer during load and the rank writer is built
-    just above this call, so it is available by construction.
+    Two earlier versions did read them. The first pulled an expert off the
+    CHECKPOINT through a whole expert-mover module; the second materialised a
+    real arena shard, a 2.19 MB copy out of mapped memory plus a 2.19 MB
+    host-to-device copy, at boot, for bytes nobody looks at. Both were paying
+    for data to measure it.
+
+    The shapes come from ``kt_ram_source`` rather than being recomputed here on
+    purpose: that module owns the axis arithmetic, and a second copy of it
+    beside the plan builder is free to drift from the shard it is supposed to
+    describe. The write source is registered per layer during load and the rank
+    writer is built just above this call, so it is available by construction.
     """
     from sglang.srt.layers.moe.kt_arena_share import arena_write_source_for
     from sglang.srt.layers.moe.kt_mxfp4_export import (
@@ -4028,12 +4034,16 @@ def _build_dynamic_swizzle_plan(anchor, device):
                 li,
             )
             return None, None
-        # cold[0] is non-resident by construction, so it owns a BufferB and
-        # raw_shard cannot raise the absent-slot KeyError here.
-        shard = source.raw_shard(cold[0])
-        on_dev = {n: shard[k].to(device) for n, k in zip(
-            WEIGHT_NAMES, ("w13", "w13_scale", "w2", "w2_scale")
-        )}
+        shapes = source.raw_shard_shapes()
+        # uint8 throughout: kt's arena is mapped as uint8 and the shard slicing
+        # never changes dtype, which raw_shard_shapes states in its docstring.
+        # empty(), not zeros(): nothing reads these.
+        on_dev = {
+            n: torch.empty(shapes[k], dtype=torch.uint8, device=device)
+            for n, k in zip(
+                WEIGHT_NAMES, ("w13", "w13_scale", "w2", "w2_scale")
+            )
+        }
         raw_shapes = {n: (tuple(t.shape), t.dtype) for n, t in on_dev.items()}
         w13, w13_scale, w2, w2_scale = (on_dev[n] for n in WEIGHT_NAMES)
         indices = trtllm_permute_indices(

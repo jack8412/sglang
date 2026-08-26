@@ -191,6 +191,14 @@ class KtRamExpertSource:
         Returns ``{"w13", "w13_scale", "w2", "w2_scale"}`` in the layout the
         GPU-side swizzle consumes -- see this module's docstring for the axis
         arithmetic, which lives there because nothing else states it now.
+
+        NOT ON THE SERVING PATH: split prefill reads through
+        ``ArenaDmaColdSource.layer_rows``, which DMAs straight out of the same
+        arena. This is the EXECUTABLE statement of the layout, checked
+        bitwise against an independently packed arena in
+        test_kt_ram_source, and ``raw_shard_shapes`` -- which production DOES
+        use -- is pinned against it there. Keeping it is what replaced the
+        second opinion ``build_expert_bytes`` used to provide.
         """
         slot = int(logical_id)
         if not 0 <= slot < self.experts:
@@ -233,59 +241,30 @@ class KtRamExpertSource:
             "w2_scale": w2_scale,
         }
 
-    def raw_shard_into(self, logical_id: int, out: Dict[str, torch.Tensor]) -> None:
-        """``raw_shard``, but written into caller storage with zero allocations.
+    def raw_shard_shapes(self) -> Dict[str, tuple]:
+        """The shapes ``raw_shard`` returns, without touching a byte.
 
-        The split-prefill gather calls this ~276 times per layer per rank at a
-        ~22 ms/layer budget; ``raw_shard``'s fresh ``cat`` outputs would double
-        the memory traffic and hand the allocator a hot loop. ``out`` maps the
-        four names to 2-D uint8 views shaped exactly like ``raw_shard``'s
-        returns (typically rows of a pinned staging buffer). Each ``copy_`` is
-        a plain (possibly strided) memcpy and releases the GIL, which is what
-        lets a thread pool run several of these concurrently.
+        Same four names, same order, every tensor uint8 (kt's arena is mapped
+        as uint8 and the slicing never changes dtype). Expert-independent: the
+        blocks are fixed-size per partition, so one expert's shard is every
+        expert's shard.
+
+        WHY THIS EXISTS. The split-prefill swizzle plan needs a tensor of the
+        right shape and nothing else -- ``trtllm_permute_indices`` caches on
+        ``tuple(x.shape)`` and never reads the data. It used to get one by
+        materialising a real shard, which is a 2.19 MB copy out of mapped
+        memory plus a 2.19 MB host-to-device copy, at boot, for bytes nobody
+        looks at. Deriving the shapes here rather than at the call site is what
+        keeps this module the ONLY statement of the axis arithmetic -- the
+        alternative recomputes it beside the plan builder, where it can drift
+        from ``raw_shard`` silently.
         """
-        slot = int(logical_id)
-        if not 0 <= slot < self.experts:
-            raise KeyError(
-                f"expert {logical_id} is outside kt's {self.experts} buffer "
-                "slots"
-            )
-        if self._absent(slot):
-            raise KeyError(
-                f"expert {logical_id} is not CPU-resident here (null BufferB); "
-                "under cold-only residency only cold experts have buffers"
-            )
-
-        h2 = self.hidden // 2
-        hg = self.hidden // self.group
-
-        def fill_rows(dst, pieces):
-            r = 0
-            for p in pieces:
-                n = p.shape[0]
-                dst[r : r + n].copy_(p)
-                r += n
-
-        def fill_cols(dst, pieces):
-            c = 0
-            for p in pieces:
-                n = p.shape[1]
-                dst[:, c : c + n].copy_(p)
-                c += n
-
-        fill_rows(
-            out["w13"],
-            self._row_pieces(_GATE_B, slot, h2) + self._row_pieces(_UP_B, slot, h2),
-        )
-        fill_rows(
-            out["w13_scale"],
-            self._row_pieces(_GATE_D, slot, hg) + self._row_pieces(_UP_D, slot, hg),
-        )
-        fill_cols(out["w2"], self._col_pieces(_DOWN_B, slot, self.per_numa // 2, 2))
-        fill_cols(
-            out["w2_scale"],
-            self._col_pieces(_DOWN_D, slot, self.per_numa // self.group, self.group),
-        )
+        return {
+            "w13": (2 * self.per_gpu, self.hidden // 2),
+            "w13_scale": (2 * self.per_gpu, self.hidden // self.group),
+            "w2": (self.hidden, self.per_gpu // 2),
+            "w2_scale": (self.hidden, self.per_gpu // self.group),
+        }
 
 
 class KtArenaExpertSource(KtRamExpertSource):

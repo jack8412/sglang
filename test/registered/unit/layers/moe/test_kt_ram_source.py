@@ -160,12 +160,24 @@ class TestRawShardModes(CustomTestCase):
                 r,
             )
 
-    def test_raw_shard_into_matches_raw_shard(self):
-        """The alloc-free writer must produce the allocating reader's bytes.
+    def test_shapes_accessor_matches_the_real_shard(self):
+        """raw_shard_shapes must state what raw_shard actually produces.
 
-        raw_shard_into is what the split-prefill gather runs ~276x per layer;
-        any divergence from raw_shard (whose construction is the one proven
-        bitwise against the checkpoint) is silently wrong weights.
+        This is the only cross-check left on the shard geometry. Production no
+        longer calls raw_shard at all -- the split-prefill pipeline reads
+        through ArenaDmaColdSource.layer_rows -- but the swizzle plan is built
+        from raw_shard_shapes, and a wrong shape there permutes the resident
+        rows by the wrong map: right-shaped, finite, silently wrong weights for
+        every promoted expert.
+
+        raw_shard remains the executable statement of the layout (its bytes are
+        checked against an independently packed arena above), so pinning the
+        accessor against it is what keeps the arithmetic honest now that
+        build_expert_bytes, which used to state it a second time, is gone.
+
+        Every rank and every expert, because the shapes are claimed to be
+        expert-independent and the per-rank slicing is where the arithmetic can
+        go wrong.
         """
         blocks = _make_blocks(seed=23)
         arenas, offsets = _pack_arenas(blocks)
@@ -178,15 +190,15 @@ class TestRawShardModes(CustomTestCase):
                 tp_rank=r,
                 tp_size=TP_SIZE,
             )
+            claimed = src.raw_shard_shapes()
+            self.assertEqual(
+                set(claimed), {"w13", "w13_scale", "w2", "w2_scale"}
+            )
             for e in range(EXPERTS):
-                want = src.raw_shard(e)
-                out = {
-                    k: torch.empty_like(want[k])
-                    for k in ("w13", "w13_scale", "w2", "w2_scale")
-                }
-                src.raw_shard_into(e, out)
-                for k, t in out.items():
-                    self.assertTrue(torch.equal(t, want[k]), (r, e, k))
+                got = src.raw_shard(e)
+                for k, t in got.items():
+                    self.assertEqual(tuple(t.shape), tuple(claimed[k]), (r, e, k))
+                    self.assertEqual(t.dtype, torch.uint8, (r, e, k))
 
     def test_absent_expert_raises(self):
         blocks = _make_blocks()
