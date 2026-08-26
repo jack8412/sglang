@@ -321,8 +321,8 @@ class ArenaDmaColdSource:
     aligned and the physical blocks never move. Sorting the live offsets by
     address therefore yields slot order at any point in the run.
 
-    Satisfies the source interface ColdExpertPipeline drives: layer_rows,
-    after_enqueue, reset.
+    Satisfies the source interface ColdExpertPipeline drives:
+    issue_layer_copies, after_enqueue, reset, num_cold.
     """
 
     def __init__(self, *, dma, offsets_by_layer, geometry, layers, num_cold, experts):
@@ -381,18 +381,6 @@ class ArenaDmaColdSource:
 
     def reset(self) -> None:
         return
-
-    def layer_rows(self, layer_idx: int, name: str) -> None:
-        """Probe hook compatibility: no host gather to wait for.
-
-        The overlap probe calls this before ``copy_begin`` to charge a
-        gathering source's host-side wait to its own column instead of letting
-        it hide inside the copy interval. This source reads straight out of
-        kt's registered arena, so there is nothing to gather and nothing to
-        wait for -- the honest measurement is zero. Same stub, same reason, as
-        the direct-DMA transport's.
-        """
-        return None
 
     def issue_layer_copies(self, layer_idx: int, raw, stream) -> None:
         """Gather one layer's whole cold set into ``raw``, six pitched copies."""

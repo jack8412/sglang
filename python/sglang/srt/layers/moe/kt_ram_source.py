@@ -184,7 +184,7 @@ class KtRamExpertSource:
         arithmetic, which lives there because nothing else states it now.
 
         NOT ON THE SERVING PATH: split prefill reads through
-        ``ArenaDmaColdSource.layer_rows``, which DMAs straight out of the same
+        ``ArenaDmaColdSource.issue_layer_copies``, which DMAs straight out of the same
         arena. This is the EXECUTABLE statement of the layout, checked
         bitwise against an independently packed arena in
         test_kt_ram_source, and ``raw_shard_shapes`` -- which production DOES

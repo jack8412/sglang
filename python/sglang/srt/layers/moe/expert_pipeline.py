@@ -47,7 +47,7 @@ class ColdExpertPipeline:
     def __init__(
         self,
         *,
-        source,  # a cold source: num_cold / layer_rows / lifecycle hooks
+        source,  # a cold source: num_cold / issue_layer_copies / lifecycle
         device: torch.device,
         per_expert_shapes: Dict[str, tuple],
         moe_layer_indices: Sequence[int],
@@ -157,20 +157,20 @@ class ColdExpertPipeline:
 
     def _issue_raw(self, slot: int, layer_idx: int) -> None:
         """Enqueue this layer's checkpoint-layout block into its raw slot."""
-        raw = self._raw_buffers[slot]
-        if hasattr(self._source, "issue_layer_copies"):
-            # The source owns the H2D issue: there is no host staging to hand
-            # back, because the bytes are read straight out of kt's registered
-            # arena. Enqueued on the SAME copy stream so the prefetch event's
-            # meaning is unchanged. Duck-typed rather than isinstance so both
-            # the direct-DMA transport and the arena cold source qualify
-            # without this file importing either.
-            self._source.issue_layer_copies(layer_idx, raw, self._copy_stream)
-        else:
-            for name in WEIGHT_NAMES:
-                raw[name].copy_(
-                    self._source.layer_rows(layer_idx, name), non_blocking=True
-                )
+        # The source owns the H2D issue: there is no host staging to hand
+        # back, because the bytes are read straight out of kt's registered
+        # arena. Enqueued on the SAME copy stream so the prefetch event's
+        # meaning is unchanged.
+        #
+        # Unguarded, and that is deliberate: this used to sit behind a hasattr
+        # so the deleted direct-DMA transport and the arena source could both
+        # qualify, with a layer_rows host-copy fallback for sources that had
+        # neither. There is one source now, and an unguarded call is what makes
+        # test_arena_source_implements_every_unguarded_store_call treat this as
+        # REQUIRED rather than optional.
+        self._source.issue_layer_copies(
+            layer_idx, self._raw_buffers[slot], self._copy_stream
+        )
 
     def _swizzle_into(self, slot: int, dst: Dict[str, torch.Tensor]) -> None:
         """Gather the raw block into ``dst`` on the CALLER's stream.

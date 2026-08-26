@@ -2641,31 +2641,27 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _cls = type(self)
         if not hasattr(_cls, "_kt_margin_step"):
             _cls._kt_margin_step = {}
+        # BEFORE the margin counters, on its own rate limit, and before their
+        # early return -- so it is emitted whether or not the swap driver
+        # allocated them. Inside the margin limit the only line ever printed is
+        # eager step 1, which happens during warmup before capture has bound a
+        # single slot: it would report zeros forever and look exactly like a
+        # transport that never ran. The counters are cumulative and
+        # process-wide, and this runs on EAGER steps, so a line printed while
+        # prefilling one request already carries the previous request's DECODE
+        # traffic. That is what makes `served` readable with swapping off --
+        # the only configuration that can be byte-compared.
+        if _KT_DOORBELL["inited"]:
+            _cls._kt_db_log_step = getattr(_cls, "_kt_db_log_step", 0) + 1
+            if _cls._kt_db_log_step % 256 == 1:
+                logger.info("[kt-doorbell] %s", kt_doorbell_stats())
         if self._margin_insist_count is None:
-            # Counters are off (no swap driver, no full override), so there is
-            # nothing to report. The doorbell line below still matters and is
-            # emitted before the return.
-            if _KT_DOORBELL["inited"]:
-                _cls._kt_db_log_step = getattr(_cls, "_kt_db_log_step", 0) + 1
-                if _cls._kt_db_log_step % 256 == 1:
-                    logger.info("[kt-doorbell] %s", kt_doorbell_stats())
+            # Counters are off (no swap driver, no full override): nothing else
+            # to report.
             return
         _li = self.kt_config.layer_idx
         _cls._kt_margin_step[_li] = _cls._kt_margin_step.get(_li, 0) + 1
         _step = _cls._kt_margin_step[_li]
-        if _KT_DOORBELL["inited"]:
-            # Emitted BEFORE the margin rate limit, on its own counter. Inside
-            # it, the only line ever printed is eager step 1 -- which happens
-            # during warmup, before capture has bound a single slot, so it
-            # reports zeros forever and looks exactly like a transport that
-            # never ran. The counters are cumulative and process-wide, and
-            # this runs on EAGER steps, so a line printed while prefilling one
-            # request already carries the previous request's DECODE traffic.
-            # That is what makes `served` readable with swapping off -- the
-            # only configuration that can be byte-compared.
-            _cls._kt_db_log_step = getattr(_cls, "_kt_db_log_step", 0) + 1
-            if _cls._kt_db_log_step % 256 == 1:
-                logger.info("[kt-doorbell] %s", kt_doorbell_stats())
         if _step != 1 and _step % 64 != 0:
             return
         insists = self._margin_insist_count

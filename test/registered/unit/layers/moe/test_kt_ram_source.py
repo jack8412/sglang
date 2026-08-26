@@ -165,7 +165,7 @@ class TestRawShardModes(CustomTestCase):
 
         This is the only cross-check left on the shard geometry. Production no
         longer calls raw_shard at all -- the split-prefill pipeline reads
-        through ArenaDmaColdSource.layer_rows -- but the swizzle plan is built
+        through ArenaDmaColdSource.issue_layer_copies -- but the swizzle plan is built
         from raw_shard_shapes, and a wrong shape there permutes the resident
         rows by the wrong map: right-shaped, finite, silently wrong weights for
         every promoted expert.

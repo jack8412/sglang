@@ -670,15 +670,16 @@ class TestColdSourceSatisfiesThePipelineProtocol(unittest.TestCase):
     """Every method the pipeline calls unguarded, the arena source must have.
 
     This exists because of a real failure. ``ArenaDmaColdSource`` shipped
-    without ``layer_rows``, and nothing noticed: the pipeline only calls it
+    without ``layer_rows``, and nothing noticed: the pipeline only called it
     from inside ``if self._probe is not None``, so the gap was invisible until
-    a server booted with the overlap probe enabled and every one of
-    the eight ranks died with AttributeError partway through a benchmark --
-    after a 17-minute boot.
+    a server booted with the overlap probe enabled and every one of the eight
+    ranks died with AttributeError partway through a benchmark -- after a
+    17-minute boot. (Both that probe and layer_rows are gone now; the lesson
+    that outlived them is that a call the pipeline makes without a guard is a
+    contract nothing else was checking.)
 
     So do not hardcode the method list. Derive it from the pipeline source, and
-    treat a name as REQUIRED unless the pipeline guards it with hasattr (which
-    is how the optional ``issue_layer_copies`` fast path is dispatched). A new
+    treat a name as REQUIRED unless the pipeline guards it with hasattr. A new
     unguarded ``self._source.foo()`` then fails here rather than on the node.
     """
 
@@ -702,10 +703,11 @@ class TestColdSourceSatisfiesThePipelineProtocol(unittest.TestCase):
         required = called - optional
 
         self.assertIn(
-            "layer_rows",
+            "issue_layer_copies",
             required,
-            "the regression this test exists for: layer_rows is called "
-            "unguarded (under the overlap probe), so it is REQUIRED",
+            "issue_layer_copies used to be dispatched behind a hasattr, for a "
+            "transport that no longer exists; it is the only H2D issue path "
+            "now, so the pipeline must call it unguarded",
         )
 
         missing = sorted(
@@ -718,19 +720,6 @@ class TestColdSourceSatisfiesThePipelineProtocol(unittest.TestCase):
             f"these without a hasattr guard (required={sorted(required)}, "
             f"optional={sorted(optional)})",
         )
-
-    def test_layer_rows_is_cheap_and_returns_none(self):
-        """The probe charges its host-side wait to gather_wait; ours is zero.
-
-        A source that reads out of kt's registered arena has no host gather, so
-        the honest measurement is 0 ms. Returning None (rather than a tensor)
-        is what marks it as "nothing was gathered" -- and it must not blow up
-        on a layer index it has never planned.
-        """
-        src = _dw.ArenaDmaColdSource.__new__(_dw.ArenaDmaColdSource)
-        self.assertIsNone(src.layer_rows(0, "w13_weight"))
-        self.assertIsNone(src.layer_rows(9999, "w2_weight"))
-
 
 if __name__ == "__main__":
     unittest.main()
