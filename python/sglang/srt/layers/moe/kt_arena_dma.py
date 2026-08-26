@@ -1,5 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Rank-write demotions: every rank writes its own slice into kt's buffers.
+"""kt's memfd arena <-> device, in one hop, in both directions.
+
+WHAT IS IN HERE. One CUDA registration of kt's per-(layer, partition) memfd
+arenas, and the three things built on it:
+
+    SlotOffsets        a mirror of kt's BufferB ownership -- which expert
+                       holds which buffer, on every partition. Replays kt's
+                       own legality checks (``can_move``) so a swap is proved
+                       installable before anything moves.
+    ArenaDmaWriter     the registration plus ``cudaMemcpy2DAsync`` both ways:
+                       ``read`` arena -> device, ``write`` device -> arena.
+    ArenaDmaColdSource split prefill's cold stream, READ-only: six pitched
+                       copies per layer straight out of the same arena.
+    RankShardWriter    the demotion orchestrator: capture, validate, write.
+
+The read and the write directions live together because they share the thing
+that costs -- the registration is ~6 s and ~418 MB of page tables per rank for
+~204 GiB, paid once at arm time, and neither direction is worth paying it
+twice. That is also why split prefill depends on this module with swapping
+switched off entirely: ``finalize_split_prefill`` builds its cold source from
+this writer's ``_dma``, ``_offsets`` and geometry.
+
+The rest of this docstring is the demotion half, which is the harder half.
 
 THE PROBLEM. Under cold-only residency a demoted expert owns no CPU buffer,
 so the swap window has to give it one before it becomes routable. kt's
@@ -47,9 +69,10 @@ ORDERING, which is the whole correctness story:
     3. write()     every rank memcpys its slice into the moved buffers.
     4. barrier     before serving resumes and kt computes the expert.
 
-Nothing here issues a CUDA collective, so a rank that fails degrades to
-"this layer keeps the checkpoint path" instead of stranding seven peers in
-NCCL.
+Nothing here issues a CUDA collective, so a rank that fails cannot strand
+seven peers in NCCL. It used to degrade to "this layer keeps the checkpoint
+path"; there is no such path any more, so the window's arming consensus turns
+a failure into a terminate instead -- see ``_fatal_swap_failure``.
 """
 
 from __future__ import annotations
@@ -488,8 +511,9 @@ class RankShardWriter:
                 }
         except Exception:
             logger.exception(
-                "[kt-rankwrite] capture failed on layer %s; this layer keeps "
-                "the checkpoint path",
+                "[kt-rankwrite] capture failed on layer %s; the caller turns "
+                "this into a terminate, since a demoted expert has no other "
+                "source of weights",
                 layer_idx,
             )
             self._staged = {}

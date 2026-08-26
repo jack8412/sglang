@@ -40,9 +40,9 @@ def _load(mod_name, filename):
 
 
 try:
-    from sglang.srt.layers.moe import kt_demotion_writer as _dw
+    from sglang.srt.layers.moe import kt_arena_dma as _dw
 except ModuleNotFoundError:  # dev VM without orjson: load standalone
-    _dw = _load("sglang.srt.layers.moe.kt_demotion_writer", "kt_demotion_writer.py")
+    _dw = _load("sglang.srt.layers.moe.kt_arena_dma", "kt_arena_dma.py")
 
 SlotOffsets = _dw.SlotOffsets
 RankShardWriter = _dw.RankShardWriter

@@ -3601,10 +3601,11 @@ def finalize_split_prefill(server_args) -> bool:
         num_cold = anchor.global_num_experts - num_gpu
 
         # ONE COLD SOURCE. kt's memfd arena already holds every cold expert's
-        # checkpoint-layout bytes, and the demotion writer has already
-        # registered this rank's view of them, so the copy engine reads them
-        # IN PLACE -- six pitched copies per layer, one DRAM transit, no
-        # prepare stage and no second copy of anything.
+        # checkpoint-layout bytes, and kt_arena_dma has already registered this
+        # rank's view of them -- one registration serving both directions, which
+        # is why the writer is built just above -- so the copy engine reads them
+        # IN PLACE: six pitched copies per layer, one DRAM transit, no prepare
+        # stage and no second copy of anything.
         #
         # Four alternatives used to stand beside this and every one of them was
         # another copy of those same bytes: a 51 GiB/rank pinned store, kt's
@@ -3639,7 +3640,7 @@ def finalize_split_prefill(server_args) -> bool:
                 "not be built"
             )
 
-        from sglang.srt.layers.moe.kt_demotion_writer import ArenaDmaColdSource
+        from sglang.srt.layers.moe.kt_arena_dma import ArenaDmaColdSource
 
         source = ArenaDmaColdSource(
             dma=_dma_writer._dma,
@@ -3979,7 +3980,7 @@ def _get_or_create_rank_writer(entry):
             from sglang.srt.layers.moe.kt_arena_share import (
                 arena_write_source_for,
             )
-            from sglang.srt.layers.moe.kt_demotion_writer import (
+            from sglang.srt.layers.moe.kt_arena_dma import (
                 RankShardWriter,
                 SlotOffsets,
             )
@@ -4020,7 +4021,7 @@ def _get_or_create_rank_writer(entry):
                 # ~2275 MiB, not the 150,144 per-expert ranges that made the
                 # direct-DMA transport fail with rc=2. Cost is per page, so
                 # expect seconds and a few hundred MB of page tables, once.
-                from sglang.srt.layers.moe.kt_demotion_writer import ArenaDmaWriter
+                from sglang.srt.layers.moe.kt_arena_dma import ArenaDmaWriter
                 from sglang.srt.layers.moe.kt_arena_geometry import (
                     CudaCopyLib,
                     cudart_register_fns,
