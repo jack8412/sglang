@@ -605,7 +605,7 @@ class _ReapStage:
         return num, count
 
 
-def reap_note_batch(is_decode: bool, num_requests: int) -> None:
+def reap_note_batch(is_decode: bool, num_requests: int, forward_stream=None) -> None:
     """Combine the PREVIOUS decode step, then remember this one.
 
     Called at the top of run_batch, before this batch's forward is enqueued, so
@@ -619,13 +619,13 @@ def reap_note_batch(is_decode: bool, num_requests: int) -> None:
         return
     pending = _KT_REAP_PENDING.get("tokens", 0)
     if pending:
-        reap_combine_decode_step(pending)
+        reap_combine_decode_step(pending, forward_stream=forward_stream)
     _KT_REAP_PENDING["tokens"] = (
         num_requests * stage.token_width if is_decode else 0
     )
 
 
-def reap_combine_decode_step(real_tokens: int) -> None:
+def reap_combine_decode_step(real_tokens: int, forward_stream=None) -> None:
     """Fold one decode step's staged measurement in. Called by the scheduler.
 
     Outside the captured graph on purpose. A replay runs no Python, so this is
@@ -639,8 +639,16 @@ def reap_combine_decode_step(real_tokens: int) -> None:
     routing. Counting them would corrupt the denominator REAP exists for.
     """
     stage = reap_stage()
-    if stage is not None:
-        stage.combine(real_tokens)
+    if stage is None:
+        return
+    if forward_stream is not None:
+        # The replay wrote the staging buffers on the forward stream and
+        # nothing has waited on it -- the scheduler deliberately runs ahead --
+        # so reading them from here without ordering is a race against the
+        # forward that produced them. Same idiom as the scheduler's own WAR
+        # barrier.
+        torch.cuda.current_stream().wait_stream(forward_stream)
+    stage.combine(real_tokens)
 
 
 _KT_REAP_PENDING: Dict[str, int] = {}
@@ -696,14 +704,21 @@ def _init_reap_stage(server_args: "ServerArgs", hf_config, num_layers: int) -> N
         return
 
     decode_bs = server_args.cuda_graph_config.decode.bs
-    # A captured decode graph runs one token per request only without
-    # speculation; with a draft it runs the whole verify width, and a stage
-    # sized for the batch alone would silently refuse every forward.
-    width = getattr(server_args, "speculative_num_draft_tokens", None) or 1
-    max_tokens = max(decode_bs) * width if decode_bs else 0
-    if max_tokens <= 0:
+    if not decode_bs:
         logger.warning("[kt-reap] no decode capture sizes; scoring off")
         return
+    # The capture list is not the bound on its own: it defaults well above what
+    # the scheduler will ever run, and this buffer is taken before the KV pool
+    # is sized, so over-allocating here shrinks the pool that decides the batch
+    # size it was allocated for. A captured decode graph also runs one token
+    # per request only without speculation; with a draft it runs the whole
+    # verify width, and a stage sized for the request count alone would refuse
+    # every forward.
+    width = getattr(server_args, "speculative_num_draft_tokens", None) or 1
+    cap = max(decode_bs)
+    if server_args.max_running_requests:
+        cap = min(cap, server_args.max_running_requests)
+    max_tokens = cap * width
 
     holder["stage"] = _ReapStage(
         num_layers=num_layers,
@@ -714,10 +729,16 @@ def _init_reap_stage(server_args: "ServerArgs", hf_config, num_layers: int) -> N
         width=width,
         device=torch.device("cuda", torch.cuda.current_device()),
     )
+    stage = holder["stage"]
+    staged_bytes = (
+        stage.vec.numel() * stage.vec.element_size()
+        + stage._rs.numel() * stage._rs.element_size()
+    )
     logger.info(
         "[kt-reap] scoring armed: %d layers x %d experts, top_k %d, hidden %d, "
-        "max decode batch %d",
+        "max decode tokens %d, staging %.0f MiB",
         num_layers, num_experts, top_k, hidden, max_tokens,
+        staged_bytes / (1024 * 1024),
     )
 
 
