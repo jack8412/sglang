@@ -731,6 +731,16 @@ def _init_reap_stage(server_args: "ServerArgs", hf_config, num_layers: int) -> N
         cap = min(cap, server_args.max_running_requests)
     max_tokens = cap * width
 
+    world = get_tp_group().world_size
+    if (num_layers * top_k) % world:
+        # reduce_scatter splits dim 0, so T*L*top_k must divide the rank count
+        # for every T. L*top_k dividing it makes that true for all T at once.
+        logger.warning(
+            "[kt-reap] %d layers x top_k %d does not divide %d ranks; scoring off",
+            num_layers, top_k, world,
+        )
+        return
+
     holder["stage"] = _ReapStage(
         num_layers=num_layers,
         num_experts=num_experts,
