@@ -81,7 +81,6 @@ _STATE: Dict = {
     "conns": [],  # rank 0: one per peer, None where dead
     "sock": None,  # peers: connection to rank 0
     "mmaps": [],  # peers: keep mappings alive for the process lifetime
-    "sources": {},  # layer_idx -> KtArenaExpertSource (READ path)
     "write_sources": {},  # layer_idx -> source for the rank-write path
 }
 
@@ -92,25 +91,17 @@ def kt_arena_mode_requested() -> bool:
     return v is not None and v != "" and v != "0"
 
 
-def arena_source_for(layer_idx: int):
-    """This rank's arena source for one layer, or None (fall back).
-
-    READ path. Under cold-only this stays empty on purpose: swaps move
-    BufferB ownership between expert ids, so load-time offsets go stale and
-    a reader would serve the previous occupant's bytes.
-    """
-    return _STATE["sources"].get(layer_idx)
-
-
 def arena_write_source_for(layer_idx: int):
     """This rank's arena source for the WRITE path, or None.
 
-    Kept in a separate registry from ``arena_source_for`` precisely because
-    the cold-only staleness argument does not apply to it: the rank-write
-    demotion path never reads through these sources, and it tracks every
-    slot move in its own table. Publishing them into the read registry
-    instead would silently hand stale offsets to the promotion path, which
-    is the one thing the cold-only refusal exists to prevent.
+    THE ONLY REGISTRY. There used to be a second, read-path one beside it,
+    for a promotion route that read arena bytes through load-time offsets.
+    That route cannot be correct under cold-only residency -- swaps move
+    BufferB ownership between expert ids, so those offsets go stale at the
+    first swap and a reader would serve the previous occupant's bytes -- so
+    the registry was never populated and the route never ran. The rank-write
+    path has no such problem: it never reads through these sources, and it
+    tracks every slot move in its own table.
     """
     return _STATE["write_sources"].get(layer_idx)
 
@@ -455,13 +446,3 @@ def share_layer_arenas(*, method) -> None:
                     conn.close()
                 finally:
                     _STATE["conns"][i] = None
-
-
-def arena_sources_summary() -> str:
-    """One line for the boot log: how many layers this rank can promote from RAM."""
-    n = len(_STATE["sources"]) + len(_STATE["write_sources"])
-    if not _STATE["enabled"]:
-        return "arena mode off"
-    if _STATE["failed"]:
-        return f"FAILED after {n} layer(s)"
-    return f"{n} layer(s) mapped"

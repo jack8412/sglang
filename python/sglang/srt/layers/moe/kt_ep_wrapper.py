@@ -2898,7 +2898,6 @@ def maybe_run_expert_swap_window(
     forward has completed, including the host nodes that enqueue CPU expert
     work, so nothing is mid-flight while weights and masks change.
     """
-    from sglang.srt.layers.moe.kt_arena_share import arena_source_for
     from sglang.srt.layers.moe.kt_expert_swap import (
         ExpertSwapPolicy,
         run_swap_window,
@@ -3021,12 +3020,6 @@ def maybe_run_expert_swap_window(
             "expert owns no CPU buffers under cold-only residency, so without "
             "the arena writer it would become routable with no weights"
         )
-
-    # Arena promotion (full-kt + KT_BUFFER_B_MEMFD): promoted bytes come from
-    # this rank's read-only mapping of kt's own buffers instead of the
-    # checkpoint. The batched swizzle plan it feeds is armed lazily here
-    # because without split prefill nothing else builds one.
-    _maybe_arm_arena_swizzle_plan(entries)
 
     # Batched move state, flushed through run_swap_window's finish_layer hook.
     # Flushing lazily on "the layer changed" instead looks equivalent and is
@@ -3945,48 +3938,6 @@ def finalize_split_prefill(server_args) -> bool:
             "window will retry"
         )
     return True
-
-
-def _maybe_arm_arena_swizzle_plan(entries):
-    """Build the batched swizzle plan when arena promotion will need it.
-
-    Split prefill arms _KT_SPLIT_PREFILL_STATE at store-build time; the
-    full-kt config has no store, so the first acting window pays for the plan
-    here instead -- one 2.2 MB checkpoint read, shape-derived, serves every
-    layer for the process lifetime. Purely local: no collective.
-    """
-    from sglang.srt.layers.moe.kt_arena_share import arena_source_for
-
-    if _KT_SPLIT_PREFILL_STATE.get("swizzle_plan") is not None:
-        return
-    if _KT_SPLIT_PREFILL_STATE.get("arena_swizzle_failed"):
-        return
-    if not any(
-        arena_source_for(e["layer_idx"]) is not None for e in entries
-    ):
-        return
-    anchor = entries[0]["method"]
-    device = anchor.gpu_experts_mask_cuda.device
-    raw_shapes, plan = _build_dynamic_swizzle_plan(anchor, device)
-    if plan is None or raw_shapes is None:
-        _KT_SPLIT_PREFILL_STATE["arena_swizzle_failed"] = True
-        logger.error(
-            "[kt-arena] could not build a swizzle plan; promotions keep the "
-            "checkpoint path"
-        )
-        return
-    _KT_SPLIT_PREFILL_STATE["swizzle_plan"] = plan
-    _KT_SPLIT_PREFILL_STATE["swizzle_inverse"] = None
-    _KT_SPLIT_PREFILL_STATE["raw_scale_shapes"] = (
-        tuple(raw_shapes["w13_weight_scale"][0]),
-        tuple(raw_shapes["w2_weight_scale"][0]),
-    )
-    from sglang.srt.layers.moe.kt_arena_share import arena_sources_summary
-
-    logger.info(
-        "[kt-arena] promotion from kt RAM armed on this rank (%s)",
-        arena_sources_summary(),
-    )
 
 
 def _swizzle_promoted_rows(promoted):
