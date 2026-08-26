@@ -2962,10 +2962,6 @@ def maybe_run_expert_swap_window(
         # "prefetch 0 hit / 0 miss". Not one byte was consumed.
         return
 
-    mover = _get_or_create_expert_mover(anchor)
-    if mover is None:
-        return
-
     # Phase accounting for one window, logged on the way out.
     _timing = {
         "read_s": 0.0,
@@ -2998,12 +2994,6 @@ def maybe_run_expert_swap_window(
         "d2h_sync_s": 0.0,    # waiting for this rank's demotion D2H to land
     }
     _window_t0 = time.perf_counter()
-
-    # Per-layer physical-to-logical maps for _checkpoint_id: _move only has
-    # the layer module in hand, everything else here has an entry.
-    p2l_by_layer = {
-        e["layer_idx"]: e["method"]._kt_physical_to_logical for e in entries
-    }
 
     # RANK-WRITE ARMING IS DECIDED ONCE PER WINDOW, SYMMETRICALLY. The writer
     # itself is per-rank fallible -- kt_arena_share degrades a rank that could
@@ -3212,26 +3202,32 @@ def maybe_run_expert_swap_window(
             and getattr(_rw, "_dma", None) is not None
             and bool(_KT_SWAP_STATE.get("rank_write_armed"))
         )
-        # None means this expert no longer holds a buffer in this partition --
-        # a re-promotion inside one window. That is a different source, not a
-        # failed one, so it is routed below rather than treated as an error.
         _dma_row = (
             _rw._offsets[layer_idx].get(int(logical_id), _rw._g.part)
             if _dma_armed
             else None
         )
         if _dma_row is None:
-            # The expert left the cold set (a re-promotion inside one
-            # window). The checkpoint path writes the GPU row immediately,
-            # so drain anything staged for this layer first -- otherwise a
-            # queued scatter could land on top of it.
-            _flush_moves()
-            mover.move(
-                layer,
-                dst_row,
-                _checkpoint_id(p2l_by_layer.get(layer_idx), logical_id),
+            # None means the promoted expert holds no CPU buffer, i.e. it is
+            # already GPU-resident -- and with THIS policy that cannot happen.
+            # ExpertSwapPolicy.select draws promotes from ~mask and demotes
+            # from mask via nonzero(), so within one layer's plan the promote
+            # ids are distinct and disjoint from the demote ids; the only thing
+            # that nulls an entry is apply_move(promote=X), and X appears once.
+            # An expert null BEFORE the window is refused earlier still, by
+            # can_move inside validate().
+            #
+            # So this is a policy invariant asserted at the point that depends
+            # on it, not a fallback. It used to read the expert off the
+            # checkpoint instead, which is exactly the failure recorded above:
+            # a silent per-expert disk read while the rank-write log claimed
+            # the fast path. If select() ever emits a non-disjoint plan, the
+            # server must say so rather than quietly serve at 1/100th the rate.
+            _fatal_swap_failure(
+                f"promoted expert {int(logical_id)} on layer {layer_idx} holds "
+                f"no arena buffer: the swap plan is not disjoint, which "
+                f"ExpertSwapPolicy.select is supposed to guarantee"
             )
-            return
 
         if _pending["layer_idx"] != layer_idx:
             _flush_moves()
@@ -3705,43 +3701,6 @@ class _GpuResidentExpertReader:
         ]
 
 
-class _PerLayerMover:
-    """One CheckpointExpertMover per layer (permute indices are per-shape)."""
-
-    def __init__(self, weight_path, tp_rank, tp_size):
-        self._by_layer = {}
-        self._args = (weight_path, tp_rank, tp_size)
-
-    def move(self, layer, dst_row, logical_id, demoted_id=None):
-        # demoted_id is part of the MoveWeightsFn contract for movers that
-        # maintain a cold-side store; the checkpoint mover reads the promoted
-        # expert straight from disk and does not need it.
-        self._for(layer)(layer, dst_row, logical_id)
-
-    def _for(self, layer):
-        from sglang.srt.layers.moe.kt_expert_mover import CheckpointExpertMover
-
-        layer_idx = getattr(layer, "layer_id", None)
-        if layer_idx is None:
-            raise RuntimeError("layer has no layer_id; cannot resolve its experts")
-        mover = self._by_layer.get(layer_idx)
-        if mover is None:
-            weight_path, tp_rank, tp_size = self._args
-            prefix = (
-                f"language_model.model.layers.{layer_idx}"
-                f".block_sparse_moe.experts"
-            )
-            mover = CheckpointExpertMover(
-                weight_path,
-                expert_prefix_for_layer=lambda _l, _p=prefix: _p,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-                param_names=_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES,
-            )
-            self._by_layer[layer_idx] = mover
-        return mover
-
-
 def _register_split_prefill_layer(method, layer) -> None:
     """Record a layer that armed split-slice prefill (post-load, per layer)."""
     layer_idx = method.kt_config.layer_idx
@@ -3988,25 +3947,13 @@ def finalize_split_prefill(server_args) -> bool:
     return True
 
 
-def _checkpoint_id(p2l, plan_id):
-    """Swap-plan ids are kt buffer SLOTS (physical); the checkpoint is logical.
-
-    Every checkpoint read keyed by a plan id goes through this, so the arena
-    source (slot-indexed by construction) and the checkpoint fallback name the
-    SAME expert for one plan id. Identity map -> no-op, which is why the gap
-    was invisible until now; a frequency-placement seed makes it real.
-    """
-    return int(plan_id) if p2l is None else int(p2l[plan_id])
-
-
 def _maybe_arm_arena_swizzle_plan(entries):
     """Build the batched swizzle plan when arena promotion will need it.
 
     Split prefill arms _KT_SPLIT_PREFILL_STATE at store-build time; the
     full-kt config has no store, so the first acting window pays for the plan
     here instead -- one 2.2 MB checkpoint read, shape-derived, serves every
-    layer for the process lifetime. Purely local: no collective, and a failure
-    only means promotions keep the checkpoint path.
+    layer for the process lifetime. Purely local: no collective.
     """
     from sglang.srt.layers.moe.kt_arena_share import arena_source_for
 
@@ -4398,22 +4345,6 @@ def _get_or_create_rank_writer(entry):
 
     _KT_SWAP_STATE["rank_writer"] = writer
     return writer
-
-
-def _get_or_create_expert_mover(anchor):
-    mover = _KT_SWAP_STATE.get("mover")
-    if mover is None:
-        try:
-            mover = _PerLayerMover(
-                anchor.kt_config.weight_path,
-                get_parallel().tp_rank,
-                get_parallel().tp_size,
-            )
-            _KT_SWAP_STATE["mover"] = mover
-        except Exception:
-            logger.exception("[kt-swap] could not build the expert mover")
-            return None
-    return mover
 
 
 # ---------------------------------------------------------------------------
