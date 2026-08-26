@@ -43,17 +43,32 @@ seam exists on this path.
 **Staged in the decode graph, per layer.** Buffers allocated at init - never on
 first use, which under graph capture would take them from the capture pool:
 
-    vec   [max_T, L, top_k, H]  bf16   gathered gemm2 rows, zero where not served
-    ids   [max_T, L, top_k]     int32  served expert id
-    w     [max_T, L, top_k]     fp32
-    valid [max_T, L, top_k]     bool
+    vec   [max_T, L, top_k, H]  bf16   gathered gemm2 rows, ZERO where not served
+    ids   [max_T, L, top_k]     int64  served expert id, for EVERY slot
+    w     [max_T, L, top_k]     fp32   for every slot
+    valid [max_T, L, top_k]     bool   did the GPU serve this slot
 
-`max_T` leads so `vec[:T]` is contiguous. At `max_T=39, L=92, top_k=16,
-H=3584`: 411 MB, plus ~50 MB reduce-scatter output and ~1 MB of side tables.
+Only `vec` is zeroed on a slot the GPU did not serve. `ids` and `w` are staged
+for all top_k slots, because the slots the GPU skipped are exactly the ones kt
+served and the fold below needs their real expert id -- zeroing them sends
+every CPU-served activation to expert 0, which then wins every promotion.
+`valid` alone separates the two halves.
+
+`max_T` leads so `vec[:T]` is contiguous.
+
+`max_T = min(max(capture_bs), max_running_requests) * draft_width`. The capture
+list alone is not the bound -- it defaults far above anything the scheduler will
+run -- and this buffer is taken BEFORE the KV pool is sized, so over-allocating
+here shrinks the pool that decides the batch size it was sized for. The armed
+size is logged.
 
 **Combined outside the graph**, at the scheduler's decode hook - the same place
 the swap window runs, and for the same reason: it needs Python and a device
 sync, which a graph replay has neither of.
+
+It must first `wait_stream` on the forward stream. The replay wrote the staging
+buffers there and the scheduler deliberately runs ahead, so reading them from
+the scheduler stream without ordering races the forward that produced them.
 
     N = T * L * top_k                      # N % 8 == 0 since 92*16 = 1472
     reduce_scatter_tensor: [N, H] -> [N/P, H]   each rank gets TRUE summed rows
@@ -97,9 +112,14 @@ That division of labour drops three problems at once:
 The transfer is `qlen * k` floats per layer per step -- about 2.5 KB at
 `qlen=39, k=16`, against the ~4.6 MB of expert rows it summarises.
 
-Parallelise the merge over (token, slot) with the TP-level pool rather than
-inside one NUMA node's job: the reads are cross-node whichever way it is
-written, and one node's threads doing all of them serialises the work.
+Parallelise the merge over (token, slot) across NUMA nodes, via
+`dispense_backend()->do_numa_job` plus each node's own `get_subpool`.
+`WorkerPool::do_work_stealing_job` forwards everything to node 0's threads
+alone, so using it would leave the reads remote AND serialise them on a sixth
+of the cores.
+
+kt refuses a batch longer than the registered buffer rather than measuring a
+prefix of it: that length is a prefill shape, and prefill is not measured.
 
 A slot kt did not compute reads back 0, which contributes nothing.
 
@@ -133,4 +153,9 @@ evidence to justify promoting.
 - Only real tokens are measured. Captured graphs pad to the capture size and
   padding rows carry the previous replay's ids; counting them corrupts `|X_k|`.
 - Buffers allocated at init, not on first use.
-- Prefill is never measured, including chunks below the split-prefill threshold.
+- Prefill is never measured, including chunks below the split-prefill
+  threshold. On the GPU side the combine only runs for a decode batch; on the
+  kt side anything longer than the decode buffer is refused.
+- Under `--kt-routing-full-override` nothing scores a promotion candidate,
+  because no CPU expert ever runs. Placement holds its startup cut, and that
+  is said out loud at arming rather than discovered.

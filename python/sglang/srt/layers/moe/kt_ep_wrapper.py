@@ -689,7 +689,18 @@ def _init_reap_stage(server_args: "ServerArgs", hf_config, num_layers: int) -> N
     if "stage" in holder:
         return
     holder["stage"] = None
-    if server_args.expert_swap_transitions <= 0:
+    if server_args.kt_expert_swap_transitions <= 0:
+        return
+    if server_args.kt_routing_full_override:
+        # Full override substitutes every non-resident pick, so kt never runs
+        # and no non-resident expert is ever measured. Promotion would have no
+        # evidence to act on and the boot cut would stand for the life of the
+        # server -- silently, if this did not say so.
+        logger.warning(
+            "[kt-reap] --kt-routing-full-override runs no CPU expert, so "
+            "nothing can score a promotion candidate: expert placement will "
+            "hold its startup cut. Scoring off."
+        )
         return
 
     hidden = getattr(hf_config, "routed_expert_hidden_size", None)
@@ -714,7 +725,7 @@ def _init_reap_stage(server_args: "ServerArgs", hf_config, num_layers: int) -> N
     # per request only without speculation; with a draft it runs the whole
     # verify width, and a stage sized for the request count alone would refuse
     # every forward.
-    width = getattr(server_args, "speculative_num_draft_tokens", None) or 1
+    width = server_args.speculative_num_draft_tokens or 1
     cap = max(decode_bs)
     if server_args.max_running_requests:
         cap = min(cap, server_args.max_running_requests)
