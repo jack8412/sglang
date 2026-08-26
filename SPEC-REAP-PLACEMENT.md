@@ -56,11 +56,15 @@ every CPU-served activation to expert 0, which then wins every promotion.
 
 `max_T` leads so `vec[:T]` is contiguous.
 
-`max_T = min(max(capture_bs), max_running_requests) * draft_width`. The capture
-list alone is not the bound -- it defaults far above anything the scheduler will
-run -- and this buffer is taken BEFORE the KV pool is sized, so over-allocating
-here shrinks the pool that decides the batch size it was sized for. The armed
-size is logged.
+`max_T` is capped by a BYTE budget (1 GiB), not by the capture list.
+`max_running_requests` is None unless someone passes it, so clamping to it is
+usually inert, and the capture list defaults far above anything the scheduler
+runs -- a B200 default would take 5.09 GiB per rank out of the KV pool, before
+that pool is sized. The armed size is logged.
+
+A batch above `max_T` is REFUSED, not clamped. Clamping would re-fold whichever
+step last fit, once per oversized step, growing its weight in the decayed mean
+while blacking out exactly the overloaded traffic that most needs re-placement.
 
 **Combined outside the graph**, at the scheduler's decode hook - the same place
 the swap window runs, and for the same reason: it needs Python and a device
@@ -69,6 +73,12 @@ sync, which a graph replay has neither of.
 It must first `wait_stream` on the forward stream. The replay wrote the staging
 buffers there and the scheduler deliberately runs ahead, so reading them from
 the scheduler stream without ordering races the forward that produced them.
+
+kt's norms must be copied as the WHOLE contiguous pinned buffer and sliced on
+device. Slicing the host tensor first makes the copy non-contiguous, which
+turns it into a pageable copy through a temporary taken on the calling thread
+immediately -- `non_blocking` becomes inert, the `wait_stream` orders nothing,
+and it reads bytes kt's poller thread is still writing.
 
     N = T * L * top_k                      # N % 8 == 0 since 92*16 = 1472
     reduce_scatter_tensor: [N, H] -> [N/P, H]   each rank gets TRUE summed rows
@@ -156,6 +166,13 @@ evidence to justify promoting.
 - Prefill is never measured, including chunks below the split-prefill
   threshold. On the GPU side the combine only runs for a decode batch; on the
   kt side anything longer than the decode buffer is refused.
+- When the deferred-finalize seam turns out to be absent, the stage is torn
+  down, not left armed. Nothing would ever be staged, but the combine would
+  still pay a reduce-scatter and all-gather of zeros before every decode
+  forward, and kt's norms would accumulate onto expert 0.
+- Expert deferral is refused alongside swapping: a second kt forward per layer
+  zero-fills the norms buffer, and the selector defers the lowest-weight picks,
+  so what survived would be each expert's least important activations.
 - Under `--kt-routing-full-override` nothing scores a promotion candidate,
   because no CPU expert ever runs. Placement holds its startup cut, and that
   is said out loud at arming rather than discovered.
