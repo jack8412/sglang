@@ -2064,7 +2064,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
                 if self._counters_enabled:
                     self._update_margin_counters(
-                        topk_output.topk_ids, _insist_slots, _override_slots
+                        topk_output.topk_ids,
+                        new_topk_ids,
+                        _insist_slots,
+                        _override_slots,
                     )
                 # Reachable at a server margin of 0.0 only via a per-request
                 # budget (the scalar-0.0 batch took the exact-routing path
@@ -2424,7 +2427,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         which is the same quantity ``_update_margin_counters`` produces as
         insist + override -- margin only partitions it. Everything lands in the
         insist counter because nothing was substituted; ``snapshot_counters``
-        sums the pair, so the policy sees an identical figure either way.
+        sums the pair, so the policy sees an identical figure either way. The
+        served-vs-original distinction that function makes for resident hits
+        does not arise here either: with no substitution the two ids coincide.
 
         Counts on the ids the ROUTER chose. Under split prefill that is also
         the id actually computed (all 896 are), so there is no pre/post
@@ -2446,7 +2451,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             0, safe_ids, (routed & resident).to(torch.int32)
         )
 
-    def _update_margin_counters(self, topk_ids, insist_slots, override_slots) -> None:
+    def _update_margin_counters(
+        self, topk_ids, served_ids, insist_slots, override_slots
+    ) -> None:
         """Fold one forward into the per-expert demand counters.
 
         The swap driver cannot work without these -- promotion reads demand for
@@ -2463,12 +2470,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         from sglang.kernels.ops.kimi_k3 import kt_margin_counters as ktmc
 
-        if ktmc.covered(topk_ids, insist_slots, override_slots):
+        if ktmc.covered(topk_ids, served_ids, insist_slots, override_slots):
             ktmc.kt_margin_counters(
                 self._margin_insist_count,
                 self._margin_override_count,
                 self._resident_hit_count,
                 topk_ids,
+                served_ids,
                 insist_slots,
                 override_slots,
             )
@@ -2485,21 +2493,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logger.warning(
                 "[kt-margin] fused demand counters unavailable (%s); using the "
                 "torch fallback. Numbers are identical; decode is ~10%% slower.",
-                ktmc.why_not_covered(topk_ids, insist_slots, override_slots),
+                ktmc.why_not_covered(
+                    topk_ids, served_ids, insist_slots, override_slots
+                ),
             )
         # Fallback for shapes/dtypes the kernel does not claim. Kept because
         # the counters feed a serving decision: silently not counting would
         # starve the swap policy rather than fail.
         _orig_safe_ids = topk_ids.clamp_min(0).reshape(-1).to(torch.int64)
+        # DEMAND on the ORIGINAL id: what the router asked for.
         self._margin_insist_count.scatter_add_(
             0, _orig_safe_ids, insist_slots.reshape(-1).to(torch.int32)
         )
         self._margin_override_count.scatter_add_(
             0, _orig_safe_ids, override_slots.reshape(-1).to(torch.int32)
         )
-        _resident_slots = (topk_ids >= 0) & ~(insist_slots | override_slots)
+        # RESIDENT HITS on the SERVED id, and `~insist` rather than
+        # `~(insist | override)`: an overridden slot is served by a resident
+        # expert too, just not the one the router named. Wherever nothing was
+        # overridden served_ids equals topk_ids, so this reproduces the old
+        # numbers exactly.
+        _served_safe_ids = served_ids.clamp_min(0).reshape(-1).to(torch.int64)
+        _resident_slots = (topk_ids >= 0) & ~insist_slots
         self._resident_hit_count.scatter_add_(
-            0, _orig_safe_ids, _resident_slots.reshape(-1).to(torch.int32)
+            0, _served_safe_ids, _resident_slots.reshape(-1).to(torch.int32)
         )
 
     def _kt_doorbell_output(self, staging_buffer) -> torch.Tensor:

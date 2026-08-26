@@ -8,14 +8,21 @@ performing the swap (weight movement, mask/index updates) lives in
 ``kt_ep_wrapper``.
 
 The two inputs come from the margin-routing counters and are on the same
-scale, both counted per routed slot on the ORIGINAL (pre-override) expert id:
+scale, one slot each, but they are attributed to DIFFERENT experts on an
+overridden slot -- which is the point:
 
-* **demand** (``insist + override``) — the router chose a NON-resident expert.
-  Whether we then paid the CPU (insist) or substituted a resident one
-  (override) is a serving decision; either way the traffic wanted that expert,
-  so both count toward promoting it.
-* **resident hits** — the router chose an expert that was already GPU-resident
-  and it was served there. Its inverse ranks demotion victims.
+* **demand** (``insist + override``) — counted on the ORIGINAL id: the router
+  chose a NON-resident expert. Whether we then paid the CPU (insist) or
+  substituted a resident one (override) is a serving decision; either way the
+  traffic wanted that expert, so both count toward promoting it.
+* **resident hits** — counted on the SERVED id: the expert that actually
+  computed the slot, which is the substitute wherever one was installed. Its
+  inverse ranks demotion victims, so it has to mean "did work", not "was
+  named". Attributing it to the original id credited nobody for overridden
+  traffic, and a resident expert doing well as a stand-in therefore looked
+  idle -- margin routing nominating its own best stand-ins for demotion,
+  harder the higher the margin. Wherever nothing is overridden the two ids
+  coincide and the numbers are unchanged.
 
 Counters are cumulative since launch, so the policy differences them per
 evaluation and folds the deltas into an EMA: swaps should track *recent*
