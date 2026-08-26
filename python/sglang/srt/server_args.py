@@ -6982,6 +6982,19 @@ class ServerArgs:
                 "does it is armed by split prefill's boot hook."
             )
 
+        if self.kt_max_deferred_experts_per_token and self.kt_expert_swap_transitions > 0:
+            raise ValueError(
+                "--kt-max-deferred-experts-per-token is incompatible with "
+                "--kt-expert-swap-transitions. Deferral runs a SECOND kt "
+                "forward per layer per step, and each one zero-fills the REAP "
+                "norms buffer before writing its own slots -- so the deferred "
+                "pass erases the immediate pass's measurements. The selector "
+                "defers the LOWEST-weight picks, so what survives is each "
+                "expert's least important activations: S_k is biased down for "
+                "exactly the experts placement exists to find. Set one of them "
+                "to 0."
+            )
+
         if self.kt_transport == "hostnode" and self.kt_max_deferred_experts_per_token:
             raise ValueError(
                 "--kt-transport hostnode packs activations, ids and weights "

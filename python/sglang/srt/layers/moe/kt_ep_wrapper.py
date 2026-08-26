@@ -519,6 +519,7 @@ class _ReapStage:
         # Pinned so kt's writes reach the device as a DMA. Not available
         # without CUDA, which is only the case under test.
         self.kt_norms = kt_norms.pin_memory() if torch.cuda.is_available() else kt_norms
+        self._oversize_warned = False
         self._row_offset = (
             torch.arange(num_layers, device=device, dtype=torch.int64) * num_experts
         ).view(1, num_layers, 1)
@@ -549,8 +550,22 @@ class _ReapStage:
         replay ran at. Padding rows carry the previous replay's ids, and
         counting them would corrupt the very denominator REAP exists for.
         """
-        tokens = min(int(real_tokens), self.max_tokens)
+        tokens = int(real_tokens)
         if tokens <= 0:
+            return
+        if tokens > self.max_tokens:
+            # stage() refused this batch, so the buffers still hold whichever
+            # step last fit. Clamping would re-fold that step -- inflating its
+            # weight in the decayed mean once per oversized step -- and would
+            # blank out exactly the overloaded traffic that most needs
+            # re-placement. Refuse it and say so once.
+            if not self._oversize_warned:
+                self._oversize_warned = True
+                logger.warning(
+                    "[kt-reap] decode batch of %d exceeds the %d-token stage; "
+                    "those steps are not measured",
+                    tokens, self.max_tokens,
+                )
             return
         flat = self.vec[:tokens].reshape(-1, self.hidden)
         world = get_tp_group().world_size
@@ -584,7 +599,13 @@ class _ReapStage:
         """
         if get_tp_group().rank_in_group != 0:
             return
-        kt = self.kt_norms[:, :tokens].to(self.num.device, non_blocking=True)
+        # The WHOLE buffer, contiguous. Slicing the middle dim first makes the
+        # copy non-contiguous, which turns it into a pageable copy through a
+        # host temporary taken on this thread right now -- non_blocking becomes
+        # inert and the caller's wait_stream orders nothing, so it reads bytes
+        # kt's poller thread may still be writing. Contiguous and pinned, it is
+        # a real stream-ordered DMA fenced behind the forward.
+        kt = self.kt_norms.to(self.num.device, non_blocking=True)[:, :tokens]
         # [L, T, k] as kt writes it, [T, L, k] as everything else is laid out.
         kt = kt.permute(1, 0, 2)
         # A slot the GPU served is not kt's, and a slot kt skipped reads 0.
@@ -677,6 +698,19 @@ def reap_stage() -> Optional["_ReapStage"]:
     return get_buffer("kt_reap_stage", dict).get("stage")
 
 
+def _disarm_reap_stage() -> None:
+    """Stop measuring, for good. Every rank reaches this on the same forward."""
+    get_buffer("kt_reap_stage", dict)["stage"] = None
+    _KT_REAP_PENDING["tokens"] = 0
+
+
+# Ceiling on the staging buffers. Decode batches above what this affords are
+# not measured; REAP is a mean, so a bounded sample of batch sizes costs
+# accuracy nothing, whereas taking gigabytes out of the KV pool to size the
+# batch it was sized for costs throughput directly.
+_REAP_STAGE_BUDGET_BYTES = 1 << 30
+
+
 def _init_reap_stage(server_args: "ServerArgs", hf_config, num_layers: int) -> None:
     """Allocate the REAP stage once, at init, before any graph capture.
 
@@ -730,6 +764,11 @@ def _init_reap_stage(server_args: "ServerArgs", hf_config, num_layers: int) -> N
     if server_args.max_running_requests:
         cap = min(cap, server_args.max_running_requests)
     max_tokens = cap * width
+    # max_running_requests is None unless someone passed it, so the clamp above
+    # is usually inert and the capture list alone would take gigabytes here --
+    # out of the KV pool, and before that pool is sized. Cap the bytes directly.
+    per_token = num_layers * top_k * hidden * 2
+    max_tokens = min(max_tokens, max(1, _REAP_STAGE_BUDGET_BYTES // per_token))
 
     world = get_tp_group().world_size
     if (num_layers * top_k) % world:
@@ -2253,16 +2292,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and num_tokens >= self._split_prefill_threshold
             and not torch.cuda.is_current_stream_capturing()
         ):
-            # Count demand before returning. Split prefill computes every
-            # expert on GPU, so residency does not change this forward's
-            # result -- but the router's behaviour over the PROMPT is the best
-            # available forecast of what the decode about to start will ask
-            # for, since the two share a domain. Observing it here is what
-            # lets a swap at the prefill->decode boundary cut a set for the
-            # request's own domain. Free of consequence as well as cheap:
-            # nothing here can perturb what it measures. See SPEC-SWAP-DEMAND.
-            if self._counters_enabled:
-                self._update_demand_counters(dispatch_output.topk_output.topk_ids)
+            # Nothing to measure here. Split prefill computes every expert on
+            # GPU, so a prefill says nothing about which experts decode will
+            # need resident -- the forecast this used to take over the prompt
+            # belonged to the count-based policy that REAP replaced.
             return self._split_prefill_apply(layer, dispatch_output, num_tokens)
 
         # Margin routing (SPEC-MARGIN-ROUTING P1): rewrite below-margin
@@ -2295,23 +2328,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # rewrite provably returns the router's own ids and weights, and the
         # decision below already declines to apply them -- but the kernel still
         # RAN, at every one of the 92 layers of every decode step, for a result
-        # thrown away. The counters it would have produced reduce to demand and
-        # hits, which _update_demand_counters computes directly from the routed
-        # ids and the residency mask (SPEC-SWAP-DEMAND). So exact routing keeps
-        # its full swap signal and skips the argsort/cumsum/scatter.
+        # thrown away. Placement is unaffected either way: it is scored from
+        # expert output, not from routing counts.
         #
         # Full override sits at the default budget too, and must NOT take this
         # path: its whole effect is the rewrite.
         _exact_routing = (
             not self._margin and not _per_req_margin and not self._full_override
         )
-
-        if _exact_routing and self._counters_enabled:
-            self._update_demand_counters(dispatch_output.topk_output.topk_ids)
-            # Swap windows moved to the scheduler (SPEC-SWAP-DEMAND Phase 3):
-            # mid-prompt re-cuts stall the throughput-critical path, and this
-            # call site never ran under --kt-expert-split-prefill anyway --
-            # split prefill returns before it and decode replays a graph.
 
         if not _exact_routing:
             from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -2584,7 +2608,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         still separable from the mixture it lands in.
         """
         stage = reap_stage()
-        if stage is None:
+        # A forward the stage will refuse must not take the seam: finalizing it
+        # here allocates a fresh output, which costs the model its zero-copy
+        # write into the published latent slice and an extra [T, hidden] copy
+        # per layer. Nothing would be measured in exchange.
+        if stage is None or topk_output.topk_ids.shape[0] > stage.max_tokens:
             return self.gpu_method.apply(layer, masked_dispatch_output).hidden_states
 
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -2607,10 +2635,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 type(self)._reap_seam_warned = True
                 logger.warning(
                     "[kt-reap] %s finalizes internally, so per-expert outputs "
-                    "are not observable and placement cannot adapt; expert "
-                    "swapping will hold its startup cut",
+                    "are not observable; scoring off and expert placement will "
+                    "hold its startup cut",
                     type(self.gpu_method).__name__,
                 )
+            # Disarm rather than leave it armed. Nothing would ever be staged,
+            # but combine() would still pay a reduce-scatter and all-gather of
+            # zeros ahead of every decode forward for the life of the process,
+            # and kt's norms would keep landing on expert 0 because no ids were
+            # ever staged. Deterministic and identical on every rank, so they
+            # disarm together and no collective is left unmatched.
+            _disarm_reap_stage()
             return deferred
 
         stage.stage(
@@ -2774,36 +2809,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             have,
             want,
             _default,
-        )
-
-    def _update_demand_counters(self, topk_ids) -> None:
-        """Fold one forward into the demand counters, with no margin involved.
-
-        For the paths that never produce insist/override slots: split prefill
-        (which computes every expert on GPU and returns before the margin
-        block) and margin-unset serving. Demand is defined directly:
-
-            demand = routed & ~gpu_experts_mask[topk_ids]
-
-        which is the same quantity ``_update_margin_counters`` produces as
-        insist + override -- margin only partitions it. Everything lands in the
-        insist counter because nothing was substituted.
-
-        Counts on the ids the ROUTER chose. Under split prefill that is also
-        the id actually computed (all 896 are), so there is no pre/post
-        distinction to get wrong here.
-        """
-        # Both guards are load-bearing and independent: the swap driver checks
-        # gpu_experts_mask_cuda and the counter separately (:6599), so the mask
-        # can be absent while the counters exist. Indexing a None mask here
-        # would crash the split-prefill path.
-        if self._margin_insist_count is None or self.gpu_experts_mask_cuda is None:
-            return
-        safe_ids = topk_ids.clamp_min(0).reshape(-1).to(torch.int64)
-        routed = (topk_ids >= 0).reshape(-1)
-        resident = self.gpu_experts_mask_cuda[safe_ids]
-        self._margin_insist_count.scatter_add_(
-            0, safe_ids, (routed & ~resident).to(torch.int32)
         )
 
     def _update_margin_counters(
@@ -3152,7 +3157,11 @@ def maybe_run_expert_swap_window(
 
     entries = []
     for method in _KT_EP_METHODS:
-        if method.gpu_experts_mask_cuda is None or method._margin_insist_count is None:
+        # Instrumented means "has a residency table to swap and a policy to
+        # rank it", not "has margin counters": those are margin telemetry and
+        # nothing here reads them any more. Gating on them would silently stop
+        # swapping the moment they are narrowed to the configs that log them.
+        if method.gpu_experts_mask_cuda is None:
             continue
         if method._swap_policy is None:
             method._swap_policy = ExpertSwapPolicy(
