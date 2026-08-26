@@ -239,5 +239,27 @@ class TestWindowAccounting(CustomTestCase):
         self.assertLess(num[0, 3].item(), 10.0)
 
 
+class TestArmingReadsRealServerArgs(CustomTestCase):
+    """Critical-path bookkeeping: every ServerArgs field the arming path reads
+    must exist. Red if a field is renamed upstream or misspelled here -- which
+    is not hypothetical: `expert_swap_transitions` was written for
+    `kt_expert_swap_transitions` and would have raised AttributeError at
+    startup on every KT server, on a path no CPU test reaches."""
+
+    def test_every_field_the_wrapper_reads_exists(self):
+        import re
+
+        from sglang.srt.server_args import ServerArgs
+
+        src = open(
+            "python/sglang/srt/layers/moe/kt_ep_wrapper.py", encoding="utf-8"
+        ).read()
+        names = sorted(set(re.findall(r"\bserver_args\.([a-z_][a-z0-9_]*)", src)))
+        self.assertTrue(names, "no server_args reads found; the regex rotted")
+        known = set(ServerArgs.__annotations__) | set(dir(ServerArgs))
+        missing = [n for n in names if n not in known]
+        self.assertEqual(missing, [], f"ServerArgs has no {missing}")
+
+
 if __name__ == "__main__":
     unittest.main()
