@@ -365,6 +365,10 @@ class TestTransportConfigRails(CustomTestCase):
         self.assertIn("deferred", str(cm.exception))
 
     def test_non_mxfp4_is_refused(self):
+        # No longer a doorbell-specific rail: cold-only CPU residency is the
+        # only expert-allocation path and it is MXFP4-only, so this is refused
+        # for every transport. Kept here because the doorbell recipe is what
+        # first needed it.
         with self.assertRaises(ValueError) as cm:
             self._args(kt_transport="doorbell", kt_method="AMXINT4")
         self.assertIn("MXFP4", str(cm.exception))

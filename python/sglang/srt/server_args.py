@@ -2937,10 +2937,10 @@ class ServerArgs:
         NS("exec.moe"),
     ] = None
     kt_method: A[
-        str,
-        "[ktransformers parameter] Quantization formats for CPU execution.",
+        Literal["MXFP4"],
+        "[ktransformers parameter] Quantization format for CPU expert execution. MXFP4 is the only supported value: cold-only CPU residency is the only expert-allocation path this build has, and it is implemented for MXFP4 alone -- the other formats' load paths fill every expert's buffer unconditionally and would dereference the ones that are no longer allocated. The default used to be AMXINT4, from when full kt residency was still a configuration.",
         NS("exec.moe"),
-    ] = "AMXINT4"
+    ] = "MXFP4"
     kt_cpuinfer: A[
         Optional[int],
         "[ktransformers parameter] The number of CPUInfer threads.",

@@ -3020,13 +3020,6 @@ def maybe_run_expert_swap_window(
         "layer": None,
         "layer_idx": None,
         "items": [],
-        # True when the DMA wrote the promoted rows STRAIGHT INTO the batch
-        # buffers, so _flush_moves has nothing to gather. False when they are
-        # separate tensors that still have to be copied in. It used to also
-        # stand in for "checkpoint layout, needs the swizzle"; that second
-        # meaning is gone because every remaining source is checkpoint layout
-        # and the swizzle is unconditional.
-        "in_batch": False,
     }
 
     def _flush_moves():
@@ -3053,12 +3046,9 @@ def maybe_run_expert_swap_window(
         pend = _pending
         items = pend["items"]
         if not items:
-            pend["in_batch"] = False
             return
         layer, layer_idx = pend["layer"], pend["layer_idx"]
         pend["items"] = []
-        in_batch = pend["in_batch"]
-        pend["in_batch"] = False
         # Past this point the recorded rows hold PROMOTED experts. Demotions
         # never read them back: _begin_layer took every demoted row for this
         # layer before its first move ran.
@@ -3103,35 +3093,12 @@ def maybe_run_expert_swap_window(
         # shape. Rows beyond len(items) hold stale bytes and are simply not
         # scattered -- swizzling a few unused rows costs microseconds against
         # milliseconds per allocator miss.
-        _bat = _KT_SWAP_STATE.get("batch_bufs")
-        if in_batch and _bat is not None:
-            # The DMA already wrote row i of every buffer; nothing to gather.
-            promoted = _bat
-        else:
-            # Store / export path: the bytes are host or store tensors, so they
-            # still have to be brought together. Use the same run-scoped pool at
-            # the same constant width so the shape the swizzle sees never
-            # changes, and only the live prefix is scattered later.
-            src0 = items[0]["promoted"][_MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]]
-            _cap = max(len(items), 1 if _bat is None else _bat[
-                _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]
-            ].shape[0])
-            if _bat is None or _bat[
-                _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]
-            ].shape[0] != _cap:
-                _bat = {
-                    n: torch.empty(
-                        (_cap,) + tuple(items[0]["promoted"][n].shape),
-                        dtype=items[0]["promoted"][n].dtype,
-                        device=dev,
-                    )
-                    for n in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES
-                }
-                _KT_SWAP_STATE["batch_bufs"] = _bat
-            for name in _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES:
-                for i, it in enumerate(items):
-                    _bat[name][i].copy_(it["promoted"][name], non_blocking=True)
-            promoted = _bat
+        # The DMA already wrote row i of every buffer, so there is nothing to
+        # gather: the staging path allocates batch_bufs before any flush can
+        # run, and it is the only producer of `items`. The branch that used to
+        # sit here brought host or store tensors together for the deleted
+        # store/export transports.
+        promoted = _KT_SWAP_STATE["batch_bufs"]
         # Every remaining source hands back CHECKPOINT layout -- kt's arena is
         # checkpoint layout by construction -- so the resident row's trtllm
         # layout is produced HERE, on the GPU, in the same four-gather form
@@ -3284,9 +3251,6 @@ def maybe_run_expert_swap_window(
                 stream=torch.cuda.current_stream().cuda_stream,
             )
             _timing["stage_s"] += time.perf_counter() - _t
-            # The DMA landed directly in batch row _k, so _flush_moves must not
-            # gather these again.
-            _pending["in_batch"] = True
             _pending["items"].append(
                 {
                     "dst_row": dst_row,
@@ -3865,14 +3829,6 @@ def finalize_split_prefill(server_args) -> bool:
     # landing buffers from them: the arena hands back raw bytes and
     # _swizzle_promoted_rows wants exactly these shapes.
     _KT_SPLIT_PREFILL_STATE["raw_shapes"] = raw_shapes
-    _KT_SPLIT_PREFILL_STATE["swizzle_inverse"] = None
-    # Unconditional: the arena hands back checkpoint layout, always, so the
-    # raw scale shapes always exist. This used to be gated on a `dynamic` flag
-    # that the deleted store/export branches set.
-    _KT_SPLIT_PREFILL_STATE["raw_scale_shapes"] = (
-        tuple(raw_shapes["w13_weight_scale"][0]),
-        tuple(raw_shapes["w2_weight_scale"][0]),
-    )
     for method, _ in _KT_SPLIT_PREFILL_LAYERS:
         method._cold_pipeline = pipeline
         method._split_prefill_ready = True

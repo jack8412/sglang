@@ -69,20 +69,17 @@ class ColdExpertPipeline:
         self._swizzle_plan = swizzle_plan
 
         # WHICH buffer the copy stream writes decides how many of each is
-        # needed, and the two modes differ:
+        # needed: the copy stream fills raw[slot] and the compute stream
+        # gathers raw -> resident. Resident is written AND read by the compute
+        # stream, in order, so ONE is enough; raw needs NUM_SLOTS, because
+        # layer L's raw is being gathered while L+1's is still landing. The
+        # copy-stream-written buffer is what _slot() indexes. 2 raw + 1
+        # resident costs 1.66 GiB/rank where 2 + 2 cost 2.22.
         #
-        #   swizzling  copy stream -> raw[slot]; the compute stream gathers
-        #              raw -> resident. Resident is written AND read by the
-        #              compute stream, in order, so ONE is enough. Raw needs
-        #              NUM_SLOTS: layer L's raw is being gathered while L+1's
-        #              is still landing.
-        #   plain      the store already holds resident layout, so the copy
-        #              stream writes resident directly and it needs NUM_SLOTS.
-        #
-        # Either way the copy-stream-written buffer is NUM_SLOTS deep, which is
-        # what _slot() indexes. 2 raw + 1 resident costs 1.66 GiB/rank where
-        # 2 + 2 cost 2.22.
-        self._swizzling = swizzle_plan is not None and raw_shapes is not None
+        # There is no second mode. A caller with no swizzle plan used to write
+        # resident directly (the pre-swizzled store); finalize_split_prefill
+        # now raises rather than building this without one, since kt's arena is
+        # checkpoint layout and nothing else can produce a resident row from it.
         self._buffers: List[Dict[str, torch.Tensor]] = [
             {
                 n: torch.empty(
@@ -90,21 +87,16 @@ class ColdExpertPipeline:
                 )
                 for n, (shape, dtype) in per_expert_shapes.items()
             }
-            for _ in range(1 if self._swizzling else self.NUM_SLOTS)
         ]
-        self._raw_buffers: Optional[List[Dict[str, torch.Tensor]]] = (
-            [
-                {
-                    n: torch.empty(
-                        (source.num_cold,) + tuple(shape), dtype=dtype, device=device
-                    )
-                    for n, (shape, dtype) in raw_shapes.items()
-                }
-                for _ in range(self.NUM_SLOTS)
-            ]
-            if self._swizzling
-            else None
-        )
+        self._raw_buffers: List[Dict[str, torch.Tensor]] = [
+            {
+                n: torch.empty(
+                    (source.num_cold,) + tuple(shape), dtype=dtype, device=device
+                )
+                for n, (shape, dtype) in raw_shapes.items()
+            }
+            for _ in range(self.NUM_SLOTS)
+        ]
 
         # Which layer currently occupies each slot (None = never filled).
         self._slot_layer: List[Optional[int]] = [None] * self.NUM_SLOTS
@@ -122,13 +114,13 @@ class ColdExpertPipeline:
                 t.numel() * t.element_size() for buf in bufs for t in buf.values()
             ) / (1024**3)
 
-        raw_gib = _gib(self._raw_buffers) if self._raw_buffers is not None else 0.0
+        raw_gib = _gib(self._raw_buffers)
         logger.info(
             "[cold-pipeline] %d cold experts: %d resident + %d raw = %.2f GiB "
             "device (%.2f resident + %.2f raw)",
             source.num_cold,
             len(self._buffers),
-            0 if self._raw_buffers is None else len(self._raw_buffers),
+            len(self._raw_buffers),
             _gib(self._buffers) + raw_gib,
             _gib(self._buffers),
             raw_gib,
@@ -151,19 +143,12 @@ class ColdExpertPipeline:
         with torch.cuda.stream(self._copy_stream):
             # WAR: the slot's previous occupant must be done being read.
             self._copy_stream.wait_event(self._consume_events[slot])
-            if self._raw_buffers is None:
-                dst = self._buffers[slot]
-                for name in WEIGHT_NAMES:
-                    dst[name].copy_(
-                        self._source.layer_rows(layer_idx, name), non_blocking=True
-                    )
-            else:
-                # TRANSFER ONLY. The swizzle is a gather kernel and this stream
-                # is the floor, so running it here puts compute on the critical
-                # path; it moves to wait_prefetch on the compute stream, which
-                # idles most of every layer. The prefetch event therefore now
-                # means "the raw block has landed", not "resident is ready".
-                self._issue_raw(slot, layer_idx)
+            # TRANSFER ONLY. The swizzle is a gather kernel and this stream is
+            # the floor, so running it here puts compute on the critical path;
+            # it moves to wait_prefetch on the compute stream, which idles most
+            # of every layer. The prefetch event therefore means "the raw block
+            # has landed", not "resident is ready".
+            self._issue_raw(slot, layer_idx)
             self._prefetch_events[slot].record(self._copy_stream)
         # After the copies are enqueued: an arena source uses this to recycle
         # its staging slot once the DMA completes; the store's is a no-op.
@@ -222,8 +207,6 @@ class ColdExpertPipeline:
             )
         cur = torch.cuda.current_stream(self._device)
         cur.wait_event(self._prefetch_events[slot])
-        if self._raw_buffers is None:
-            return self._buffers[slot]
         # One resident buffer is enough because this stream both writes and
         # reads it: the previous layer's MoE was enqueued before this call, so
         # it has already read the buffer by the time this gather overwrites it.
@@ -235,14 +218,13 @@ class ColdExpertPipeline:
         return dst
 
     def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
-        """Release this layer's slot and start the layer two ahead."""
-        slot = self._slot(layer_idx)
-        cur = torch.cuda.current_stream(self._device)
-        if self._raw_buffers is None:
-            # Plain store: the copy stream writes the resident buffer itself,
-            # so the slot is free only once the MoE has read it. When
-            # swizzling, wait_prefetch already released the raw slot.
-            self._consume_events[slot].record(cur)
+        """Start the layer two ahead. This layer's slot is already released.
+
+        No consume event here: wait_prefetch records it as soon as the gather
+        has read the raw slot, which is earlier than the MoE finishes and is
+        what lets the copy stream run ahead. The plain-store mode that had to
+        wait until here is gone.
+        """
         nxt = self._next_layer(layer_idx)
         if nxt is not None:
             nxt2 = self._next_layer(nxt)
