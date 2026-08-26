@@ -34,9 +34,14 @@ by GPU rank, and it partitions the two projections on different axes. With
     down scale     [hidden, per_numa/group]    COLUMN-blocked
 
 Concatenating the partitions along those axes rebuilds the full expert, and
-slicing that for the GPU rank reproduces ``build_expert_bytes`` exactly. The
-implementation slices each partition's block FIRST and concatenates only the
-touched pieces -- identical bytes (slice and concat commute along one axis),
+slicing that for the GPU rank gives the shard the swizzle consumes: w13 is
+``[gate rows; up rows]`` for this rank's slice of the intermediate axis, and
+w2 is the matching COLUMN slice, halved for the two-values-per-byte packing
+and divided by the group size for its scales. This module is now the only
+definition of that layout -- ``build_expert_bytes``, which used to state it
+independently for a checkpoint-sourced promotion path, is gone with that
+path. The implementation slices each partition's block FIRST and concatenates
+only the touched pieces -- identical bytes (slice and concat commute along one axis),
 but it copies the rank's 2.19 MB instead of materializing the full 17.5 MB
 expert per call, which matters at ~370 promotions per swap window.
 
@@ -183,8 +188,9 @@ class KtRamExpertSource:
     def raw_shard(self, logical_id: int) -> Dict[str, torch.Tensor]:
         """This rank's TP shard of one expert, in checkpoint layout.
 
-        Returns ``{"w13", "w13_scale", "w2", "w2_scale"}`` matching what
-        ``build_expert_bytes`` produces, so the GPU-side swizzle is unchanged.
+        Returns ``{"w13", "w13_scale", "w2", "w2_scale"}`` in the layout the
+        GPU-side swizzle consumes -- see this module's docstring for the axis
+        arithmetic, which lives there because nothing else states it now.
         """
         slot = int(logical_id)
         if not 0 <= slot < self.experts:

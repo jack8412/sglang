@@ -3991,17 +3991,26 @@ def _swizzle_promoted_rows(promoted):
 def _build_dynamic_swizzle_plan(anchor, device):
     """Raw per-expert shapes and the per-layer swizzle maps, from one sample.
 
-    Both are shape-derived, so a single expert read settles them for every
-    layer. Returns ``(raw_shapes, plan)`` in ColdExpertStore's WEIGHT_NAMES
-    order, or ``(None, None)`` if anything is missing -- in which case the
-    caller falls back to the pre-swizzled store rather than guessing.
+    Both are shape-derived, so a single expert settles them for every layer.
+    Returns ``(raw_shapes, plan)`` in ColdExpertStore's WEIGHT_NAMES order, or
+    ``(None, None)`` if anything is missing -- in which case the caller
+    refuses to arm rather than guessing.
+
+    THE SAMPLE IS A RULER, NOT DATA. ``trtllm_permute_indices`` builds a row
+    permutation, and the builder underneath it caches on ``tuple(x.shape)``
+    plus the tile size and device -- it never reads a byte of the tensor. So
+    the sample only has to have the right SHAPE.
+
+    It used to be read off the checkpoint, through a whole expert-mover module,
+    for exactly that. kt's arena already holds every cold expert in the layout
+    the swizzle consumes, and ``raw_shard`` documents itself as producing what
+    the old reader produced -- so the ruler comes out of memory now. The write
+    source is registered per layer during load and the rank writer is built
+    just above this call, so it is available by construction.
     """
-    from sglang.srt.layers.moe.kt_mxfp4_export import WEIGHT_NAMES
-    from sglang.srt.layers.moe.kt_expert_mover import (
-        CheckpointExpertReader,
-        build_expert_bytes,
-    )
+    from sglang.srt.layers.moe.kt_arena_share import arena_write_source_for
     from sglang.srt.layers.moe.kt_mxfp4_export import (
+        WEIGHT_NAMES,
         trtllm_batched_swizzle,
         trtllm_permute_indices,
     )
@@ -4010,59 +4019,46 @@ def _build_dynamic_swizzle_plan(anchor, device):
         cold = torch.where(~anchor.gpu_experts_mask)[0].tolist()
         if not cold:
             return None, None
-        reader = CheckpointExpertReader(anchor.kt_config.weight_path)
-        try:
-            li = anchor.kt_config.layer_idx
-            sample = build_expert_bytes(
-                reader,
-                f"language_model.model.layers.{li}.block_sparse_moe.experts",
-                cold[0],
-                tp_rank=get_parallel().tp_rank,
-                tp_size=get_parallel().tp_size,
+        li = anchor.kt_config.layer_idx
+        source = arena_write_source_for(li)
+        if source is None:
+            logger.error(
+                "[split-prefill] no arena source for layer %d; cannot derive "
+                "the swizzle plan",
+                li,
             )
-        finally:
-            reader.close()
-        on_dev = type(sample)(
-            w13=sample.w13.to(device),
-            w13_scale_e8m0=sample.w13_scale_e8m0.to(device),
-            w2=sample.w2.to(device),
-            w2_scale_e8m0=sample.w2_scale_e8m0.to(device),
-        )
-        raw_shapes = {
-            n: (tuple(t.shape), t.dtype)
-            for n, t in zip(
-                WEIGHT_NAMES,
-                (
-                    on_dev.w13,
-                    on_dev.w13_scale_e8m0,
-                    on_dev.w2,
-                    on_dev.w2_scale_e8m0,
-                ),
-            )
-        }
+            return None, None
+        # cold[0] is non-resident by construction, so it owns a BufferB and
+        # raw_shard cannot raise the absent-slot KeyError here.
+        shard = source.raw_shard(cold[0])
+        on_dev = {n: shard[k].to(device) for n, k in zip(
+            WEIGHT_NAMES, ("w13", "w13_scale", "w2", "w2_scale")
+        )}
+        raw_shapes = {n: (tuple(t.shape), t.dtype) for n, t in on_dev.items()}
+        w13, w13_scale, w2, w2_scale = (on_dev[n] for n in WEIGHT_NAMES)
         indices = trtllm_permute_indices(
-            w13_sample=on_dev.w13,
-            w13_scale_sample=on_dev.w13_scale_e8m0,
-            w2_sample=on_dev.w2,
-            w2_scale_sample=on_dev.w2_scale_e8m0,
+            w13_sample=w13,
+            w13_scale_sample=w13_scale,
+            w2_sample=w2,
+            w2_scale_sample=w2_scale,
             w13_gate_up_halves=True,
         )
         plan = trtllm_batched_swizzle(
             indices,
-            w13_scale_shape=tuple(on_dev.w13_scale_e8m0.shape),
-            w2_scale_shape=tuple(on_dev.w2_scale_e8m0.shape),
+            w13_scale_shape=tuple(w13_scale.shape),
+            w2_scale_shape=tuple(w2_scale.shape),
             device=device,
         )
         logger.info(
-            "[split-prefill] dynamic swizzle armed: raw w13 %s, w2 %s",
-            tuple(on_dev.w13.shape),
-            tuple(on_dev.w2.shape),
+            "[split-prefill] dynamic swizzle armed from kt arena: raw w13 %s, "
+            "w2 %s",
+            tuple(w13.shape),
+            tuple(w2.shape),
         )
         return raw_shapes, plan
     except Exception:
         logger.exception(
-            "[split-prefill] could not build the dynamic swizzle plan; using "
-            "the pre-swizzled cold store"
+            "[split-prefill] could not build the dynamic swizzle plan"
         )
         return None, None
 

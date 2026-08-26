@@ -102,7 +102,7 @@ def _full_expert(seed):
 
 
 def _rank_shard(full, rank):
-    """What unswizzle_trtllm_expert hands this rank: build_expert_bytes form."""
+    """What unswizzle_trtllm_expert hands this rank: kt-arena shard form."""
     lo, hi = rank * PER_GPU, (rank + 1) * PER_GPU
     return types.SimpleNamespace(
         w13=torch.cat([full["gate"][lo:hi], full["up"][lo:hi]], dim=0).contiguous(),
