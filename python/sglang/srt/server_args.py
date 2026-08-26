@@ -2998,11 +2998,6 @@ class ServerArgs:
         "Poller threads for --kt-transport doorbell (one per socket is the intent).",
         NS("exec.moe"),
     ] = 2
-    kt_conditional_cpu_branch: A[
-        bool,
-        "Skip a layer's CPU-expert branch device-side, via a CUDA conditional node, when no routed slot in the batch names a CPU-resident expert. Under margin routing a large share of layer-steps route entirely to GPU-resident experts; kt's inline-empty check already makes the poller cheap for those, but the GPU still pays the staging D2H, the round trip, the result H2D and the merge. Applies to captured decode graphs only -- an eager forward has no graph to splice a conditional into and runs the branch as before. Requires --kt-transport doorbell.",
-        NS("exec.moe"),
-    ] = False
     kt_expert_swap_transitions: A[
         int,
         "Run an expert-swap window every N prefill->decode transitions (0 disables). At the window the pipeline is briefly quiesced, high-demand offloaded experts are promoted into the GPU rows of low-use resident experts, and both sides of each pair are re-sourced from the checkpoint. Counted in transitions rather than seconds because every TP rank must reach the same decision -- a wall-clock gate lets ranks straddling the threshold disagree and diverge their expert membership. Does NOT require --kt-routing-margin: the demand it acts on is a function of the routed ids and the residency mask alone (SPEC-SWAP-DEMAND). Demand is sampled every 2N eager forwards so the EMA already carries history when the first window acts.",
@@ -7079,22 +7074,6 @@ class ServerArgs:
                 "codes, so a wheel with a different layout produces "
                 "right-shaped wrong weights rather than an error. Rebuild "
                 "kt-kernel from feat/mxfp4-kimi-k3."
-            )
-
-        if self.kt_conditional_cpu_branch:
-            raise ValueError(
-                "--kt-conditional-cpu-branch does not work and is refused. "
-                "CUDA stream memory operations cannot be captured into a "
-                "conditional node's body graph (driver 580.159.03 / CUDA "
-                "13.0): capture dies at capture_end with "
-                "cudaErrorInvalidValue. Bisected in runs/meta/c3_body_bisect.py "
-                "-- device ops, pinned D2H and H2D all capture inside an IF "
-                "body; cuStreamWriteValue64 and cuStreamWaitValue64 do not, "
-                "and those are exactly the doorbell's arm, ring and wait. "
-                "Re-enabling this needs the doorbell's memops replaced by "
-                "kernels (a write kernel plus a spin kernel), which trades an "
-                "SM for the elision and has to be measured. See "
-                "SPEC-DOORBELL-TRANSPORT.md."
             )
 
         # --kt-expert-swap-transitions no longer requires --kt-routing-margin.
