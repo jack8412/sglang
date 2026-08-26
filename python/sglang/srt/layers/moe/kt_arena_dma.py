@@ -15,8 +15,7 @@ arenas, and the three things built on it:
     RankShardWriter    the demotion orchestrator: capture, validate, write.
 
 The read and the write directions live together because they share the thing
-that costs -- the registration is ~6 s and ~418 MB of page tables per rank for
-~204 GiB, paid once at arm time, and neither direction is worth paying it
+that costs: registering the arena, paid once at arm time, and not worth paying
 twice. That is also why split prefill depends on this module with swapping
 switched off entirely: ``finalize_split_prefill`` builds its cold source from
 this writer's ``_dma``, ``_offsets`` and geometry.
@@ -27,12 +26,11 @@ THE PROBLEM. Under cold-only residency a demoted expert owns no CPU buffer,
 so the swap window has to give it one before it becomes routable. kt's
 ``swap_expert_slot`` takes SIX FULL-EXPERT pointers and slices them per NUMA
 partition internally, so one process has to materialize the whole expert --
-which is why every previous attempt either read 12.9 GB off the checkpoint
-(measured 28.8 s per window, 0.45 GB/s through 4,416 scattered mmap copies)
-or all-gathered the shards across TP and deadlocked (M9/M11/M12, see
-``runs/status/phase-swap-readback.status``).
+which is why every previous attempt either read the whole cold set off the
+checkpoint through scattered mmap copies, or all-gathered the shards across TP
+and deadlocked.
 
-THE OBSERVATION THIS MODULE IMPLEMENTS (user's, 2026-08-17): nobody needs
+THE OBSERVATION THIS MODULE IMPLEMENTS: nobody needs
 the whole expert in one place. The bytes are already in VRAM -- they are the
 resident rows about to be overwritten -- and each rank owns a DISJOINT slice
 of them. With kt's BufferB in a memfd arena every rank maps, each rank can
@@ -51,9 +49,7 @@ solved by the WRITE PATTERN: no one ever reassembles eight shards. Cost is
 WHY THE BYTES COME OUT IDENTICAL. kt's MXFP4 ``from_raw_mat`` is a plain
 row-major memcpy at the same offsets (``fp4-moe.hpp:103``) and scales are
 copied verbatim, so writing a slice at its offset is exactly what
-``fill_expert_buffers`` would have written there. The layout inverse
-(``unswizzle_trtllm_expert``) is proved bitwise by
-``runs/meta/verify_unswizzle.py``, and kt's own
+``fill_expert_buffers`` would have written there. The layout inverse (``unswizzle_trtllm_expert``) is proved bitwise, and kt's
 ``verify_install_against_loaded`` re-checks a filled expert against the bulk
 load per NUMA partition.
 
@@ -160,9 +156,8 @@ class ArenaDmaWriter:
     into a fresh pinned buffer (a real D2H DMA) and then memcpys that buffer
     into kt's arena on the CPU. The second hop is pure DRAM traffic -- a read
     and a write through the one controller, serialized against the DMA engine
-    doing the first hop -- and it MEASURED as the larger of the two: at 114
-    demotions per rank, capture 0.03 s against write 0.05-0.13 s; at 2,646,
-    capture 2.06 s against write 3.35 s. Same ratio across a 23x range.
+    doing the first hop -- and it is the larger of the two, at every scale
+    tried.
 
     Registering the arena lets the copy engine put the bytes where they belong
     itself, so the second hop stops existing rather than getting faster.
@@ -174,11 +169,10 @@ class ArenaDmaWriter:
     part of this campaign.
 
     REGISTRATION IS PER MAPPING, NOT PER EXPERT. kt makes one memfd per
-    (layer, partition) and a rank reads only its own partition, so this is 92
-    registrations of ~2275 MiB, once, at arm time -- against the 150,144
-    per-expert ranges that made the direct-DMA transport fail with rc=2. The
-    page count is what costs (~0.117 us/page, ~8 B of PTE per 4K page), so
-    expect ~6 s and ~418 MB of page tables per rank for ~204 GiB.
+    (layer, partition) and a rank reads only its own partition, so this is one
+    registration per layer, once, at arm time -- against the per-expert ranges
+    that made the direct-DMA transport fail outright. The page count is what
+    costs, so expect seconds and a few hundred MB of page tables per rank.
     """
 
     def __init__(self, *, arena_by_layer, geometry, copy_lib, register_fn):
@@ -236,9 +230,8 @@ class ArenaDmaWriter:
         )
         # down. A PITCHED COPY ONLY WHEN THE REGION IS ACTUALLY STRIDED: at one
         # rank per partition w2_pitch == w2_width, so the strips are contiguous
-        # and a 2D descriptor would buy nothing while costing 3,584 row
-        # transactions of 192 bytes each -- measured at 7.05 ms per expert,
-        # 5.19 s of a 5.61 s window, which is the entire promotion cost.
+        # and a 2D descriptor would buy nothing while costing one tiny row
+        # transaction per hidden row, which dominated the whole promotion.
         self._copy_down_h2d(
             dst=out["w2"].data_ptr(),
             src=base + row[_DOWN_B] + lr * g.w2_width,
@@ -318,12 +311,12 @@ class ArenaDmaColdSource:
     """Split prefill's cold stream, straight out of kt's arena.
 
     THIS IS WHAT DELETES THE PINNED STORE. The store exists to hand the
-    pipeline a layer's 272 cold experts as packed host rows; those same bytes
-    are already in kt's arena, which the demotion path has registered. So the
-    copy engine can read them directly and the ~51 GiB per rank (409 GiB across
-    TP8) never needs to exist.
+    pipeline a layer's cold experts as packed host rows; those same bytes are
+    already in kt's arena, which the demotion path has registered. So the copy
+    engine can read them directly and the store never needs to exist.
 
-    SIX COPIES PER LAYER, not 272. Two properties make that possible, and both
+    SIX COPIES PER LAYER, not one per expert. Two properties make that
+    possible, and both
     are checked at construction rather than assumed:
 
       * kt bump-allocates the resident experts in order, so each kind's buffers

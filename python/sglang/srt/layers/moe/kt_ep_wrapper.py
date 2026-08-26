@@ -904,9 +904,7 @@ def _weight_budget_override_slots(
     # and on a token whose entire routed set is CPU-resident the two are the
     # same quantity summed differently. They can disagree by an ulp, which
     # strands the largest slot as an insist and re-ranks every stand-in after
-    # it -- measured on ~20% of all-CPU rows. Without this the flag help, the
-    # KTConfig docstring and the `nobound` launch profile would all be
-    # almost-true.
+    # it.
     if isinstance(budget, torch.Tensor):
         # Per-token budgets. The ``> 0`` term carries the count-only contract
         # PER TOKEN: with a scalar budget the caller enforces "0.0 means route
@@ -1224,20 +1222,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # weights into one block on the MAIN stream before forking, then a
         # single D2H after it. The three separate copies it replaces were all
         # issued on the CPU stream AFTER the fork, so the dispatch reached the
-        # poller only once they landed -- measured as the staging completing
-        # after the GPU expert GEMM on 52% of layers, which exposes the whole
-        # CPU latency because no GPU work is left to hide behind.
+        # poller only once they landed, which exposes the whole CPU latency
+        # because no GPU work is left to hide behind.
         self._fused_enabled = kt_config.transport == "hostnode"
-        # CPU-branch elision: a CUDA conditional node skips the whole branch
-        # when nothing in the batch routes to a CPU-resident expert. The flag
-        # and the body stream are created in create_weights -- both addresses
-        # are baked into the captured graph, so neither may be allocated
-        # during capture or move afterwards.
         # Per-expert demand counters are maintained only where something reads
         # them: the swap policy, and the full-override falsification check
         # (which needs to see an insist survive a routing that claims none can).
-        # Profiling put them at ~5.2% of decode GPU time, so "always on" is a
-        # real price, not bookkeeping noise.
+        # They cost real decode time, so "always on" is not free.
         self._counters_enabled = bool(
             kt_config.expert_swap_transitions > 0 or kt_config.routing_full_override
         )
@@ -1264,16 +1255,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # weights; the kt-RAM expert source needs it to turn logical expert ids
         # into physical buffer slots.
         self._kt_physical_to_logical = None
-        # Break-even against the CPU-expert path, NOT the chunk size.  The
-        # split path's cost is dominated by a FIXED per-forward stream -- every
-        # cold expert lands once however many tokens the chunk holds -- so it
-        # wins above roughly (stream seconds x CPU tokens/s): measured 1.99 s
-        # and ~1,400 tok/s give ~2,800 tokens.
-        #
-        # Gating on chunked_prefill_size instead meant only an exactly-full
-        # chunk qualified, so the scheduler's remainder always fell back: a
-        # 65,498-token prompt became 32768 (split, 2.0 s) + 32730 (CPU, 23 s),
-        # 38 tokens short of the threshold and 6.4x slower overall.
+        # Break-even against the CPU-expert path, NOT the chunk size. The
+        # split path costs a fixed per-forward stream (every cold expert lands
+        # once however many tokens the chunk holds), so it wins above roughly
+        # stream_seconds x cpu_tokens_per_second. Gating on
+        # chunked_prefill_size instead would qualify only an exactly-full
+        # chunk, dropping every remainder onto the slow path.
         self._split_prefill_threshold = kt_config.split_prefill_min_tokens
         # Cap the MoE's per-call transients by running it in token tiles. Both
         # scale with tokens -- the gemm2 buffer the kernel sizes for all
@@ -1444,12 +1431,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # to the swap policy, so both sides of a swap decision come from the
         # same forward passes and need no extra instrumentation.
         #
-        # They are NOT free. Profiling decode (runs/meta/phaseP.sh) put this
-        # bookkeeping at ~5.2% of GPU time: three scatter_add_ and four
-        # bitwise kernels per layer per step, 11040 and 7360 launches over 40
-        # steps -- exactly 92 layers x 3 and 92 x 2. Baked into the captured
-        # graph, so they run every step forever whether or not anything reads
-        # them. Maintained only where something does.
+        # They are NOT free: three scatter_add_ and several bitwise kernels
+        # per layer per step, baked into the captured graph so they run every
+        # step forever whether or not anything reads them. Maintained only
+        # where something does.
         # Gated on the swap interval, NOT on margin. Demand is
         # `routed & ~gpu_experts_mask[topk_ids]` and hits are its complement --
         # both functions of the routed ids and the residency mask alone. The
@@ -2343,7 +2328,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # get_forward_context() asserts rather than returning None, and this
         # code also runs from paths that publish no context (unit tests, the
-        # standalone probes in runs/meta), so the guard is required.
+        # standalone probes), so the guard is required.
         if not has_forward_context():
             return default
         per_token = get_forward_context().kt_routing_margin
@@ -2468,12 +2453,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         so the answer to their cost is a cheaper measurement, not no
         measurement.
 
-        The torch form below ran ~11 kernels per layer per step (clamp, two
-        dtype casts, three more casts, four bitwise ops, three scatter_add_),
-        about 920 launches per decode step across 92 layers. Profiling put that
-        at ~10% of the step. The fused kernel does the same arithmetic in one
-        launch; the counters are integers accumulated by atomicAdd, so the
-        values are bit-identical, not merely equivalent.
+        The torch form below runs about a dozen kernels per layer per step
+        (clamp, dtype casts, bitwise ops, three scatter_add_), which is a
+        material share of decode once multiplied by the layer count. The fused
+        kernel does the same arithmetic in one launch; the counters are
+        integers accumulated by atomicAdd, so the values are bit-identical,
+        not merely equivalent.
         """
         from sglang.kernels.ops.kimi_k3 import kt_margin_counters as ktmc
 
@@ -2691,9 +2676,9 @@ def maybe_run_expert_swap_at_decode_boundary(
     prompt is freshest and the decode about to consume the resident set has not
     started. One window per request-arrival instead of several per prompt.
 
-    RATE LIMIT IS NOT OPTIONAL. With continuous batching at 8 concurrent
-    requests a prefill->decode transition lands every ~2.5 s; an unthrottled
-    window there costs far more than it returns. The limit counts TRANSITIONS
+    RATE LIMIT IS NOT OPTIONAL. Under continuous batching prefill->decode
+    transitions arrive constantly, and an unthrottled window costs far more
+    than it returns. The limit counts TRANSITIONS
     (--kt-expert-swap-transitions), not wall clock: a window costs a quiesce
     plus weight copies, and what earns that back is the demand observed since
     the last one, which arrives per transition rather than per second.
@@ -2717,9 +2702,8 @@ def maybe_run_expert_swap_at_decode_boundary(
     # NEVER ON THE PREFILL BOUNDARY ITSELF. Under split prefill every expert is
     # computed on GPU, so a prefill does not care which experts are offloaded:
     # placement only matters for decode. Running the window at the
-    # prefill->decode crossing therefore buys nothing and lands squarely in the
-    # request's time-to-first-token -- measured as prefill rows of 1,967-3,099
-    # tok/s against a clean 9,365, purely from which requests a window hit.
+    # prefill->decode crossing therefore buys nothing and lands squarely in
+    # the request's time-to-first-token.
     #
     # So the crossing only DECIDES; the window runs at the first steady decode
     # step after it, once the first token is already out. The condition is a
@@ -2841,26 +2825,18 @@ def maybe_run_expert_swap_window(
         #
         # This used to also kick off a background checkpoint prefetch of what
         # the NEXT window would demote. It fed a read path that no longer
-        # exists -- rank-write captures each rank's own slice off its own GPU
-        # rows, so no demoted expert's bytes come off disk at all -- and it was
-        # never free: MEASURED on V7, 28 prefetch passes moved 25,617 experts,
-        # ~448 GB read for real, while every one of 112 windows reported
-        # "prefetch 0 hit / 0 miss". Not one byte was consumed.
+        # exists: rank-write captures each rank's own slice off its own GPU
+        # rows, so no demoted expert's bytes come off disk at all.
         return
 
     # Phase accounting for one window, logged on the way out.
     _timing = {
         "read_s": 0.0,
         "install_s": 0.0,
-        # Phase breakdown of what the window's timing line calls "elsewhere".
-        # Added because two rounds of reasoning about where it goes were both
-        # wrong (the per-layer all_reduces, then the pinned allocations); the
-        # GPU flush measures 0.09 s per window on this node, so the remainder
-        # is CPU-side and has to be attributed rather than guessed.
-        # The first cut of this breakdown left ~0.9 ms per swap outside every
-        # timer, so the spans below now tile the whole per-layer body: nothing
-        # in it is untimed, and "unattributed" in the log line is a real
-        # residue rather than a span nobody thought to measure.
+        # Phase breakdown of what the window's timing line calls "elsewhere",
+        # because guessing where that time went was wrong twice. The spans
+        # below tile the whole per-layer body, so "unattributed" in the log is
+        # a real residue rather than a span nobody thought to measure.
         "select_s": 0.0,      # policy.select over 896 experts, per layer
         "rows_s": 0.0,        # the demoted rows' l2g lookup, per swap
         "begin_s": 0.0,       # begin_layer: rank-write capture + validate
@@ -2923,12 +2899,9 @@ def maybe_run_expert_swap_window(
     def _flush_moves():
         """Apply one layer's staged swaps as a handful of bulk copies.
 
-        WHY THIS EXISTS. The per-expert version issued, for every swap, four
-        `.to("cpu", non_blocking=False)` reads -- a BLOCKING D2H each. At 8
-        swaps x 4 tensors x 92 layers that is 2,944 synchronising round trips,
-        and it is what made a measured swap window cost 36-78 s against a
-        bandwidth model predicting ~116 ms. The traffic was never the problem:
-        3.2 GB at 27.9 GB/s is a tenth of a second. The stalls were.
+        WHY THIS EXISTS. The per-expert version issued a BLOCKING D2H for
+        every (swap, tensor) pair -- thousands of synchronising round trips per
+        window. The traffic was never the problem; the stalls were.
 
         This mirrors ColdExpertPipeline, which streams a layer as four bulk
         copies (one per weight name) rather than one per expert. Per layer:
@@ -2974,19 +2947,16 @@ def maybe_run_expert_swap_window(
 
         # WRITE: scatter every promoted row back, again one kernel per name.
         #
-        # PREALLOCATED, CONSTANT-SHAPE BATCH. torch.stack allocated four fresh
-        # device tensors per layer, and the swizzle four more -- 8 x 92 = 736
-        # allocations per window. Their shape followed len(items), which varies
-        # per layer, so the caching allocator could not reuse blocks and each
-        # miss forced a free/synchronize: measured ~6.4 ms apiece against an
-        # allocator nearly full at mem-fraction 0.89, i.e. ~4.7 s of a 5.19 s
-        # window, while the DMA itself is 0.075 ms/expert and the swizzle
-        # ~1 ms/layer.
+        # PREALLOCATED, CONSTANT-SHAPE BATCH. torch.stack allocated fresh
+        # device tensors per layer whose shape followed len(items), which
+        # varies per layer -- so the caching allocator could not reuse blocks
+        # and each miss forced a free/synchronize. That dominated the window;
+        # the copies themselves were a rounding error.
         #
-        # Split prefill never had this problem because its raw/dst buffers are
-        # allocated once per slot at construction and every layer is the same
-        # 272-expert shape, so the allocator serves it from cache. Do the same
-        # here: one buffer set sized to the swap budget, filled in place, and
+        # Split prefill never had this problem because its buffers are
+        # allocated once per slot at construction and every layer presents the
+        # same shape, so the allocator serves it from cache. Do the same here:
+        # one buffer set sized to the swap budget, filled in place, and
         # ALWAYS processed at full width so every layer presents an identical
         # shape. Rows beyond len(items) hold stale bytes and are simply not
         # scattered -- swizzling a few unused rows costs microseconds against
@@ -3102,11 +3072,9 @@ def maybe_run_expert_swap_window(
                 layer, _MXFP4_TRTLLM_RESIDENT_PARAM_NAMES[0]
             ).data.device
             # REUSED LANDING BUFFERS, one set per position in the layer's swap
-            # budget. Allocating four fresh device tensors per expert cost
-            # 6.4 ms each -- 2,944 allocations per window against a caching
-            # allocator that is nearly full at mem-fraction 0.89, so the misses
-            # force a free/synchronize. That was 4.72 s of a 5.14 s window,
-            # while the copies themselves are 0.075 ms of it. The buffers are
+            # budget. Allocating fresh device tensors per expert misses the
+            # caching allocator once it is near full, and every miss forces a
+            # free/synchronize -- which dominated the window. The buffers are
             # identical in shape for every expert, so one set per slot serves
             # the whole run.
             # DMA STRAIGHT INTO THE BATCH ROW. This used to land in a separate
@@ -3373,10 +3341,10 @@ def maybe_run_expert_swap_window(
             result.skipped_layers,
             _KT_SWAP_STATE["swaps"],
         )
-        # The phase split, MEASURED. It was previously inferred by subtracting
-        # an estimated disk rate from the window total, and the loader says
-        # that estimate was probably wrong: the install is a memcpy plus a
-        # strided restride of down_proj, with no format conversion in it.
+        # Fetch and install are timed separately rather than one being
+        # inferred from the other: the install is a memcpy plus a strided
+        # restride of down_proj, with no format conversion, so an estimate
+        # derived from a disk rate does not describe it.
         logger.info(
             "[kt-swap] window %d timing: total %.2fs = fetch %.2fs + install "
             "%.2fs (+%.2fs elsewhere)",
@@ -3417,14 +3385,13 @@ class _GpuResidentExpertReader:
 
     WHY. Under cold-only residency a demoted expert owns no CPU buffers, so
     every demotion must be given weights before it becomes routable. Reading
-    them off the checkpoint costs ~17.5 MB per demotion -- 8 swaps x 92 layers
-    = ~12.9 GB per window, which at this node's ~1.1 GB/s is ~11.7 s and is
-    essentially the entire 12.5 s a batched swap window still cost. The bytes
-    are already in device memory; only the layout differs.
+    them off the checkpoint costs tens of MB per demotion, which multiplied
+    by the swap budget and the layer count was essentially the entire cost of a
+    batched swap window. The bytes are already in device memory; only the
+    layout differs.
 
     One thing stands between the resident row and the exported bytes: the
-    trtllm-gen shuffle, inverted exactly by ``unswizzle_trtllm_expert``
-    (bitwise on every tensor -- runs/meta/verify_unswizzle.py).
+    trtllm-gen shuffle, inverted exactly by ``unswizzle_trtllm_expert``.
 
     NO COLLECTIVE, AND NO WHOLE EXPERT. Each rank returns its OWN shard and
     writes it into its own slice of kt's arena, which is what
@@ -3518,11 +3485,9 @@ class _GpuResidentExpertReader:
         if not dst_rows:
             return []
         # ONE KERNEL PER TENSOR, not one per expert. This was a Python loop
-        # calling the per-expert unswizzle, and at 92 layers x
-        # --kt-expert-swap-max it measured 0.23 s of a 1.40 s swap window --
-        # the same per-expert-vs-per-batch gap the forward swizzle already
-        # closed. The returned rows are VIEWS into the batched result, so the
-        # caller's per-expert loop stays free.
+        # calling the per-expert unswizzle -- the same per-expert-vs-per-batch
+        # gap the forward swizzle already closed. The returned rows are VIEWS
+        # into the batched result, so the caller's per-expert loop stays free.
         dev = getattr(layer, w13_n).data.device
         idx = torch.tensor(list(dst_rows), dtype=torch.long, device=dev)
         b13, b13s, b2, b2s = apply_batched_unswizzle(
@@ -3593,8 +3558,8 @@ def finalize_split_prefill(server_args) -> bool:
     if _KT_SPLIT_PREFILL_STATE["pipeline"] is not None:
         # Already armed. Defence in depth behind the draft-worker gate in
         # ModelRunner: a second call here does not re-arm anything, it builds a
-        # WHOLE SECOND cold store (51.1 GiB per rank, 439 GB across TP8) whose
-        # only visible symptom is host memory, because the layer list and the
+        # WHOLE SECOND cold store, whose only visible symptom is host
+        # memory, because the layer list and the
         # arming consensus both look exactly the same the second time.
         logger.info(
             "[split-prefill] already armed on %d layers; ignoring a second "
@@ -3743,12 +3708,12 @@ def finalize_split_prefill(server_args) -> bool:
     )
 
     # BUILD THE DEMOTION WRITER NOW, AT BOOT, not on the first window that
-    # needs it. Registering the arena is the expensive part -- 51 GiB per rank
-    # at 4K pages measured ~62 s -- and paying it lazily puts that stall inside
-    # the first swap window, i.e. inside serving, where it looks like a
-    # pathological window rather than a one-off setup cost. Everything it
-    # needs exists by this point: the arenas are mapped (kt_arena_share ran
-    # per layer during load) and the layer list is complete.
+    # needs it. Registering the arena is the expensive part, and paying it
+    # lazily puts that stall inside the first swap window -- inside serving,
+    # where it looks like a pathological window rather than a one-off setup
+    # cost. Everything it needs exists by this point: the arenas are mapped
+    # (kt_arena_share ran per layer during load) and the layer list is
+    # complete.
     #
     # Failure policy lives in the callee and in the window's arming consensus:
     # a writer that cannot be built terminates at the first window, because
@@ -4063,11 +4028,11 @@ def _get_or_create_rank_writer(entry):
                 # THE FAILURE YOU WILL ACTUALLY SEE, and it is not a bug in
                 # this code: cudaHostRegister rc=1 partway through the arenas.
                 # It pins EXISTING pages, so it is charged against
-                # RLIMIT_MEMLOCK -- unlike the cudaHostAlloc backing the pinned
-                # store, which is why a 51.1 GiB store allocates fine on a box
-                # where registering a 2.2 GiB arena does not. `ulimit -l` is
-                # 8 MB on an unprivileged vast.ai container, hard limit
-                # included, so nothing can be done from inside it; docker needs
+                # RLIMIT_MEMLOCK -- unlike the cudaHostAlloc backing a pinned
+                # store, which is why a much larger store can allocate fine on
+                # a box where registering the arena does not. Check `ulimit -l`;
+                # an unprivileged container may cap it low enough that nothing
+                # can be done from inside, and docker then needs
                 # `--ulimit memlock=-1`.
                 _t_reg = time.perf_counter()
                 try:

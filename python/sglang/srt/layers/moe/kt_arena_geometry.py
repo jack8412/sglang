@@ -123,8 +123,8 @@ class CudaCopyLib:
         This is what makes w2 free: the demoted expert's strips land at
         ``dpitch`` intervals inside kt's buffer, and the copy engine walks
         that stride itself. The host-side gather it replaces was the largest
-        single component of demotion -- measured 0.44-1.14 ms per expert
-        against 0.26 ms for the read-back that feeds it.
+        single component of demotion, costing more than the read-back that
+        feeds it.
         """
         rc = self._lib.cudaMemcpy2DAsync(
             dst, dpitch, src, spitch, width, height,

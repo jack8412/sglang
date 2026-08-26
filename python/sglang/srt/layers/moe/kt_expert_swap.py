@@ -164,11 +164,11 @@ def assert_tables_consistent(tables: SwapTables, num_gpu_experts: int) -> None:
     Worth running after every window: the failure mode of a desynced table is a
     silently wrong answer, not a crash.
 
-    Whole-tensor on purpose. Written the obvious way -- walk the resident ids in
-    python and ``.item()`` each table entry -- this is ~1,900 scalar extractions
-    per layer, and 92 layers per window measured at 1.75 s INSIDE the scheduler
-    against 0.17 s for the identical code standalone. Python-heavy loops pay for
-    every other thread in the process; whole-tensor ops do not. None of the four
+    Whole-tensor on purpose. Written the obvious way -- walk the resident ids
+    in python and ``.item()`` each table entry -- this is thousands of scalar
+    extractions per layer, and inside the scheduler process it costs an order
+    of magnitude more than the same code standalone: python-heavy loops pay for
+    every other thread holding the GIL, whole-tensor ops do not. None of the four
     invariants needs a python loop, so none of them has one. The per-expert
     detail is recovered only on the failure path, where its cost cannot matter.
     """

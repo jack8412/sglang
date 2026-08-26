@@ -61,11 +61,9 @@ class ColdExpertPipeline:
         # Dynamic-swizzle mode: the store holds CHECKPOINT-layout bytes and the
         # trtllm layout is produced here, once per layer, on device.
         #
-        # The point of doing it per layer is measured, not stylistic: one
-        # expert's TP8 shard swizzles in ~52 us -- launch-bound, only ~42 GB/s
-        # for 2.19 MB -- so 276 cold experts x 92 layers issued per expert is
-        # ~1.32 s per forward against a ~2.07 s copy floor. Issued once per
-        # layer it is ~1.0 ms, ~0.092 s per forward. Same bytes, 14x apart.
+        # Per layer, not per expert: a single expert's shard is small enough
+        # that the swizzle is launch-bound, so issuing one per expert costs an
+        # order of magnitude more than one per layer for the same bytes.
         self._swizzle_plan = swizzle_plan
 
         # WHICH buffer the copy stream writes decides how many of each is
@@ -74,7 +72,7 @@ class ColdExpertPipeline:
         # stream, in order, so ONE is enough; raw needs NUM_SLOTS, because
         # layer L's raw is being gathered while L+1's is still landing. The
         # copy-stream-written buffer is what _slot() indexes. 2 raw + 1
-        # resident costs 1.66 GiB/rank where 2 + 2 cost 2.22.
+        # resident is cheaper than 2 + 2.
         #
         # There is no second mode. A caller with no swizzle plan used to write
         # resident directly (the pre-swizzled store); finalize_split_prefill

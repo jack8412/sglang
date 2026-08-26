@@ -25,7 +25,7 @@ The combine is exact, for two reasons that both have to hold:
 The two slices are combined through finalize's fp32 accumulator rather than by
 concatenating their gemm2 buffers: each deferred call sizes its buffer for ALL
 T*top_k slots, so holding both plus a concatenation costs 3.5x the single
-call's peak (22.1 GiB vs 6.3 at T=48K) and will not fit beside a live server.
+call's peak several times over and will not fit beside a live server.
 Accumulating keeps the peak at one call's workspace plus an fp32 [T, hidden]
 buffer, and -- because the accumulation never leaves fp32 -- the result is
 rounded to bf16 exactly once, as an unsplit call does.
@@ -115,10 +115,9 @@ def split_slice_moe(
     A token's MoE output depends only on its own row, so tiling changes no
     value -- but both large transients (the gemm2 buffer, which the kernel
     sizes for ALL T*top_k slots, and the fp32 accumulator) scale with the
-    tile rather than the chunk. Measured at a 49152 chunk: peak 7.01 GiB
-    untiled vs 2.94 at a 16384 tile, for ~7% more MoE time -- and the MoE is
-    ~19% of the forward, so ~1.3% end to end. That is what lets a large chunk
-    coexist with a long-context KV pool.
+    tile rather than the chunk. The peak saving is large and costs only a few
+    percent of MoE time, which is what lets a large prefill chunk coexist with
+    a long-context KV pool.
 
     ``resident`` / ``cold`` each carry ``w13``, ``w13_scale``, ``w2``,
     ``w2_scale``, ``alpha``, ``beta`` -- the per-slice weights and the
