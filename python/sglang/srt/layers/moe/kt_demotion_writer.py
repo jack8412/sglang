@@ -321,7 +321,8 @@ class ArenaDmaColdSource:
     aligned and the physical blocks never move. Sorting the live offsets by
     address therefore yields slot order at any point in the run.
 
-    Duck-compatible with ColdExpertStore where ColdExpertPipeline touches it.
+    Satisfies the source interface ColdExpertPipeline drives: layer_rows,
+    after_enqueue, reset.
     """
 
     def __init__(self, *, dma, offsets_by_layer, geometry, layers, num_cold, experts):
@@ -374,7 +375,7 @@ class ArenaDmaColdSource:
                 bases.append(vals[0])
             self._plan[int(layer_idx)] = (int(stride), bases)
 
-    # -- ColdExpertStore-compatible lifecycle -----------------------------
+    # -- ColdExpertPipeline source lifecycle ------------------------------
     def after_enqueue(self, layer_idx: int, stream) -> None:
         return
 

@@ -125,21 +125,6 @@ def expert_bytes_digest(bytes_: Mxfp4ExpertBytes) -> str:
 # ---------------------------------------------------------------------------
 
 
-def swizzle_marlin(
-    w13: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w2: torch.Tensor,
-    w2_scale: torch.Tensor,
-    *,
-    out=None,
-):
-    """DSV4 target: delegate to the existing marlin preparation (accepts
-    E8M0 or bf16 scales via its SRC_IS_E8M0 kernel switch)."""
-    from sglang.srt.layers.quantization.v4_marlin_moe import prepare_v4_mxfp4_marlin
-
-    return prepare_v4_mxfp4_marlin(w13, w13_scale, w2, w2_scale, out=out)
-
-
 class TrtllmPermuteIndices(msgspec.Struct):
     """Shape-derived permutations for the trtllm-gen shuffled layout.
 
@@ -686,113 +671,6 @@ def allocate_trtllm_mxfp4(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
     )
-
-
-def prepare_trtllm_mxfp4(
-    w13: torch.Tensor,
-    w13_scale_bf16: torch.Tensor,
-    w2: torch.Tensor,
-    w2_scale_bf16: torch.Tensor,
-    *,
-    out: Optional[TrtllmPreparedWeights] = None,
-    expert_ids: Optional[Sequence[int]] = None,
-) -> TrtllmPreparedWeights:
-    """Swizzle kt-export MXFP4 experts into the trtllm-gen shuffled layout
-    on the current CUDA stream.
-
-    Inputs are the raw export payload: FP4 nibble bytes with w13 as
-    ``[gate | up]`` halves, and bf16 scales that are recovered to their
-    exact resident E8M0 codes via ``bf16_scales_to_e8m0``.  ``expert_ids``
-    restricts the swizzle to those experts (the layerwise pipeline copies
-    GPU-resident experts' already-shuffled images directly, so their raw
-    rows are never written); untouched ``out`` rows are preserved.  ``out``
-    is optional for one-shot use and required by the layerwise
-    double-buffer manager to keep storage addresses stable (``copy_``-only
-    writes).
-    """
-    if w13.ndim != 3 or w2.ndim != 3:
-        raise ValueError("export expert weights must be rank 3")
-    experts = w13.shape[0]
-    hidden_size = w13.shape[2] * 2
-    intermediate_size = w2.shape[2] * 2
-    shapes = _trtllm_prepared_shapes(experts, hidden_size, intermediate_size)
-    actual_raw = (
-        tuple(w13.shape),
-        tuple(w13_scale_bf16.shape),
-        tuple(w2.shape),
-        tuple(w2_scale_bf16.shape),
-    )
-    if actual_raw != shapes:
-        raise ValueError(
-            f"inconsistent export shapes {actual_raw}, expected {shapes}"
-        )
-
-    if out is None:
-        out = allocate_trtllm_mxfp4(
-            num_experts=experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            device=w13.device,
-        )
-    else:
-        actual = (
-            tuple(out.w13.shape),
-            tuple(out.w13_scale.shape),
-            tuple(out.w2.shape),
-            tuple(out.w2_scale.shape),
-        )
-        if actual != shapes:
-            raise ValueError(
-                f"prepared output shapes {actual} do not match {shapes}"
-            )
-        if (out.num_experts, out.hidden_size, out.intermediate_size) != (
-            experts,
-            hidden_size,
-            intermediate_size,
-        ):
-            raise ValueError(
-                "prepared output metadata does not match raw weights: got "
-                f"E/K/N={out.num_experts}/{out.hidden_size}/"
-                f"{out.intermediate_size}, expected "
-                f"{experts}/{hidden_size}/{intermediate_size}"
-            )
-
-    selected = list(range(experts)) if expert_ids is None else list(expert_ids)
-    if not selected:
-        return out
-
-    if expert_ids is None:
-        codes13 = bf16_scales_to_e8m0(w13_scale_bf16)
-        codes2 = bf16_scales_to_e8m0(w2_scale_bf16)
-    else:
-        # Gather first: unselected (GPU-resident) rows were never written by
-        # the export and must not reach the exactness assertion.
-        index = torch.tensor(selected, dtype=torch.long, device=w13.device)
-        codes13 = bf16_scales_to_e8m0(w13_scale_bf16.index_select(0, index))
-        codes2 = bf16_scales_to_e8m0(w2_scale_bf16.index_select(0, index))
-
-    indices = trtllm_permute_indices(
-        w13_sample=w13[selected[0]],
-        w13_scale_sample=codes13[0],
-        w2_sample=w2[selected[0]],
-        w2_scale_sample=codes2[0],
-        w13_gate_up_halves=True,
-    )
-    for position, expert_id in enumerate(selected):
-        swizzle_trtllm_expert(
-            Mxfp4ExpertBytes(
-                w13=w13[expert_id],
-                w13_scale_e8m0=codes13[position],
-                w2=w2[expert_id],
-                w2_scale_e8m0=codes2[position],
-            ),
-            indices,
-            out_w13=out.w13[expert_id],
-            out_w13_scale=out.w13_scale[expert_id],
-            out_w2=out.w2[expert_id],
-            out_w2_scale=out.w2_scale[expert_id],
-        )
-    return out
 
 
 def kt_wheel_has_e8m0_resident_scales() -> bool:

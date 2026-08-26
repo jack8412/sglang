@@ -7054,6 +7054,32 @@ class ServerArgs:
                 f"still fill every expert's buffer unconditionally and would "
                 f"dereference the ones that are no longer allocated."
             )
+        # E8M0-RESIDENT SCALES, checked by footprint rather than by version.
+        # Everything downstream reads kt's BufferB bytes in place -- raw_shard
+        # for the swizzle plan's geometry, ArenaDmaColdSource for the cold
+        # stream, RankShardWriter for demotions -- and all of them interpret
+        # the scale bytes as E8M0 codes. A wheel that stores fp32 scales lays
+        # those buffers out differently (0.625 B/elem against 0.53125), so the
+        # arena arithmetic addresses the wrong bytes.
+        #
+        # This gate previously hung off --kt-enable-dynamic-expert-update, and
+        # went unreferenced when that path was removed. It is restored
+        # unconditionally because the arena transport depends on the same
+        # layout the dynamic update did, and more directly.
+        from sglang.srt.layers.moe.kt_mxfp4_export import (
+            kt_wheel_has_e8m0_resident_scales,
+        )
+
+        if not kt_wheel_has_e8m0_resident_scales():
+            raise ValueError(
+                "The installed kt_kernel wheel does not store E8M0-resident "
+                "MXFP4 scales (its mxfp4_buffer_bytes reports a footprint "
+                "other than 0.53125 B/elem). Every path here reads kt's expert "
+                "buffers in place and interprets their scale bytes as E8M0 "
+                "codes, so a wheel with a different layout produces "
+                "right-shaped wrong weights rather than an error. Rebuild "
+                "kt-kernel from feat/mxfp4-kimi-k3."
+            )
 
         if self.kt_conditional_cpu_branch:
             raise ValueError(

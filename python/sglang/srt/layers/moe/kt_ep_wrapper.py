@@ -2624,17 +2624,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """The single D2H; the only thing between the fork and the dispatch."""
         self.wrapper.flush_forward_inputs(hidden_states)
 
-    def _kt_doorbell_stage(self, layer, dispatch_output, staging_buffer) -> None:
-        """Copy this step's ids/weights into the kt ring the poller reads.
-
-        The host-node path did this inside submit_forward; with the doorbell
-        the copies must still happen (the poller reads the same rings) but
-        without the enqueue, so this mirrors submit_forward's staging half
-        and stops there.
-        """
-        topk_weights, topk_ids, _ = dispatch_output.topk_output
-        self.wrapper.stage_forward_inputs(staging_buffer, topk_ids, topk_weights)
-
     def _kt_doorbell_output(self, staging_buffer) -> torch.Tensor:
         """Result tensor for the merge; the wait node already ordered it."""
         return self.wrapper.doorbell_output(staging_buffer)
@@ -3033,10 +3022,10 @@ def maybe_run_expert_swap_window(
         "items": [],
         # True when the DMA wrote the promoted rows STRAIGHT INTO the batch
         # buffers, so _flush_moves has nothing to gather. False when they are
-        # separate tensors (the ring-export staging path) that still have to be
-        # copied in. It used to also stand in for "checkpoint layout, needs the
-        # swizzle"; that second meaning is gone because every remaining source
-        # is checkpoint layout and the swizzle is unconditional.
+        # separate tensors that still have to be copied in. It used to also
+        # stand in for "checkpoint layout, needs the swizzle"; that second
+        # meaning is gone because every remaining source is checkpoint layout
+        # and the swizzle is unconditional.
         "in_batch": False,
     }
 
@@ -3726,26 +3715,6 @@ def reset_split_prefill() -> None:
     _KT_SPLIT_PREFILL_STATE["pipeline"] = None
 
 
-def _invert_cold_slot_table(
-    l2s: torch.Tensor, num_gpu: int, num_cold: int
-) -> torch.Tensor:
-    """Cold half of ``logical_to_slot``, inverted: row ``j`` -> the expert
-    whose slot is ``num_gpu + j``.
-
-    Runs at gather time, i.e. inside a forward where torch's DEFAULT DEVICE is
-    cuda -- A3's first request died on exactly that (a device-less
-    ``torch.empty`` landed on cuda:0 against the CPU table). Every tensor here
-    is therefore pinned to the table's own device, and the result comes back
-    on CPU, which is what the gather indexes with.
-    """
-    is_cold = l2s >= num_gpu
-    cold = torch.empty(num_cold, dtype=torch.int64, device=l2s.device)
-    cold[(l2s[is_cold] - num_gpu).long()] = torch.nonzero(
-        is_cold, as_tuple=False
-    ).flatten()
-    return cold.cpu()
-
-
 def finalize_split_prefill(server_args) -> bool:
     """Build the cold-expert source and prefetch pipeline, then arm every layer.
 
@@ -3870,11 +3839,12 @@ def finalize_split_prefill(server_args) -> bool:
     # full-expert shards while a disarmed rank contributes its margin-routed
     # resident-only shard, and the row-parallel all-reduce sums them into
     # every output token of every large prefill. A single rank's build is the
-    # likeliest thing in this file to fail alone (its arena share can degrade
-    # per rank BY DESIGN, sending only it into the 52 GiB pinned-store
-    # fallback), so unanimity is decided with the same symmetric consensus
-    # every other rank-divergence risk here uses. Reached from the success
-    # AND failure paths, so it cannot itself desynchronise.
+    # likeliest thing in this file to fail alone -- kt_arena_share degrades a
+    # rank that could not map the arena, BY DESIGN -- so unanimity is decided
+    # with the same symmetric consensus every other rank-divergence risk here
+    # uses. Reached from the success AND failure paths, so it cannot itself
+    # desynchronise. There is no per-rank fallback left to degrade INTO: the
+    # whole split-prefill path disarms on every rank, together.
     if not _all_tp_ranks_succeeded(pipeline is not None):
         if pipeline is not None:
             logger.error(
@@ -3992,7 +3962,7 @@ def _build_dynamic_swizzle_plan(anchor, device):
     """Raw per-expert shapes and the per-layer swizzle maps, from one sample.
 
     Both are shape-derived, so a single expert settles them for every layer.
-    Returns ``(raw_shapes, plan)`` in ColdExpertStore's WEIGHT_NAMES order, or
+    Returns ``(raw_shapes, plan)`` in ``kt_mxfp4_export.WEIGHT_NAMES`` order, or
     ``(None, None)`` if anything is missing -- in which case the caller
     refuses to arm rather than guessing.
 
