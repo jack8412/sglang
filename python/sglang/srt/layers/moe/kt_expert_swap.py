@@ -44,8 +44,8 @@ class ExpertSwap(NamedTuple):
 
     promote: int  # logical expert id, currently CPU-resident
     demote: int  # logical expert id, currently GPU-resident
-    demand: float  # EMA demand of the promoted expert
-    hits: float  # EMA resident hits of the demoted expert
+    promote_score: float  # REAP score of the expert coming to the GPU
+    demote_score: float  # REAP score of the expert being sent to the CPU
 
 
 class SwapTables(NamedTuple):
@@ -207,21 +207,30 @@ def assert_tables_consistent(tables: SwapTables, num_gpu_experts: int) -> None:
 
 
 class ExpertSwapPolicy:
-    """Per-layer EMA bookkeeping plus swap selection.
+    """Per-layer REAP bookkeeping plus swap selection.
+
+    Ranks experts by
+
+        S_k = (sum over the expert's own activations of w_k * ||f_k||) / |X_k|
+
+    the damage removing it would do, per token that actually uses it. How OFTEN
+    an expert fires does not appear: one firing constantly and contributing
+    little is exactly what belongs on the CPU side.
 
     Args:
         num_experts: Logical expert count for the layer.
-        ema_alpha: Weight of the newest observation, in (0, 1]. 1.0 uses only
-            the latest interval.
-        hysteresis: A promotion must beat the demotion victim by this factor
+        ema_alpha: Weight of the newest window, in (0, 1]. The sum and the
+            count decay TOGETHER, so the result stays a pooled mean and a
+            window holding one activation carries the weight of one
+            activation. Averaging per-window means instead would let a single
+            sample move a score as far as five thousand.
+        hysteresis: A promotion must beat its demotion victim by this factor
             before the swap is taken. >1 creates a dead band so two experts of
-            similar weight cannot trade places every interval (thrashing);
-            each swap costs a weight transfer, so an unprofitable one is
-            strictly worse than doing nothing.
-        max_swaps: Per-evaluation budget, bounding transfer traffic and
-            keeping any single decision's blast radius small.
-        min_demand: Absolute floor on EMA demand; below it a promotion is
-            noise rather than signal.
+            similar score cannot trade places every window; each swap costs a
+            weight transfer, so an unprofitable one is worse than nothing.
+        max_swaps: Per-evaluation budget, bounding transfer traffic.
+        min_evidence: Decayed activation count a non-resident expert needs
+            before its score counts as evidence rather than noise.
     """
 
     def __init__(
@@ -231,7 +240,7 @@ class ExpertSwapPolicy:
         ema_alpha: float = 0.3,
         hysteresis: float = 2.0,
         max_swaps: int = 4,
-        min_demand: float = 1.0,
+        min_evidence: float = 1.0,
     ):
         if not 0.0 < ema_alpha <= 1.0:
             raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha}")
@@ -241,106 +250,92 @@ class ExpertSwapPolicy:
         self.ema_alpha = ema_alpha
         self.hysteresis = hysteresis
         self.max_swaps = max_swaps
-        self.min_demand = min_demand
+        self.min_evidence = min_evidence
 
-        self.demand_ema = torch.zeros(num_experts, dtype=torch.float64)
-        self.hits_ema = torch.zeros(num_experts, dtype=torch.float64)
-        self._prev_demand = torch.zeros(num_experts, dtype=torch.float64)
-        self._prev_hits = torch.zeros(num_experts, dtype=torch.float64)
-        self._observed = False
+        self.reap_sum = torch.zeros(num_experts, dtype=torch.float64)
+        self.reap_count = torch.zeros(num_experts, dtype=torch.float64)
 
-    def observe(self, demand_cum: torch.Tensor, hits_cum: torch.Tensor) -> None:
-        """Fold one interval's counter deltas into the EMAs.
+    @property
+    def score(self) -> torch.Tensor:
+        """S_k per expert; 0 where nothing has been measured.
 
-        ``demand_cum`` / ``hits_cum`` are cumulative-since-launch counts on
-        CPU. The first call only establishes the baseline: its "delta" would
-        be the entire history, which is exactly the stale signal the EMA
-        exists to avoid.
+        A zero is meaningful in both directions: an unmeasured resident is the
+        safest thing to demote, and an unmeasured non-resident has no evidence
+        to justify promoting it (``min_evidence`` is what enforces the latter).
         """
-        demand_cum = demand_cum.to(torch.float64).cpu()
-        hits_cum = hits_cum.to(torch.float64).cpu()
-        if demand_cum.shape != (self.num_experts,) or hits_cum.shape != (
-            self.num_experts,
-        ):
+        return torch.where(
+            self.reap_count > 0.0,
+            self.reap_sum / self.reap_count.clamp(min=1e-12),
+            torch.zeros_like(self.reap_sum),
+        )
+
+    def observe(self, window_sum: torch.Tensor, window_count: torch.Tensor) -> None:
+        """Fold one window's REAP totals in.
+
+        The totals are already this window's own -- the device accumulators are
+        zeroed after every snapshot -- so there is no baseline to subtract and
+        no cumulative counter to saturate. A monotonic float accumulator read
+        by differencing stalls once the total outgrows the increment by 2**24,
+        which sends the busiest experts' delta to zero and inverts the ranking.
+        """
+        window_sum = window_sum.to(torch.float64).cpu()
+        window_count = window_count.to(torch.float64).cpu()
+        shape = (self.num_experts,)
+        if tuple(window_sum.shape) != shape or tuple(window_count.shape) != shape:
             raise ValueError(
-                f"counter shape mismatch: expected ({self.num_experts},), got "
-                f"{tuple(demand_cum.shape)} and {tuple(hits_cum.shape)}"
+                f"REAP shape mismatch: expected {shape}, got "
+                f"{tuple(window_sum.shape)} and {tuple(window_count.shape)}"
             )
+        if self.num_experts and (window_count < 0).any():
+            raise ValueError("REAP activation counts cannot be negative")
 
-        # Counters only ever grow; a decrease means they were reset (or the
-        # layer was rebuilt), so treat the new value as the delta rather than
-        # producing a negative one.
-        d_delta = torch.clamp(demand_cum - self._prev_demand, min=0.0)
-        h_delta = torch.clamp(hits_cum - self._prev_hits, min=0.0)
-        self._prev_demand = demand_cum.clone()
-        self._prev_hits = hits_cum.clone()
-
-        if not self._observed:
-            self._observed = True
-            return
-
-        a = self.ema_alpha
-        self.demand_ema = (1.0 - a) * self.demand_ema + a * d_delta
-        self.hits_ema = (1.0 - a) * self.hits_ema + a * h_delta
+        decay = 1.0 - self.ema_alpha
+        self.reap_sum = decay * self.reap_sum + window_sum
+        self.reap_count = decay * self.reap_count + window_count
 
     def select(self, gpu_experts_mask: torch.Tensor) -> List[ExpertSwap]:
         """Pick up to ``max_swaps`` profitable 1:1 exchanges.
 
-        Greedy and disjoint: the highest-demand non-resident expert is paired
-        with the least-used resident one, then both are removed from
-        consideration, so one evaluation never promotes or demotes the same
-        expert twice.
+        Greedy and disjoint: the highest-scoring non-resident expert is paired
+        with the lowest-scoring resident one, then both leave the running, so
+        one evaluation never moves the same expert twice.
 
-        Whole-tensor for the same reason assert_tables_consistent is. This runs
-        on all 92 layers of an acting window AND of every sampling boundary in
-        between -- five times per window at interval 50 -- and the python form
-        walked 896 experts twice and then called .item() once per candidate
-        inside two sort keys: ~3,000 scalar ops per layer, ~270,000 per window.
-        Inside the scheduler process, where kt's cpuinfer pool and the demotion
-        prefetch readers compete for the GIL, those cost about ten times what
-        they do standalone. Measured at 0.27 s per window, and unlike the rest
-        of the window it does not shrink as the policy converges: it costs the
-        same on a layer that ends up swapping nothing.
+        Whole-tensor rather than a python loop: this runs on all 92 layers of
+        every window, and the scalar form cost about ten times as much inside
+        the scheduler process, where kt's pool competes for the GIL.
         """
-        if self.max_swaps <= 0 or not self._observed:
+        if self.max_swaps <= 0:
             return []
         mask = gpu_experts_mask.to(torch.bool).cpu()
-        if mask.shape != (self.num_experts,):
+        if tuple(mask.shape) != (self.num_experts,):
             raise ValueError(
                 f"mask shape {tuple(mask.shape)} != ({self.num_experts},)"
             )
 
-        # A non-resident expert's demand is meaningful only if it cleared the
-        # floor; a resident expert is a candidate victim regardless of hits
-        # (zero hits is the strongest case for demoting it).
+        score = self.score
         cand_promote = (
-            (~mask) & (self.demand_ema >= self.min_demand)
+            (~mask) & (self.reap_count >= self.min_evidence)
         ).nonzero().flatten()
         cand_demote = mask.nonzero().flatten()
         if cand_promote.numel() == 0 or cand_demote.numel() == 0:
             return []
 
-        # Stable, and that is not a detail: python's sort is stable, so equal
-        # keys stayed in ascending expert id, and every rank must pick the SAME
-        # pairs or their placements diverge silently. argsort(stable=True) over
-        # an ascending candidate list reproduces exactly that.
+        # Stable, and that is not a detail: every rank must pick the SAME pairs
+        # or the placements diverge silently. argsort(stable=True) over an
+        # ascending candidate list keeps ties in expert-id order everywhere.
         cand_promote = cand_promote[
-            torch.argsort(-self.demand_ema[cand_promote], stable=True)
+            torch.argsort(-score[cand_promote], stable=True)
         ]
-        cand_demote = cand_demote[
-            torch.argsort(self.hits_ema[cand_demote], stable=True)
-        ]
+        cand_demote = cand_demote[torch.argsort(score[cand_demote], stable=True)]
 
         n = min(self.max_swaps, cand_promote.numel(), cand_demote.numel())
         promote = cand_promote[:n]
         demote = cand_demote[:n]
-        demand = self.demand_ema[promote]
-        hits = self.hits_ema[demote]
-        # Dead band: demand must beat the incumbent by the hysteresis factor.
-        # With hits == 0 any demand above the floor wins, which is the intended
-        # behaviour for an unused resident. Both lists are sorted, so the first
-        # pair that fails ends the run: this takes a PREFIX, not a filter.
-        failed = (demand <= hits * self.hysteresis).nonzero().flatten()
+        gain = score[promote]
+        loss = score[demote]
+        # Dead band. Both lists are sorted, so the first pair that fails ends
+        # the run: this takes a PREFIX, not a filter.
+        failed = (gain <= loss * self.hysteresis).nonzero().flatten()
         if failed.numel():
             n = int(failed[0].item())
 
@@ -348,51 +343,18 @@ class ExpertSwapPolicy:
             ExpertSwap(
                 promote=int(promote[i]),
                 demote=int(demote[i]),
-                demand=float(demand[i]),
-                hits=float(hits[i]),
+                promote_score=float(gain[i]),
+                demote_score=float(loss[i]),
             )
             for i in range(n)
         ]
-
-    def note_swapped(self, swaps: List[ExpertSwap]) -> None:
-        """Reset EMAs for experts that just changed side.
-
-        After a swap the promoted expert's demand history describes a state
-        that no longer exists (it is resident now and will accumulate hits
-        instead), and the demoted expert's hit history likewise. Leaving the
-        stale values in place would let the same pair immediately qualify to
-        swap back.
-        """
-        for s in swaps:
-            self.demand_ema[s.promote] = 0.0
-            self.hits_ema[s.promote] = 0.0
-            self.demand_ema[s.demote] = 0.0
-            self.hits_ema[s.demote] = 0.0
-
-    def snapshot_counters(
-        self,
-        insist: torch.Tensor,
-        override: torch.Tensor,
-        resident_hits: torch.Tensor,
-    ) -> None:
-        """Fold one interval from the three device counters.
-
-        ``insist`` and ``override`` both mean "the router asked for a
-        non-resident expert" and are summed into demand; whether we paid the
-        CPU or substituted is a serving decision, not a statement about what
-        the traffic wanted.
-        """
-        self.observe(
-            (insist.to(torch.int64) + override.to(torch.int64)).cpu(),
-            resident_hits.to(torch.int64).cpu(),
-        )
 
     def state_dict(self) -> dict:
         """Serialisable state, for persisting across restarts as a seed."""
         return {
             "num_experts": self.num_experts,
-            "demand_ema": self.demand_ema.tolist(),
-            "hits_ema": self.hits_ema.tolist(),
+            "reap_sum": self.reap_sum.tolist(),
+            "reap_count": self.reap_count.tolist(),
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -401,27 +363,10 @@ class ExpertSwapPolicy:
                 f"swap state is for {state.get('num_experts')} experts, "
                 f"layer has {self.num_experts}"
             )
-        self.demand_ema = torch.tensor(state["demand_ema"], dtype=torch.float64)
-        self.hits_ema = torch.tensor(state["hits_ema"], dtype=torch.float64)
-        self._observed = True
+        self.reap_sum = torch.tensor(state["reap_sum"], dtype=torch.float64)
+        self.reap_count = torch.tensor(state["reap_count"], dtype=torch.float64)
 
 
-# ---------------------------------------------------------------------------
-# Swap window driver
-# ---------------------------------------------------------------------------
-
-# Moves one expert's weights into a resident GPU row:
-#   move_weights(layer, dst_row, logical_expert_id) -> None
-# Isolated behind this alias deliberately. Everything else in a swap window is
-# bookkeeping that can be asserted; this is the one step that physically
-# rewrites weights, so it is the one step worth testing on its own (bitwise,
-# against a known-good full-set copy for the same expert) before it is trusted.
-# (layer, dst_row, promote_logical_id, demote_logical_id). The demoted id is
-# passed rather than looked up from gpu_index_to_logical[dst_row] because a
-# mover that also maintains a cold-side store needs to know which expert is
-# leaving, and the tables still describe the PRE-swap placement at this point
-# -- a reverse lookup would be correct today and silently wrong the moment
-# this call moved after apply_swaps_to_tables.
 MoveWeightsFn = Callable[[object, int, int, int], None]
 
 
@@ -652,7 +597,11 @@ def run_swap_window(
                 except Exception:
                     logger.exception("[kt-swap] on_layer_abort failed")
             raise
-        policy.note_swapped(swaps)
+        # No score reset after a swap. A REAP score is a property of the
+        # expert, not of where it lives, and both sides keep measuring: the
+        # promoted expert is now the highest-scoring resident and the demoted
+        # one the lowest-scoring non-resident, so the pair cannot immediately
+        # trade back.
         applied += len(swaps)
         touched += 1
         # DEBUG, not INFO. This is one line per LAYER per RANK per window --
@@ -667,7 +616,7 @@ def run_swap_window(
                 entry.get("layer_idx"),
                 len(swaps),
                 ", ".join(
-                    f"{s.promote}(d={s.demand:.1f})<-row{r}-{s.demote}(h={s.hits:.1f})"
+                    f"{s.promote}(S={s.promote_score:.3g})<-row{r}-{s.demote}(S={s.demote_score:.3g})"
                     for s, r in zip(swaps, rows)
                 ),
             )

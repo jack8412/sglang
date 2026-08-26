@@ -1014,23 +1014,16 @@ class TestSwapRequiresSplitPrefill(CustomTestCase):
                 os.environ["KT_BUFFER_B_MEMFD"] = prev
 
 
-class TestResidentHitsCreditTheServingExpert(CustomTestCase):
-    """Bug regression: an overridden slot credited its resident hit to nobody.
+class TestMarginCountersCreditTheRouter(CustomTestCase):
+    """Completeness contract for the margin telemetry: insist and override are
+    both attributed to the expert the ROUTER asked for, never to a substitute.
 
-    Demand and resident hits are attributed to DIFFERENT experts on an
-    overridden slot. Demand belongs to the expert the router asked for -- it is
-    what argues for promoting it. A resident hit belongs to the expert that
-    actually computed the slot, because its INVERSE ranks demotion victims
-    (ExpertSwapPolicy.select sorts cand_demote ascending by hits_ema), so it has
-    to mean "did work", not "was named".
+    They answer "how much non-resident demand did this margin pay for on the
+    CPU, and how much did it substitute away" -- a question about the router's
+    preference, so a stand-in must not appear in either. Placement is decided
+    separately, on REAP scores.
 
-    Attributing it to the original id gave the substitute nothing, so a resident
-    expert doing well as a stand-in looked idle and went to the front of the
-    demotion queue -- margin routing nominating its own best stand-ins, harder
-    the higher the margin, and invisible because the counter still summed to a
-    plausible total.
-
-    Exercises the torch fallback: the fused kernel is CUDA-only and is asserted
+    Exercises the torch fallback; the fused kernel is CUDA-only and is asserted
     elsewhere to produce identical numbers.
     """
 
@@ -1040,20 +1033,16 @@ class TestResidentHitsCreditTheServingExpert(CustomTestCase):
         method = KTEPWrapperMethod.__new__(KTEPWrapperMethod)
         method._margin_insist_count = torch.zeros(num_experts, dtype=torch.int32)
         method._margin_override_count = torch.zeros(num_experts, dtype=torch.int32)
-        method._resident_hit_count = torch.zeros(num_experts, dtype=torch.int32)
-        method._update_margin_counters(
-            topk_ids, served_ids, insist, override
-        )
+        method._update_margin_counters(topk_ids, served_ids, insist, override)
         return (
             method._margin_insist_count.tolist(),
             method._margin_override_count.tolist(),
-            method._resident_hit_count.tolist(),
         )
 
-    def test_override_credits_demand_to_router_and_hit_to_substitute(self):
+    def test_override_is_credited_to_the_router_not_the_substitute(self):
         # One token, two slots. Slot 0: router wanted CPU expert 5, resident 2
         # stood in. Slot 1: router wanted resident 3 and got it.
-        insist, override, hits = self._counters(
+        insist, override = self._counters(
             topk_ids=torch.tensor([[5, 3]]),
             served_ids=torch.tensor([[2, 3]]),
             insist=torch.tensor([[False, False]]),
@@ -1061,26 +1050,20 @@ class TestResidentHitsCreditTheServingExpert(CustomTestCase):
         )
         self.assertEqual(override[5], 1, "demand belongs to the router's choice")
         self.assertEqual(override[2], 0, "the substitute did not generate demand")
-        self.assertEqual(hits[2], 1, "the substitute SERVED the slot")
-        self.assertEqual(hits[5], 0, "the CPU expert served nothing")
-        self.assertEqual(hits[3], 1, "an ordinary resident pick still counts")
 
-    def test_insist_credits_no_resident_hit(self):
-        # The CPU expert ran, so no resident expert served this slot.
-        insist, override, hits = self._counters(
+    def test_insist_records_demand_paid_on_the_cpu(self):
+        insist, override = self._counters(
             topk_ids=torch.tensor([[5]]),
             served_ids=torch.tensor([[5]]),
             insist=torch.tensor([[True]]),
             override=torch.tensor([[False]]),
         )
         self.assertEqual(insist[5], 1)
-        self.assertEqual(sum(hits), 0)
+        self.assertEqual(sum(override), 0)
 
-    def test_unmasked_slots_are_unchanged_when_nothing_overrides(self):
-        # The compatibility claim: with served_ids == topk_ids the counters
-        # reproduce exactly what the pre-fix code produced.
+    def test_a_slot_that_was_neither_counts_in_neither(self):
         ids = torch.tensor([[1, 4], [4, 6]])
-        insist, override, hits = self._counters(
+        insist, override = self._counters(
             topk_ids=ids,
             served_ids=ids,
             insist=torch.zeros_like(ids, dtype=torch.bool),
@@ -1088,21 +1071,6 @@ class TestResidentHitsCreditTheServingExpert(CustomTestCase):
         )
         self.assertEqual(sum(insist), 0)
         self.assertEqual(sum(override), 0)
-        self.assertEqual(hits[4], 2)
-        self.assertEqual(hits[1], 1)
-        self.assertEqual(hits[6], 1)
-
-    def test_masked_slots_contribute_no_resident_hit(self):
-        # -1 is "not routed here". It must not credit expert 0, which is what
-        # the clamp_min(0) index would otherwise do.
-        insist, override, hits = self._counters(
-            topk_ids=torch.tensor([[-1, 2]]),
-            served_ids=torch.tensor([[-1, 2]]),
-            insist=torch.tensor([[False, False]]),
-            override=torch.tensor([[False, False]]),
-        )
-        self.assertEqual(hits[0], 0)
-        self.assertEqual(hits[2], 1)
 
 
 if __name__ == "__main__":

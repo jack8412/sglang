@@ -40,29 +40,24 @@ def _jit_kt_margin_counters_module() -> Module:
 
 def covered(
     topk_ids: torch.Tensor,
-    served_ids: torch.Tensor,
     insist: torch.Tensor,
     overridden: torch.Tensor,
 ) -> bool:
     return (
         topk_ids.is_cuda
         and topk_ids.dtype in _ID_DTYPES
-        and served_ids.dtype == topk_ids.dtype
-        and served_ids.is_cuda
         and insist.dtype == torch.bool
         and overridden.dtype == torch.bool
         and topk_ids.is_contiguous()
-        and served_ids.is_contiguous()
         and insist.is_contiguous()
         and overridden.is_contiguous()
-        and served_ids.shape == topk_ids.shape
         and insist.shape == topk_ids.shape
         and overridden.shape == topk_ids.shape
         and topk_ids.numel() > 0
     )
 
 
-def why_not_covered(topk_ids, served_ids, insist, overridden) -> str:
+def why_not_covered(topk_ids, insist, overridden) -> str:
     """Why covered() declined, for the caller's fallback warning.
 
     A silent fallback is the failure mode that matters here: the torch path
@@ -74,15 +69,6 @@ def why_not_covered(topk_ids, served_ids, insist, overridden) -> str:
         return "topk_ids not on CUDA"
     if topk_ids.dtype not in _ID_DTYPES:
         return f"topk_ids dtype {topk_ids.dtype} not in {sorted(map(str, _ID_DTYPES))}"
-    if not served_ids.is_cuda:
-        return "served_ids not on CUDA"
-    if served_ids.dtype != topk_ids.dtype:
-        return f"served_ids dtype {served_ids.dtype} != topk_ids {topk_ids.dtype}"
-    if served_ids.shape != topk_ids.shape:
-        return (
-            f"served_ids shape {tuple(served_ids.shape)} != topk_ids "
-            f"{tuple(topk_ids.shape)}"
-        )
     for name, t in (("insist", insist), ("overridden", overridden)):
         if t.dtype != torch.bool:
             return f"{name} dtype {t.dtype}, expected bool"
@@ -90,7 +76,6 @@ def why_not_covered(topk_ids, served_ids, insist, overridden) -> str:
             return f"{name} shape {tuple(t.shape)} != topk_ids {tuple(topk_ids.shape)}"
     if not (
         topk_ids.is_contiguous()
-        and served_ids.is_contiguous()
         and insist.is_contiguous()
         and overridden.is_contiguous()
     ):
@@ -103,19 +88,18 @@ def why_not_covered(topk_ids, served_ids, insist, overridden) -> str:
 def kt_margin_counters(
     insist_count: torch.Tensor,
     override_count: torch.Tensor,
-    resident_count: torch.Tensor,
     topk_ids: torch.Tensor,
-    served_ids: torch.Tensor,
     insist: torch.Tensor,
     overridden: torch.Tensor,
 ) -> None:
-    """Fold one forward into the three per-expert counters, in place.
+    """Fold one forward into the two margin counters, in place.
 
     `topk_ids` are the ORIGINAL router ids, before any margin substitution, so
-    DEMAND is attributed to the expert the router actually asked for.
-    `served_ids` are the ids after substitution, so RESIDENT HITS are
-    attributed to the expert that actually computed the slot. Pass the same
-    tensor twice when nothing can be overridden; the numbers are identical.
+    both counters are attributed to the expert the router actually asked for.
+    They are margin telemetry: which non-resident picks were paid on the CPU
+    and which were substituted away. Placement is decided elsewhere, on REAP
+    scores, which measure what an expert contributes rather than how often it
+    is asked for.
 
     Accumulates in place rather than returning: this runs inside graph capture,
     where the counters' addresses are baked into the captured kernel and must
@@ -127,9 +111,7 @@ def kt_margin_counters(
     fn(
         insist_count,
         override_count,
-        resident_count,
         topk_ids.reshape(-1),
-        served_ids.reshape(-1),
         insist.reshape(-1).view(torch.uint8),
         overridden.reshape(-1).view(torch.uint8),
     )

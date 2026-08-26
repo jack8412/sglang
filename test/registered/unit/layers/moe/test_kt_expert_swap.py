@@ -16,153 +16,164 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _cum(pairs, n=8):
-    t = torch.zeros(n, dtype=torch.int64)
+def _vec(pairs, n=8, dtype=torch.float64):
+    t = torch.zeros(n, dtype=dtype)
     for i, v in pairs.items():
         t[i] = v
     return t
 
 
-class TestSwapSelection(CustomTestCase):
-    """Derived property: the greedy pairing and its dead band. Red if the
-    hysteresis comparison drops (thrashing returns), if the pairing stops
-    being disjoint, or if the budget stops binding."""
+def _window(p, scores, counts):
+    """One window where each listed expert fired `count` times contributing
+    `score` each, which is what the device accumulators would hold."""
+    total = {k: scores[k] * counts[k] for k in counts}
+    p.observe(_vec(total), _vec(counts))
 
-    # experts 0-3 resident, 4-7 offloaded
-    MASK = torch.tensor([True] * 4 + [False] * 4)
+
+MASK = torch.tensor([True] * 4 + [False] * 4)
+
+
+class TestReapRanking(CustomTestCase):
+    """Derived property: placement follows damage-per-activation, and the
+    greedy pairing, budget and dead band that turn scores into swaps. Red if
+    the ranking picks up a frequency term, if the pairing stops being disjoint,
+    or if the hysteresis comparison drops (thrashing returns)."""
 
     def _policy(self, **kw):
-        kw.setdefault("ema_alpha", 1.0)  # latest interval only, for determinism
-        kw.setdefault("min_demand", 1.0)
+        kw.setdefault("ema_alpha", 1.0)
+        kw.setdefault("min_evidence", 1.0)
         return ExpertSwapPolicy(8, **kw)
 
-    def test_promotes_high_demand_over_unused_resident(self):
+    def test_rare_high_value_expert_outranks_a_frequent_low_value_one(self):
+        # THE reason REAP divides by |X_k|. Expert 5 fires 5,000 times giving
+        # 1.0 each; expert 4 fires 10 times giving 40.0 each. Any statistic
+        # that counts activations promotes 5; REAP promotes 4.
         p = self._policy()
-        p.observe(_cum({}), _cum({}))  # baseline
-        p.observe(_cum({4: 100}), _cum({0: 50, 1: 40, 2: 30, 3: 0}))
-        swaps = p.select(self.MASK)
-        self.assertEqual(len(swaps), 1)
+        _window(p, {4: 40.0, 5: 1.0}, {4: 10, 5: 5000})
+        swaps = p.select(MASK)
+        self.assertEqual(swaps[0].promote, 4)
+
+    def test_promotes_over_the_weakest_resident(self):
+        p = self._policy()
+        _window(p, {0: 5.0, 1: 4.0, 2: 3.0, 3: 0.5, 4: 90.0}, dict.fromkeys([0, 1, 2, 3, 4], 10))
+        swaps = p.select(MASK)
         self.assertEqual((swaps[0].promote, swaps[0].demote), (4, 3))
 
-    def test_hysteresis_blocks_marginal_swap(self):
-        # demand 60 vs incumbent hits 50: a real but small edge. At the
-        # default 2x dead band this must NOT swap -- the transfer would cost
-        # more than the gain and invite a swap back next interval.
+    def test_hysteresis_blocks_a_marginal_swap(self):
         p = self._policy(hysteresis=2.0)
-        p.observe(_cum({}), _cum({}))
-        p.observe(_cum({4: 60}), _cum({0: 50, 1: 50, 2: 50, 3: 50}))
-        self.assertEqual(p.select(self.MASK), [])
+        _window(p, {0: 5.0, 1: 5.0, 2: 5.0, 3: 5.0, 4: 6.0}, dict.fromkeys(range(5), 10))
+        self.assertEqual(p.select(MASK), [])
 
     def test_budget_caps_swaps_per_evaluation(self):
         p = self._policy(max_swaps=2)
-        p.observe(_cum({}), _cum({}))
-        p.observe(_cum({4: 90, 5: 80, 6: 70, 7: 60}), _cum({}))
-        self.assertEqual(len(p.select(self.MASK)), 2)
+        _window(p, {4: 9.0, 5: 8.0, 6: 7.0, 7: 6.0}, dict.fromkeys([4, 5, 6, 7], 10))
+        self.assertEqual(len(p.select(MASK)), 2)
 
     def test_pairs_are_disjoint(self):
         p = self._policy(max_swaps=4)
-        p.observe(_cum({}), _cum({}))
-        p.observe(_cum({4: 90, 5: 80}), _cum({}))
-        swaps = p.select(self.MASK)
+        _window(p, {4: 9.0, 5: 8.0}, {4: 10, 5: 10})
+        swaps = p.select(MASK)
         self.assertEqual(len({s.promote for s in swaps}), len(swaps))
         self.assertEqual(len({s.demote for s in swaps}), len(swaps))
 
     def test_ties_break_by_ascending_expert_id(self):
-        """Derived property: with every demand equal and every hit equal, the
-        pairing is decided purely by the tie-break, and it must be ascending
-        expert id on BOTH sides -- lowest-id cold expert to lowest-id resident.
-
-        This is not cosmetic. Every TP rank runs this selection independently
-        on its own copy of the counters and they must reach the same pairs, or
-        the ranks' placements diverge and each computes a different model,
-        silently. The python implementation got this from sort() being stable;
-        a whole-tensor rewrite gets it only from an explicitly stable argsort,
-        and nothing else in this file would notice if it were dropped."""
+        # Every rank runs this independently; if equal scores did not resolve
+        # the same way everywhere the placements would silently diverge.
         p = self._policy(max_swaps=4)
-        p.observe(_cum({}), _cum({}))
-        # all four cold experts equally in demand, all four residents equally
-        # unused: only the tie-break can order this.
-        p.observe(_cum({4: 10, 5: 10, 6: 10, 7: 10}), _cum({}))
-        swaps = p.select(self.MASK)
-        self.assertEqual(
-            [(s.promote, s.demote) for s in swaps], [(4, 0), (5, 1), (6, 2), (7, 3)]
-        )
+        _window(p, {4: 9.0, 5: 9.0, 6: 9.0, 7: 9.0}, dict.fromkeys([4, 5, 6, 7], 10))
+        self.assertEqual([s.promote for s in p.select(MASK)], [4, 5, 6, 7])
 
-    def test_min_demand_floor_rejects_noise(self):
-        p = self._policy(min_demand=10.0)
-        p.observe(_cum({}), _cum({}))
-        p.observe(_cum({4: 3}), _cum({}))
-        self.assertEqual(p.select(self.MASK), [])
+    def test_an_unmeasured_non_resident_is_never_promoted(self):
+        # No evidence is not the same as a low score.
+        p = self._policy(min_evidence=1.0)
+        _window(p, {0: 1.0}, {0: 10})
+        self.assertEqual(p.select(MASK), [])
+
+    def test_an_unmeasured_resident_is_the_first_demoted(self):
+        # Zero score in the demote direction is correct: an expert nothing has
+        # routed to is the safest row to take.
+        p = self._policy()
+        _window(p, {0: 9.0, 1: 9.0, 2: 9.0, 4: 50.0}, {0: 10, 1: 10, 2: 10, 4: 10})
+        swaps = p.select(MASK)
+        self.assertEqual(swaps[0].demote, 3)
 
 
-class TestCounterDeltaSemantics(CustomTestCase):
-    """Derived property: cumulative counters must be differenced, and the
-    first observation is a baseline only. Red if a refactor feeds raw
-    cumulative values into the EMA — the resident set would then be pinned to
-    whatever the traffic looked like shortly after launch."""
+class TestWindowSemantics(CustomTestCase):
+    """Derived property: windows combine as a POOLED mean -- sum and count
+    decayed together -- not as an average of per-window means. Red if the
+    count is dropped anywhere, which would let a one-activation window move a
+    score as far as a five-thousand-activation one."""
 
-    MASK = torch.tensor([True] * 4 + [False] * 4)
+    def test_windows_are_weighted_by_their_activation_count(self):
+        p = ExpertSwapPolicy(8, ema_alpha=0.5)
+        _window(p, {4: 100.0}, {4: 1})     # one sample, huge
+        _window(p, {4: 1.0}, {4: 100})     # a hundred samples, small
+        # Pooled: (0.5*100 + 100) / (0.5*1 + 100) = 150 / 100.5
+        self.assertAlmostEqual(p.score[4].item(), 150.0 / 100.5, places=6)
+        # An average of the two window means would be ~50.5.
+        self.assertLess(p.score[4].item(), 5.0)
 
-    def test_first_observation_is_baseline_only(self):
-        p = ExpertSwapPolicy(8, ema_alpha=1.0, min_demand=1.0)
-        p.observe(_cum({4: 10_000}), _cum({}))  # whole history, must not count
-        self.assertEqual(p.select(self.MASK), [])
+    def test_a_window_is_a_delta_not_a_running_total(self):
+        # The device accumulators are zeroed after every snapshot, so there is
+        # no baseline to subtract and no first-call special case.
+        p = ExpertSwapPolicy(8, ema_alpha=1.0)
+        _window(p, {4: 7.0}, {4: 3})
+        self.assertAlmostEqual(p.score[4].item(), 7.0)
 
-    def test_only_the_delta_counts(self):
-        p = ExpertSwapPolicy(8, ema_alpha=1.0, min_demand=1.0)
-        p.observe(_cum({4: 1000, 5: 0}), _cum({}))
-        # Since the baseline, expert 5 saw 40 and expert 4 only 5: 5 must win
-        # despite 4's far larger lifetime total.
-        p.observe(_cum({4: 1005, 5: 40}), _cum({}))
-        swaps = p.select(self.MASK)
-        self.assertEqual(swaps[0].promote, 5)
+    def test_an_unmeasured_expert_keeps_its_score(self):
+        p = ExpertSwapPolicy(8, ema_alpha=0.5)
+        _window(p, {4: 20.0}, {4: 10})
+        _window(p, {}, {})  # nothing routed to it this window
+        self.assertAlmostEqual(p.score[4].item(), 20.0)
 
-    def test_counter_reset_does_not_produce_negative_delta(self):
-        p = ExpertSwapPolicy(8, ema_alpha=1.0, min_demand=1.0)
-        p.observe(_cum({4: 500}), _cum({}))
-        p.observe(_cum({4: 7}), _cum({}))  # counters restarted
-        self.assertGreaterEqual(p.demand_ema[4].item(), 0.0)
+    def test_negative_counts_are_refused(self):
+        p = ExpertSwapPolicy(8)
+        with self.assertRaises(ValueError):
+            p.observe(_vec({}), _vec({0: -1}))
+
+    def test_shape_mismatch_is_refused(self):
+        p = ExpertSwapPolicy(8)
+        with self.assertRaises(ValueError):
+            p.observe(_vec({}, n=4), _vec({}, n=4))
 
 
 class TestPostSwapHygiene(CustomTestCase):
-    """Completeness contract: after a swap the two experts' histories describe
-    a world that no longer exists. Red if note_swapped stops clearing them —
-    the pair would qualify to swap straight back on the next evaluation."""
+    """Completeness contract: a swapped pair must not trade straight back.
+    REAP needs no history reset to get this -- the score is a property of the
+    expert, not of where it lives -- so this guards that the mask flip alone
+    is sufficient. Red if select() ever ranks a demotion by something that
+    inverts when an expert changes side."""
 
-    MASK = torch.tensor([True] * 4 + [False] * 4)
-
-    def test_swapped_pair_history_is_cleared(self):
-        p = ExpertSwapPolicy(8, ema_alpha=1.0, min_demand=1.0)
-        p.observe(_cum({}), _cum({}))
-        p.observe(_cum({4: 100}), _cum({3: 0}))
-        swaps = p.select(self.MASK)
-        p.note_swapped(swaps)
-        self.assertEqual(p.demand_ema[4].item(), 0.0)
-        self.assertEqual(p.hits_ema[3].item(), 0.0)
-        # With membership now flipped, nothing should qualify immediately.
-        flipped = self.MASK.clone()
+    def test_swapped_pair_does_not_immediately_trade_back(self):
+        p = ExpertSwapPolicy(8, ema_alpha=1.0, min_evidence=1.0)
+        _window(p, {0: 9.0, 1: 9.0, 2: 9.0, 3: 0.1, 4: 90.0},
+                dict.fromkeys([0, 1, 2, 3, 4], 10))
+        swaps = p.select(MASK)
+        self.assertEqual((swaps[0].promote, swaps[0].demote), (4, 3))
+        flipped = MASK.clone()
         flipped[4], flipped[3] = True, False
         self.assertEqual(p.select(flipped), [])
 
 
 class TestStateRoundTrip(CustomTestCase):
     """Critical-path bookkeeping: the persisted state is the next launch's
-    seed. Red if a field is added to the EMA set without being serialised, or
-    if a mismatched expert count is silently accepted."""
+    seed. Red if a field is added to the score set without being serialised,
+    or if a mismatched expert count is silently accepted."""
 
     def test_round_trip_preserves_decisions(self):
-        p = ExpertSwapPolicy(8, ema_alpha=1.0, min_demand=1.0)
-        p.observe(_cum({}), _cum({}))
-        p.observe(_cum({4: 100, 5: 50}), _cum({0: 5}))
-        before = p.select(torch.tensor([True] * 4 + [False] * 4))
+        p = ExpertSwapPolicy(8, ema_alpha=1.0, min_evidence=1.0)
+        _window(p, {0: 2.0, 4: 90.0, 5: 50.0}, {0: 10, 4: 10, 5: 10})
+        before = p.select(MASK)
 
-        q = ExpertSwapPolicy(8, ema_alpha=1.0, min_demand=1.0)
+        q = ExpertSwapPolicy(8, ema_alpha=1.0, min_evidence=1.0)
         q.load_state_dict(p.state_dict())
-        after = q.select(torch.tensor([True] * 4 + [False] * 4))
         self.assertEqual(
             [(s.promote, s.demote) for s in before],
-            [(s.promote, s.demote) for s in after],
+            [(s.promote, s.demote) for s in q.select(MASK)],
         )
+        # Both halves of the mean, not just the ranking they happened to imply.
+        self.assertAlmostEqual(q.score[4].item(), 90.0)
+        self.assertAlmostEqual(q.reap_count[4].item(), 10.0)
 
     def test_expert_count_mismatch_raises(self):
         p = ExpertSwapPolicy(8)
@@ -396,12 +407,13 @@ class TestSwapWindow(CustomTestCase):
     def _entry(self, policy=None):
         from sglang.srt.layers.moe.kt_expert_swap import ExpertSwapPolicy
 
-        p = policy or ExpertSwapPolicy(8, ema_alpha=1.0, min_demand=1.0, max_swaps=2)
-        p.observe(_cum({}), _cum({}))
+        p = policy or ExpertSwapPolicy(
+            8, ema_alpha=1.0, min_evidence=1.0, max_swaps=2
+        )
         # Expert 2 must be the unambiguous demotion victim: give every other
-        # resident real traffic, so the choice does not depend on tie-break
-        # order among equally-unused experts.
-        p.observe(_cum({6: 100}), _cum({0: 50, 1: 40, 3: 30}))
+        # resident a real score, so the choice does not depend on tie-break
+        # order among equally-unmeasured experts.
+        _window(p, {0: 9.0, 1: 8.0, 3: 7.0, 6: 90.0}, dict.fromkeys([0, 1, 3, 6], 10))
         return {
             "policy": p,
             "tables": _tables(),

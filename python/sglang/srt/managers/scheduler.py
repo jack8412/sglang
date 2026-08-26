@@ -3556,10 +3556,16 @@ class Scheduler(
             return
         from sglang.srt.layers.moe.kt_ep_wrapper import (
             maybe_run_expert_swap_at_decode_boundary,
+            reap_note_batch,
         )
 
+        is_decode = batch.forward_mode.is_decode()
+        # Before the swap window, so a window folds in everything measured up
+        # to it. This runs before the batch's own forward is enqueued, which is
+        # what lets it read the previous step's staged output.
+        reap_note_batch(is_decode=is_decode, num_requests=batch.batch_size())
         maybe_run_expert_swap_at_decode_boundary(
-            is_decode=batch.forward_mode.is_decode(),
+            is_decode=is_decode,
             is_extend=batch.forward_mode.is_extend(),
         )
 

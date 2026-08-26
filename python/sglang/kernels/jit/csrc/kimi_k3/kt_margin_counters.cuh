@@ -31,27 +31,21 @@ namespace {
 
 constexpr int kMarginCounterThreads = 128;
 
-/// \brief Fold one forward's routed slots into the three per-expert counters.
+/// \brief Fold one forward's routed slots into the two margin counters.
 ///
 /// \param insist_count    [E] int32, accumulated in place
 /// \param override_count  [E] int32, accumulated in place
-/// \param resident_count  [E] int32, accumulated in place
 /// \param topk_ids        [n_slots] int32 or int64, ORIGINAL router ids
 ///                        (pre-override). Both, because the router emits int32
 ///                        and only scatter_add_'s index requirement forced the
 ///                        torch form to widen it.
-/// \param served_ids      [n_slots] same dtype, ids AFTER substitution -- what
-///                        actually computed the slot. Equal to topk_ids
-///                        wherever nothing was overridden.
 /// \param insist          [n_slots] uint8, slot kept its CPU-resident expert
 /// \param overridden      [n_slots] uint8, slot was substituted
 template <typename IdT>
 __global__ void kt_margin_counters_kernel(
     int32_t* __restrict__ insist_count,
     int32_t* __restrict__ override_count,
-    int32_t* __restrict__ resident_count,
     const IdT* __restrict__ topk_ids,
-    const IdT* __restrict__ served_ids,
     const uint8_t* __restrict__ insist,
     const uint8_t* __restrict__ overridden,
     uint32_t n_slots,
@@ -59,7 +53,6 @@ __global__ void kt_margin_counters_kernel(
   const uint32_t stride = gridDim.x * blockDim.x;
   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_slots; i += stride) {
     int64_t e = static_cast<int64_t>(topk_ids[i]);
-    const bool routed = e >= 0;
     // clamp_min(0), matching the torch form exactly -- INCLUDING its latent
     // bug. That form clamped the INDEX to 0 but applied the routed mask only
     // to the resident counter, so a masked (-1) slot credits expert 0 in
@@ -67,7 +60,7 @@ __global__ void kt_margin_counters_kernel(
     // demand and could promote the wrong expert, but fixing it here would
     // smuggle a behaviour change into a performance change; the point of this
     // kernel is to be provably inert. Filed separately.
-    if (!routed) e = 0;
+    if (e < 0) e = 0;
     // Out of range would have faulted the torch scatter_add_. Refuse rather
     // than corrupt a neighbouring counter.
     if (static_cast<uint64_t>(e) >= n_experts) continue;
@@ -82,31 +75,13 @@ __global__ void kt_margin_counters_kernel(
     // both of these index by the original id.
     if (ins) atomicAdd(&insist_count[e], 1);
     if (ovr) atomicAdd(&override_count[e], 1);
-    // RESIDENT HITS are attributed to the expert that actually SERVED the
-    // slot, which is the substitute wherever one was installed. Indexing this
-    // by the original id credited nobody for overridden traffic, so a resident
-    // expert doing well as a stand-in looked idle -- and idle is exactly what
-    // ranks a demotion victim. Margin routing therefore nominated its own best
-    // stand-ins for demotion, harder the higher the margin.
-    //
-    // `!ins` rather than `!ins && !ovr`: an overridden slot IS served by a
-    // resident expert, just not the one the router named. Wherever nothing was
-    // overridden served_ids equals topk_ids, so the old numbers are reproduced
-    // exactly.
-    if (routed && !ins) {
-      int64_t es = static_cast<int64_t>(served_ids[i]);
-      if (es >= 0 && static_cast<uint64_t>(es) < n_experts) {
-        atomicAdd(&resident_count[es], 1);
-      }
-    }
   }
 }
 
 template <typename IdT>
 struct KtMarginCounters {
   static void run(tvm::ffi::TensorView insist_count, tvm::ffi::TensorView override_count,
-                  tvm::ffi::TensorView resident_count, tvm::ffi::TensorView topk_ids,
-                  tvm::ffi::TensorView served_ids, tvm::ffi::TensorView insist,
+                  tvm::ffi::TensorView topk_ids, tvm::ffi::TensorView insist,
                   tvm::ffi::TensorView overridden) {
     using namespace host;
 
@@ -118,11 +93,10 @@ struct KtMarginCounters {
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(insist_count)
-        .verify(override_count)
-        .verify(resident_count);
+        .verify(override_count);
 
     SymbolicSize NS = {"num_slots"};
-    TensorMatcher({NS}).with_dtype<IdT>().with_device(device_).verify(topk_ids).verify(served_ids);
+    TensorMatcher({NS}).with_dtype<IdT>().with_device(device_).verify(topk_ids);
     // uint8 rather than bool: the matcher maps C++ bool to uint8 while torch
     // reports dtype bool, so the caller passes a free .view(torch.uint8).
     TensorMatcher({NS}).with_dtype<uint8_t>().with_device(device_).verify(insist).verify(overridden);
@@ -138,9 +112,7 @@ struct KtMarginCounters {
         kt_margin_counters_kernel<IdT>,
         static_cast<int32_t*>(insist_count.data_ptr()),
         static_cast<int32_t*>(override_count.data_ptr()),
-        static_cast<int32_t*>(resident_count.data_ptr()),
         static_cast<const IdT*>(topk_ids.data_ptr()),
-        static_cast<const IdT*>(served_ids.data_ptr()),
         static_cast<const uint8_t*>(insist.data_ptr()),
         static_cast<const uint8_t*>(overridden.data_ptr()),
         n_slots,

@@ -463,6 +463,264 @@ def generate_random_masks(
     return masks
 
 
+class _ReapStage:
+    """One decode step's REAP measurement, staged across layers.
+
+    ``||f||`` does not decompose across TP ranks: each holds a slice of the
+    INTERMEDIATE axis, so a rank only ever sees a partial ``f`` and squaring it
+    there drops the cross terms. Squares add only across DISJOINT COORDINATES.
+    So every layer parks its partial vectors here and one reduce-scatter turns
+    the contraction split into a coordinate split: each rank comes back holding
+    a subset of ROWS at full width, already summed, and can norm them exactly.
+
+    One collective for the whole step, not one per layer -- at these sizes a
+    collective is latency-bound, so 92 small ones cost several times what one
+    large one does.
+
+    Sized and allocated at init. Allocating on first use would take the buffers
+    from the CUDA graph's private pool, because the first decode-shaped forward
+    is the capture itself.
+    """
+
+    def __init__(
+        self, *, num_layers, num_experts, top_k, hidden, max_tokens, width, device
+    ):
+        self.num_layers = num_layers
+        # Tokens a captured decode graph runs per request: 1, or the verify
+        # width when a draft is in play.
+        self.token_width = width
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden = hidden
+        self.max_tokens = max_tokens
+
+        # max_tokens leads so that vec[:T] is contiguous, which reduce_scatter
+        # requires. Layers write a strided [T, top_k, H] slice into it.
+        shape = (max_tokens, num_layers, top_k)
+        self.vec = torch.zeros(*shape, hidden, dtype=torch.bfloat16, device=device)
+        self.ids = torch.zeros(*shape, dtype=torch.int64, device=device)
+        self.weights = torch.zeros(*shape, dtype=torch.float32, device=device)
+        self.valid = torch.zeros(*shape, dtype=torch.bool, device=device)
+
+        n = max_tokens * num_layers * top_k
+        world = get_tp_group().world_size
+        self._rs = torch.zeros(n // world, hidden, dtype=torch.bfloat16, device=device)
+        self._norms = torch.zeros(n, dtype=torch.float32, device=device)
+
+        self.num = torch.zeros(num_layers, num_experts, dtype=torch.float32, device=device)
+        self.count = torch.zeros(num_layers, num_experts, dtype=torch.int32, device=device)
+        # kt's half. Written on rank 0 only -- kt lives there -- and broadcast
+        # once per window, so the per-step path carries no extra collective.
+        self.kt_num = torch.zeros_like(self.num)
+        self.kt_count = torch.zeros_like(self.count)
+        # kt writes one norm per (layer, token, slot) it computed, and zero for
+        # the slots it does not own. Pinned so the per-step copy is a DMA.
+        kt_norms = torch.zeros(num_layers, max_tokens, top_k, dtype=torch.float32)
+        # Pinned so kt's writes reach the device as a DMA. Not available
+        # without CUDA, which is only the case under test.
+        self.kt_norms = kt_norms.pin_memory() if torch.cuda.is_available() else kt_norms
+        self._row_offset = (
+            torch.arange(num_layers, device=device, dtype=torch.int64) * num_experts
+        ).view(1, num_layers, 1)
+
+    def stage(self, *, layer_idx, gemm2_out, permuted_idx, weights, served_ids):
+        """Park one layer's per-expert outputs. Runs inside the decode graph."""
+        tokens = served_ids.shape[0]
+        if tokens > self.max_tokens or layer_idx >= self.num_layers:
+            return
+        idx = permuted_idx.reshape(tokens, self.top_k).to(torch.int64)
+        # A slot this launch did not compute -- a CPU expert, masked to -1
+        # before dispatch -- has no row to read. Read row 0 and zero it, rather
+        # than branching on it: the shapes must stay static under capture.
+        valid = idx >= 0
+        rows = gemm2_out[torch.where(valid, idx, 0)]
+        self.vec[:tokens, layer_idx] = torch.where(valid.unsqueeze(-1), rows, 0)
+        # Unconditionally, including the slots this launch did not compute:
+        # those are exactly the ones kt served, and the fold below needs their
+        # real expert id. `valid` is what keeps them out of the GPU's half.
+        self.ids[:tokens, layer_idx] = served_ids.to(torch.int64).clamp_min(0)
+        self.weights[:tokens, layer_idx] = weights.reshape(tokens, self.top_k).float()
+        self.valid[:tokens, layer_idx] = valid
+
+    def combine(self, real_tokens: int) -> None:
+        """Reduce, norm and accumulate one decode step. Runs OUTSIDE the graph.
+
+        ``real_tokens`` is the batch's true size, not the padded one a captured
+        replay ran at. Padding rows carry the previous replay's ids, and
+        counting them would corrupt the very denominator REAP exists for.
+        """
+        tokens = min(int(real_tokens), self.max_tokens)
+        if tokens <= 0:
+            return
+        flat = self.vec[:tokens].reshape(-1, self.hidden)
+        world = get_tp_group().world_size
+        n = flat.shape[0]
+        if world > 1:
+            out = self._rs[: n // world]
+            dist.reduce_scatter_tensor(out, flat, group=get_tp_group().device_group)
+            # Each rank now owns whole ROWS of the true sum, so the norm it
+            # takes is the real ||f||, not a partial.
+            local = out.float().pow(2).sum(-1).sqrt()
+            norms = self._norms[:n]
+            dist.all_gather_into_tensor(norms, local, group=get_tp_group().device_group)
+        else:
+            norms = flat.float().pow(2).sum(-1).sqrt()
+
+        norms = norms.view(tokens, self.num_layers, self.top_k)
+        valid = self.valid[:tokens]
+        contrib = torch.where(valid, self.weights[:tokens] * norms, 0.0)
+        index = (self.ids[:tokens] + self._row_offset).reshape(-1)
+        self.num.view(-1).scatter_add_(0, index, contrib.reshape(-1))
+        self.count.view(-1).scatter_add_(0, index, valid.reshape(-1).to(torch.int32))
+        self._combine_kt(tokens, index, valid)
+
+    def _combine_kt(self, tokens: int, index: torch.Tensor, gpu_valid: torch.Tensor) -> None:
+        """Fold the experts kt served into rank 0's half.
+
+        The GPU cannot see these: a non-resident expert -- every promotion
+        candidate -- never runs there. kt reports the norm of the summed vector
+        per (token, slot); the weight and the id are the ones already staged,
+        so the two halves are the same statistic by construction.
+        """
+        if get_tp_group().rank_in_group != 0:
+            return
+        kt = self.kt_norms[:, :tokens].to(self.num.device, non_blocking=True)
+        # [L, T, k] as kt writes it, [T, L, k] as everything else is laid out.
+        kt = kt.permute(1, 0, 2)
+        # A slot the GPU served is not kt's, and a slot kt skipped reads 0.
+        served = (~gpu_valid) & (kt > 0.0)
+        contrib = torch.where(served, self.weights[:tokens] * kt, 0.0)
+        self.kt_num.view(-1).scatter_add_(0, index, contrib.reshape(-1))
+        self.kt_count.view(-1).scatter_add_(0, index, served.reshape(-1).to(torch.int32))
+
+    def take_window(self):
+        """This window's totals, and reset. Zeroing is what keeps the
+        accumulators from growing until a float add stops landing."""
+        num = self.num.to(torch.float64) + self.kt_num.to(torch.float64)
+        count = self.count.to(torch.float64) + self.kt_count.to(torch.float64)
+        self.num.zero_()
+        self.count.zero_()
+        self.kt_num.zero_()
+        self.kt_count.zero_()
+        return num, count
+
+
+def reap_note_batch(is_decode: bool, num_requests: int) -> None:
+    """Combine the PREVIOUS decode step, then remember this one.
+
+    Called at the top of run_batch, before this batch's forward is enqueued, so
+    the staging buffers still hold the previous forward's output. A prefill in
+    between simply overwrites staging that is never read: only decode is
+    measured, because split prefill runs every expert and so says nothing about
+    which ones decode will need resident.
+    """
+    stage = reap_stage()
+    if stage is None:
+        return
+    pending = _KT_REAP_PENDING.get("tokens", 0)
+    if pending:
+        reap_combine_decode_step(pending)
+    _KT_REAP_PENDING["tokens"] = (
+        num_requests * stage.token_width if is_decode else 0
+    )
+
+
+def reap_combine_decode_step(real_tokens: int) -> None:
+    """Fold one decode step's staged measurement in. Called by the scheduler.
+
+    Outside the captured graph on purpose. A replay runs no Python, so this is
+    the only place a collective can be issued per step without being recorded
+    into the graph -- and raw torch.distributed collectives are not
+    capture-safe anyway (see pynccl_wrapper).
+
+    ``real_tokens`` is the batch's true size. A captured replay pads up to its
+    capture size and sglang deliberately leaves the padded tail of input_ids
+    unzeroed, so those rows carry the previous replay's tokens and produce real
+    routing. Counting them would corrupt the denominator REAP exists for.
+    """
+    stage = reap_stage()
+    if stage is not None:
+        stage.combine(real_tokens)
+
+
+_KT_REAP_PENDING: Dict[str, int] = {}
+
+
+def _take_reap_window(stage: Optional["_ReapStage"]):
+    """This window's totals per layer, agreed by every rank.
+
+    Returns CPU tensors, or None when nothing is being measured.
+    """
+    if stage is None:
+        return None
+    num, count = stage.take_window()
+    group = get_tp_group()
+    if group.world_size > 1:
+        # kt's contribution exists on rank 0 alone, and ranks that disagreed on
+        # the scores would build different swap plans and let the placements
+        # diverge. One broadcast per window, not per step.
+        dist.broadcast(num, src=group.first_rank, group=group.device_group)
+        dist.broadcast(count, src=group.first_rank, group=group.device_group)
+    return num.cpu(), count.cpu()
+
+
+def reap_stage() -> Optional["_ReapStage"]:
+    """The process-wide REAP stage, or None when placement is not adaptive."""
+    return get_buffer("kt_reap_stage", dict).get("stage")
+
+
+def _init_reap_stage(server_args: "ServerArgs", hf_config, num_layers: int) -> None:
+    """Allocate the REAP stage once, at init, before any graph capture.
+
+    Every input is read from ServerArgs and the model config, which are
+    identical on every rank. Nothing here may consult a rank-0-only object such
+    as the kt wrapper: a stage that exists on one rank only would leave its
+    collective unmatched and hang the others.
+    """
+    holder = get_buffer("kt_reap_stage", dict)
+    if "stage" in holder:
+        return
+    holder["stage"] = None
+    if server_args.expert_swap_transitions <= 0:
+        return
+
+    hidden = getattr(hf_config, "routed_expert_hidden_size", None)
+    top_k = getattr(hf_config, "num_experts_per_token", None)
+    num_experts = (
+        getattr(hf_config, "n_routed_experts", None)
+        or getattr(hf_config, "num_local_experts", None)
+        or getattr(hf_config, "num_experts", None)
+    )
+    if not hidden or not top_k or not num_experts:
+        logger.warning("[kt-reap] model config lacks the expert geometry; scoring off")
+        return
+
+    decode_bs = server_args.cuda_graph_config.decode.bs
+    # A captured decode graph runs one token per request only without
+    # speculation; with a draft it runs the whole verify width, and a stage
+    # sized for the batch alone would silently refuse every forward.
+    width = getattr(server_args, "speculative_num_draft_tokens", None) or 1
+    max_tokens = max(decode_bs) * width if decode_bs else 0
+    if max_tokens <= 0:
+        logger.warning("[kt-reap] no decode capture sizes; scoring off")
+        return
+
+    holder["stage"] = _ReapStage(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden=hidden,
+        max_tokens=max_tokens,
+        width=width,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    logger.info(
+        "[kt-reap] scoring armed: %d layers x %d experts, top_k %d, hidden %d, "
+        "max decode batch %d",
+        num_layers, num_experts, top_k, hidden, max_tokens,
+    )
+
+
 def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]:
     """Initialize GPU experts masks from activation frequency data.
 
@@ -769,6 +1027,8 @@ def create_kt_config_from_server_args(
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
+    if num_layers is not None:
+        _init_reap_stage(server_args, hf_config, num_layers)
 
     # NOTE: hash-layer skip experiment was tried here (return None when
     # layer_idx < num_hash_layers); it didn't help because the underlying
@@ -1175,6 +1435,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
     # Warn once per process, not once per layer per step.
     _kt_counter_fallback_warned: bool = False
+    _reap_seam_warned: bool = False
     # Keyed by CAUSE, not a single bool, and per-process rather than per-layer.
     # A bool is burned by the first emission -- which under decode-graph capture
     # happens before any request exists -- and then every real request is
@@ -1243,7 +1504,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # which is the same order.
         self.correction_bias: Optional[torch.Tensor] = None
         self._full_override = kt_config.routing_full_override
-        self._resident_hit_count: Optional[torch.Tensor] = None
         # Armed in create_weights once num_gpu_experts and top_k are known.
         self._skip_cpu_path = False
         # Split-slice full-expert prefill.  Armed in create_weights once the
@@ -1454,9 +1714,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self._margin_override_count = torch.zeros(
                 num_experts, dtype=torch.int32, device=target_device
             )
-            self._resident_hit_count = torch.zeros(
-                num_experts, dtype=torch.int32, device=target_device
-            )
 
         # Full override computes no CPU expert at all, so none of the CPU-side
         # machinery below is ever used: not the stream, not the staging buffer,
@@ -1569,6 +1826,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 max_deferred_experts_per_token=layer_max_deferred,
                 **_kt_situ_kwargs,
             )
+            self._bind_reap_norms_buffer()
             if layer_max_deferred > 0:
                 # The wheel's default deferral selector is placement-blind:
                 # it defers the token's lowest-score experts, most of which
@@ -2215,14 +2473,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 type(self.gpu_method).__name__,
             )
         if self.num_gpu_experts == 0:
-            gpu_combine_input = None
             output = torch.zeros_like(x)
         else:
             with _scoped_layer_num_local_experts(layer, self.num_gpu_experts):
-                gpu_combine_input = self.gpu_method.apply(
-                    layer, masked_dispatch_output
+                output = self._apply_gpu_experts(
+                    layer, masked_dispatch_output, topk_output
                 )
-            output = gpu_combine_input.hidden_states
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         if self.tp_rank == 0 and self._cpu_stream is not None and not self._skip_cpu_path:
@@ -2251,6 +2507,78 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if cpu_output is not None:
                 output = output + cpu_output
         return StandardCombineInput(hidden_states=output)
+
+    def _bind_reap_norms_buffer(self) -> None:
+        """Hand kt this layer's row of the REAP norms buffer, once.
+
+        kt writes into it every forward and never allocates or accumulates:
+        the weights and ids that turn a norm into a score live on this side,
+        and so does the knowledge of which rows of a padded decode batch are
+        real. See SPEC-REAP-PLACEMENT.md.
+        """
+        stage = reap_stage()
+        if stage is None or self.wrapper is None:
+            return
+        layer_idx = self.kt_config.layer_idx
+        if layer_idx >= stage.num_layers:
+            return
+        row = stage.kt_norms[layer_idx]
+        if not hasattr(self.wrapper, "set_reap_norms_buffer"):
+            raise RuntimeError(
+                "this kt build has no set_reap_norms_buffer; expert swapping "
+                "cannot score the experts kt serves, so promotion would never "
+                "fire. Rebuild kt-kernel, or run with "
+                "--kt-expert-swap-transitions 0"
+            )
+        self.wrapper.set_reap_norms_buffer(
+            row.data_ptr(), row.shape[0], row.shape[1]
+        )
+
+    def _apply_gpu_experts(self, layer, masked_dispatch_output, topk_output):
+        """Run the GPU experts, parking their per-expert outputs on the way.
+
+        Finalize sums every expert's contribution into one row per token, so
+        the deferred seam is the only point at which an expert's output is
+        still separable from the mixture it lands in.
+        """
+        stage = reap_stage()
+        if stage is None:
+            return self.gpu_method.apply(layer, masked_dispatch_output).hidden_states
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmDeferredFinalizeOutput,
+            finalize_flashinfer_trtllm_deferred_output,
+            flashinfer_trtllm_deferred_finalize_context,
+        )
+
+        with flashinfer_trtllm_deferred_finalize_context():
+            deferred = self.gpu_method.apply(
+                layer, masked_dispatch_output
+            ).hidden_states
+        if not isinstance(deferred, FlashInferTrtllmDeferredFinalizeOutput):
+            # Only the mxfp4 SiTU path honours the context under the standard
+            # (unpacked) routing this wrapper must produce. Everywhere else the
+            # scores would stay zero for the life of the process, which reads
+            # exactly like "measured, and every expert scored nothing" -- so
+            # say so once instead of leaving it to be discovered.
+            if not self._reap_seam_warned:
+                type(self)._reap_seam_warned = True
+                logger.warning(
+                    "[kt-reap] %s finalizes internally, so per-expert outputs "
+                    "are not observable and placement cannot adapt; expert "
+                    "swapping will hold its startup cut",
+                    type(self.gpu_method).__name__,
+                )
+            return deferred
+
+        stage.stage(
+            layer_idx=self.kt_config.layer_idx,
+            gemm2_out=deferred.gemm2_out,
+            permuted_idx=deferred.expanded_idx_to_permuted_idx,
+            weights=deferred.expert_weights,
+            served_ids=topk_output.topk_ids,
+        )
+        return finalize_flashinfer_trtllm_deferred_output(deferred, None)
 
     def _kt_doorbell_slot(self, staging_buffer, dispatch_output) -> Optional[int]:
         """This layer's doorbell slot for the batch size in flight, or None.
@@ -2414,14 +2742,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         block) and margin-unset serving. Demand is defined directly:
 
             demand = routed & ~gpu_experts_mask[topk_ids]
-            hits   = routed &  gpu_experts_mask[topk_ids]
 
         which is the same quantity ``_update_margin_counters`` produces as
         insist + override -- margin only partitions it. Everything lands in the
-        insist counter because nothing was substituted; ``snapshot_counters``
-        sums the pair, so the policy sees an identical figure either way. The
-        served-vs-original distinction that function makes for resident hits
-        does not arise here either: with no substitution the two ids coincide.
+        insist counter because nothing was substituted.
 
         Counts on the ids the ROUTER chose. Under split prefill that is also
         the id actually computed (all 896 are), so there is no pre/post
@@ -2438,9 +2762,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         resident = self.gpu_experts_mask_cuda[safe_ids]
         self._margin_insist_count.scatter_add_(
             0, safe_ids, (routed & ~resident).to(torch.int32)
-        )
-        self._resident_hit_count.scatter_add_(
-            0, safe_ids, (routed & resident).to(torch.int32)
         )
 
     def _update_margin_counters(
@@ -2462,13 +2783,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         from sglang.kernels.ops.kimi_k3 import kt_margin_counters as ktmc
 
-        if ktmc.covered(topk_ids, served_ids, insist_slots, override_slots):
+        if ktmc.covered(topk_ids, insist_slots, override_slots):
             ktmc.kt_margin_counters(
                 self._margin_insist_count,
                 self._margin_override_count,
-                self._resident_hit_count,
                 topk_ids,
-                served_ids,
                 insist_slots,
                 override_slots,
             )
@@ -2485,9 +2804,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logger.warning(
                 "[kt-margin] fused demand counters unavailable (%s); using the "
                 "torch fallback. Numbers are identical; decode is ~10%% slower.",
-                ktmc.why_not_covered(
-                    topk_ids, served_ids, insist_slots, override_slots
-                ),
+                ktmc.why_not_covered(topk_ids, insist_slots, override_slots),
             )
         # Fallback for shapes/dtypes the kernel does not claim. Kept because
         # the counters feed a serving decision: silently not counting would
@@ -2499,16 +2816,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
         self._margin_override_count.scatter_add_(
             0, _orig_safe_ids, override_slots.reshape(-1).to(torch.int32)
-        )
-        # RESIDENT HITS on the SERVED id, and `~insist` rather than
-        # `~(insist | override)`: an overridden slot is served by a resident
-        # expert too, just not the one the router named. Wherever nothing was
-        # overridden served_ids equals topk_ids, so this reproduces the old
-        # numbers exactly.
-        _served_safe_ids = served_ids.clamp_min(0).reshape(-1).to(torch.int64)
-        _resident_slots = (topk_ids >= 0) & ~insist_slots
-        self._resident_hit_count.scatter_add_(
-            0, _served_safe_ids, _resident_slots.reshape(-1).to(torch.int32)
         )
 
     def _kt_doorbell_output(self, staging_buffer) -> torch.Tensor:
@@ -2795,6 +3102,12 @@ def maybe_run_expert_swap_window(
     # baseline is what the interval//5 sampling exists to prevent.
     act = act if act is not None else (n % cfg.expert_swap_transitions) == 0
 
+    # One take for the whole window, before the per-layer loop: the
+    # accumulators are shared across layers and taking them per layer would
+    # zero the rows the later layers still need.
+    stage = reap_stage()
+    window = _take_reap_window(stage)
+
     entries = []
     for method in _KT_EP_METHODS:
         if method.gpu_experts_mask_cuda is None or method._margin_insist_count is None:
@@ -2805,11 +3118,11 @@ def maybe_run_expert_swap_window(
                 hysteresis=cfg.expert_swap_hysteresis,
                 max_swaps=cfg.expert_swap_max,
             )
-        method._swap_policy.snapshot_counters(
-            method._margin_insist_count,
-            method._margin_override_count,
-            method._resident_hit_count,
-        )
+        if window is not None:
+            method._swap_policy.observe(
+                window[0][method.kt_config.layer_idx],
+                window[1][method.kt_config.layer_idx],
+            )
         entries.append(
             {
                 "policy": method._swap_policy,
