@@ -80,6 +80,13 @@ KTMOE_WRAPPER_BASE_CTOR_PARAMS = frozenset(
     }
 )
 KTMOE_WRAPPER_SITU_CTOR_PARAMS = frozenset({"situ_beta", "situ_linear_beta"})
+# Cold-only residency is the only expert-allocation path this build has, so the
+# wrapper passes this on every construction. It stays OUT of the base contract
+# on purpose: base is enforced with an ImportError at import time, while a
+# wheel without cold-only support gets a clear config-time refusal instead --
+# which is the difference between a readable message and a TypeError deep in
+# scheduler init. Named here so the CPU test mock cannot drift from it.
+KTMOE_WRAPPER_COLD_ONLY_CTOR_PARAMS = frozenset({"cold_only_cpu_experts"})
 
 KT_WHEEL_SUPPORTS_SITU = False
 # Capability probe rather than a hard requirement: an older wheel still

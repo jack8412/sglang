@@ -27,6 +27,7 @@ from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe import kt_ep_wrapper as ktw
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTMOE_WRAPPER_BASE_CTOR_PARAMS,
+    KTMOE_WRAPPER_COLD_ONLY_CTOR_PARAMS,
     KTMOE_WRAPPER_SITU_CTOR_PARAMS,
     KTConfig,
     KTEPWrapperMethod,
@@ -46,7 +47,11 @@ NUM_EXPERTS = 64
 HIDDEN = 128
 INTERMEDIATE = 96
 
-_KT_CTOR_PARAM_UNION = KTMOE_WRAPPER_BASE_CTOR_PARAMS | KTMOE_WRAPPER_SITU_CTOR_PARAMS
+_KT_CTOR_PARAM_UNION = (
+    KTMOE_WRAPPER_BASE_CTOR_PARAMS
+    | KTMOE_WRAPPER_SITU_CTOR_PARAMS
+    | KTMOE_WRAPPER_COLD_ONLY_CTOR_PARAMS
+)
 
 
 class _RecordingKTMoEWrapper:

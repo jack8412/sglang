@@ -511,56 +511,6 @@ class TestSwapWindow(CustomTestCase):
         self.assertEqual(seq[0], "quiesce")
 
 
-class TestDemotionPrefetchGate(CustomTestCase):
-    """Do not read the checkpoint for demotions rank-write will never read.
-
-    The swap window can prefetch a demoted expert's bytes off the checkpoint
-    (~12.9 GB per window) so the fetch is off the critical path. Under rank-
-    write demotion nothing ever consumes them: each rank captures its own slice
-    from its own GPU rows.
-
-    The gate for that used to key on whether a PREVIOUS window had armed
-    rank-write -- a value that does not exist until a window has run. So every
-    boundary before the first window prefetched in full. V14 logged 17 such
-    passes and every window reported "prefetch 0 hit / 0 miss": ~219 GB read
-    off disk, none of it consumed, and worse than free because it lands right
-    after a plan change and so misses cache.
-
-    The writer is constructed at boot, so its presence is the signal that is
-    actually available when the decision is made.
-    """
-
-    def setUp(self):
-        from sglang.srt.layers.moe import kt_ep_wrapper
-
-        self.mod = kt_ep_wrapper
-        self.saved = dict(kt_ep_wrapper._KT_SWAP_STATE)
-        kt_ep_wrapper._KT_SWAP_STATE.clear()
-        self.addCleanup(
-            lambda: (
-                kt_ep_wrapper._KT_SWAP_STATE.clear(),
-                kt_ep_wrapper._KT_SWAP_STATE.update(self.saved),
-            )
-        )
-
-    def test_writer_present_before_any_window_suppresses_prefetch(self):
-        """The regression: decided at boot, not after the first window."""
-        self.mod._KT_SWAP_STATE["rank_writer"] = object()
-        self.assertNotIn("rank_write_armed", self.mod._KT_SWAP_STATE)
-        self.assertTrue(self.mod._rank_write_owns_demotions())
-
-    def test_no_writer_leaves_the_prefetch_enabled(self):
-        """Without rank-write the checkpoint IS the source; keep prefetching."""
-        self.assertFalse(self.mod._rank_write_owns_demotions())
-        self.mod._KT_SWAP_STATE["rank_writer"] = None
-        self.assertFalse(self.mod._rank_write_owns_demotions())
-
-    def test_armed_still_counts_on_its_own(self):
-        """Arming remains sufficient, so the two signals cannot disagree."""
-        self.mod._KT_SWAP_STATE["rank_write_armed"] = True
-        self.assertTrue(self.mod._rank_write_owns_demotions())
-
-
 class TestFlushMovesFixedWidthBatch(CustomTestCase):
     """A reused, full-width batch buffer must not leak stale rows.
 

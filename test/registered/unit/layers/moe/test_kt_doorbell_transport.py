@@ -378,11 +378,17 @@ class TestTransportConfigRails(CustomTestCase):
         self.assertEqual(self._args().kt_transport, "hostnode")
 
     def test_doorbell_on_the_production_recipe_is_accepted(self):
+        # --kt-expert-split-prefill travels with swapping now: the swap window
+        # writes a demoted expert into kt's arena, and the writer that does it
+        # is armed by split prefill's boot hook. A recipe with
+        # --kt-expert-swap-transitions and without it is refused at config
+        # time rather than terminating on the first acting window.
         args = self._args(
             kt_transport="doorbell",
             kt_routing_margin=0.5,
             kt_expert_swap_transitions=5,
             kt_expert_swap_max=8,
+            kt_expert_split_prefill=True,
         )
         self.assertEqual(args.kt_transport, "doorbell")
 

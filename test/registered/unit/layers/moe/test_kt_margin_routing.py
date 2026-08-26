@@ -390,12 +390,25 @@ class TestStandInRanking(CustomTestCase):
     LOGITS = torch.tensor([[1.2, 3.0, 1.0, 0.2, 2.0, 1.8, 0.0, 0.0]])
     BIAS = torch.tensor([-0.10, 0.0, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0])
     IDS = torch.tensor([[4, 1, 5]])
-    WEIGHTS = torch.tensor([[0.5, 0.3, 0.2]])
+    # DERIVED, never invented. test_bias_does_not_reach_the_weight asserts the
+    # returned weights stay proportional to sigmoid(logit); that is a statement
+    # about the ROUTER's weights, so a hand-written triple unrelated to LOGITS
+    # makes it fail for a reason that says nothing about the code. Same trap as
+    # TestBiasGap above, which already carries the note -- and it caught this
+    # class the first time these tests were actually executed.
+    WEIGHTS = (
+        lambda g: g / g.sum(dim=-1, keepdim=True)
+    )(torch.sigmoid(torch.gather(LOGITS, -1, IDS.long())))
+    # e4 and e5 carry 0.3272 / 0.3188 of the real mixture, so the budget
+    # has to sit in [0.3188, 0.6461) to admit the smaller one alone. The
+    # 0.25 this used to pass went with the invented weights, where e5 was
+    # 0.2; against the router's own weights it admits nothing.
+    BUDGET = 0.40
 
     def test_bias_decides_the_stand_in(self):
         # sigma: e0 0.769 > e2 0.731; sigma+bias: e2 0.781 > e0 0.669.
         ids, _, _, override = _route(
-            self.IDS, self.LOGITS, self.WEIGHTS, self.MASK, 0.25, bias=self.BIAS
+            self.IDS, self.LOGITS, self.WEIGHTS, self.MASK, self.BUDGET, bias=self.BIAS
         )
         self.assertEqual(override.tolist(), [[False, False, True]])
         self.assertEqual(ids.tolist(), [[4, 1, 2]])
@@ -404,7 +417,7 @@ class TestStandInRanking(CustomTestCase):
         # A router with no correction bias must keep the old behaviour exactly:
         # sigmoid is monotone, so the raw logit already gives its order.
         ids, _, _, _ = _route(
-            self.IDS, self.LOGITS, self.WEIGHTS, self.MASK, 0.25, bias=None
+            self.IDS, self.LOGITS, self.WEIGHTS, self.MASK, self.BUDGET, bias=None
         )
         self.assertEqual(ids.tolist(), [[4, 1, 0]])
 
@@ -413,7 +426,7 @@ class TestStandInRanking(CustomTestCase):
         # the bias steers selection only. Red if alt_scores (selection space) is
         # reused as the logit for the reweight.
         ids, w, _, _ = _route(
-            self.IDS, self.LOGITS, self.WEIGHTS, self.MASK, 0.25, bias=self.BIAS
+            self.IDS, self.LOGITS, self.WEIGHTS, self.MASK, self.BUDGET, bias=self.BIAS
         )
         gates = torch.sigmoid(torch.gather(self.LOGITS, -1, ids.long()))
         share = w / gates
@@ -426,7 +439,7 @@ class TestStandInRanking(CustomTestCase):
         # Pins the real argument order, so the _route adapter above cannot hide
         # a parameter being inserted or reordered.
         ids, w, insist, override = _margin_override_topk_ids_impl(
-            self.IDS, self.LOGITS, self.WEIGHTS, self.BIAS, self.MASK, 0.25, False
+            self.IDS, self.LOGITS, self.WEIGHTS, self.BIAS, self.MASK, self.BUDGET, False
         )
         self.assertEqual(ids.tolist(), [[4, 1, 2]])
         self.assertEqual(override.tolist(), [[False, False, True]])
@@ -713,7 +726,11 @@ class TestMarginConfigPlumbing(CustomTestCase):
             ForwardContext(attn_backend=None, kt_routing_margin=margins)
         ):
             resolved = method._resolve_margin(torch.zeros(3, 4))
-        self.assertEqual(resolved.tolist(), [0.5, 0.25, 0.1])
+        # assertAlmostEqual per element: the tensor is float32, so 0.1 comes
+        # back as 0.10000000149011612 and an exact list compare fails on the
+        # dtype rather than on the behaviour.
+        for got, want in zip(resolved.tolist(), [0.5, 0.25, 0.1]):
+            self.assertAlmostEqual(got, want, places=6)
 
     def test_resolve_margin_never_returns_none(self):
         """Bug regression: an unset server margin crashed the greedy.
